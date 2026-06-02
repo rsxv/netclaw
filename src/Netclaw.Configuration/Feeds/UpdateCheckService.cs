@@ -154,8 +154,19 @@ public static class UpdateCheckService
             response.EnsureSuccessStatusCode();
             manifestBytes = await response.Content.ReadAsByteArrayAsync(cts.Token);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex)
         {
+            if (ex is OperationCanceledException && !cancellationToken.IsCancellationRequested)
+            {
+                return new ManifestFetchResult
+                {
+                    Status = ManifestFetchStatus.NetworkFailure,
+                    ErrorMessage = "The update check timed out.",
+                };
+            }
+
+            if (ex is OperationCanceledException) throw;
+
             return new ManifestFetchResult
             {
                 Status = ManifestFetchStatus.NetworkFailure,
@@ -171,8 +182,19 @@ public static class UpdateCheckService
             sigResponse.EnsureSuccessStatusCode();
             signatureContent = await sigResponse.Content.ReadAsStringAsync(cts.Token);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex)
         {
+            if (ex is OperationCanceledException && !cancellationToken.IsCancellationRequested)
+            {
+                return new ManifestFetchResult
+                {
+                    Status = ManifestFetchStatus.NetworkFailure,
+                    ErrorMessage = "The signature check timed out.",
+                };
+            }
+
+            if (ex is OperationCanceledException) throw;
+            
             return new ManifestFetchResult
             {
                 Status = ManifestFetchStatus.SignatureFailure,
