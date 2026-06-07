@@ -21,8 +21,6 @@ namespace Netclaw.Cli.Tui.Wizard.Steps;
 /// </summary>
 public sealed class ProviderStepViewModel : IWizardStepViewModel
 {
-    private static readonly TimeSpan ProbeHardTimeout = TimeSpan.FromSeconds(20);
-
     private readonly IProviderProbe _probe;
     private readonly ProviderDescriptorRegistry _registry;
     private readonly DeviceFlowServiceFactory? _oauthFactory;
@@ -61,7 +59,6 @@ public sealed class ProviderStepViewModel : IWizardStepViewModel
     public ReactiveProperty<bool> IsProbing { get; } = new(false);
     public ReactiveProperty<ProviderProbeResult?> ProbeResult { get; } = new(null);
     public ReactiveProperty<int> ProbeElapsedSeconds { get; } = new(0);
-    public ReactiveProperty<int> SpinnerTick { get; } = new(0);
 
     public bool IsApplicable(WizardContext context) => true;
 
@@ -178,8 +175,15 @@ public sealed class ProviderStepViewModel : IWizardStepViewModel
         var result = new ProviderProbeResult(false, "Validation failed before probe completed.", []);
         try
         {
+            // Outer wall-clock for the WHOLE probe. The descriptor's own per-request
+            // deadline covers only the /models call; it does NOT cover pre-request work
+            // such as OAuth token exchange, which would otherwise be bounded only by the
+            // HttpClient default (~100s). This budget is deliberately larger than the
+            // descriptor's self-hosted deadline (see ProbeTimeouts.InteractiveWallClock)
+            // so it bounds a hung token exchange without truncating a legitimately slow
+            // self-hosted /models probe — the truncation that was the heart of #1292.
             result = await _probe.ProbeAsync(probeEntry, ct)
-                .WaitAsync(ProbeHardTimeout, ct);
+                .WaitAsync(ProbeTimeouts.InteractiveWallClock, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -188,7 +192,8 @@ public sealed class ProviderStepViewModel : IWizardStepViewModel
         catch (TimeoutException)
         {
             result = new ProviderProbeResult(false,
-                $"Validation timed out after {(int)ProbeHardTimeout.TotalSeconds} seconds.", []);
+                $"Validation timed out after {(int)ProbeTimeouts.InteractiveWallClock.TotalSeconds} seconds — "
+                + "the provider did not respond. Check connectivity and try again.", []);
         }
         catch (Exception ex)
         {
@@ -207,18 +212,16 @@ public sealed class ProviderStepViewModel : IWizardStepViewModel
         ProbeResult.Value = result;
     }
 
+    // Drives only the cosmetic "(Ns)" elapsed counter now that the spinner glyph
+    // self-animates via SpinnerNode; a 1 Hz tick is all that's needed.
     private async Task RunProbeTimerAsync(CancellationToken ct)
     {
-        var tickCount = 0;
         while (!ct.IsCancellationRequested)
         {
-            try { await Task.Delay(120, ct); }
+            try { await Task.Delay(1000, ct); }
             catch (OperationCanceledException) { return; }
 
-            tickCount++;
-            SpinnerTick.Value = tickCount;
-            if (tickCount % 8 == 0)
-                ProbeElapsedSeconds.Value++;
+            ProbeElapsedSeconds.Value++;
         }
     }
 
@@ -382,6 +385,5 @@ public sealed class ProviderStepViewModel : IWizardStepViewModel
         IsProbing.Dispose();
         ProbeResult.Dispose();
         ProbeElapsedSeconds.Dispose();
-        SpinnerTick.Dispose();
     }
 }

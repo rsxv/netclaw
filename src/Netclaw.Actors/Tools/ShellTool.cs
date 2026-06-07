@@ -23,6 +23,12 @@ public sealed partial class ShellTool : NetclawTool<ShellTool.Params>
 {
     public const string ToolName = "shell_execute";
 
+    // Shell output is mostly verbose noise the model skims, so bound it
+    // aggressively: small inline head+tail, full output spilled to a session file
+    // to grep. Content tools (file_read, web_fetch, MCP) keep the larger session
+    // content budget because the model fetched them to read in full.
+    public override int InlineOutputBudgetChars => 2000;
+
     private readonly ToolConfig _config;
     private readonly ToolPathPolicy? _pathPolicy;
     private readonly ShellCommandPolicy? _commandPolicy;
@@ -106,6 +112,22 @@ public sealed partial class ShellTool : NetclawTool<ShellTool.Params>
                     return $"Error preparing session working directory: {ex.Message}";
                 }
             }
+            else if (!Directory.Exists(resolvedCwd))
+            {
+                // ProcessStartInfo.WorkingDirectory must point at an existing directory or
+                // Process.Start throws an opaque, platform-specific error. Only the session
+                // scratch dir is auto-created (above); every other resolved cwd — explicit
+                // arg, project dir, inherited cwd — must already exist. Fail loudly with the
+                // remedy so the agent creates it instead of retry-looping on a cryptic error.
+                // Any approval for this cwd is existence-agnostic, so it still matches once
+                // the agent runs the mkdir.
+                if (File.Exists(resolvedCwd))
+                    return $"Error: Working directory '{resolvedCwd}' is a file, not a directory.";
+
+                var mkdirHint = isWindows ? $"mkdir \"{resolvedCwd}\"" : $"mkdir -p \"{resolvedCwd}\"";
+                return $"Error: Working directory '{resolvedCwd}' does not exist. "
+                     + $"Create it first, e.g.: {mkdirHint}";
+            }
 
             psi.WorkingDirectory = resolvedCwd;
         }
@@ -136,16 +158,17 @@ public sealed partial class ShellTool : NetclawTool<ShellTool.Params>
         {
             process.StandardInput.Close();
 
-            var outputBuilder = new StringBuilder();
-            var errorBuilder = new StringBuilder();
-
             // Start draining both pipes up front: a chatty child can deadlock if
             // one pipe buffer fills while we wait on the other. The reads take
             // CancellationToken.None deliberately — a redirected child holds the
             // pipe write-ends open, so a blocked pipe read cannot be interrupted
             // by a token; killing the process is what closes the pipes.
-            var stdoutTask = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
-            var stderrTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
+            //
+            // BoundedOutputReader reads into a head+tail window bounded by
+            // MaxOutputChars but continues draining after the cap is reached so
+            // the pipe never fills up and deadlocks a still-running child.
+            var stdoutTask = BoundedOutputReader.DrainToWindowAsync(process.StandardOutput, _config.MaxOutputChars, CancellationToken.None);
+            var stderrTask = BoundedOutputReader.DrainToWindowAsync(process.StandardError, _config.MaxOutputChars, CancellationToken.None);
 
             try
             {
@@ -172,7 +195,7 @@ public sealed partial class ShellTool : NetclawTool<ShellTool.Params>
                 {
                     // If the OS refuses the kill, the child may keep stdout/stderr
                     // open forever. Close our read ends so cancellation still
-                    // returns promptly instead of hanging in ReadToEndAsync.
+                    // returns promptly instead of hanging in the pipe drain.
                     killClosedPipes = false;
                     Debug.WriteLine($"shell_execute: process kill skipped — {ex.Message}");
                     process.StandardOutput.Dispose();
@@ -193,25 +216,33 @@ public sealed partial class ShellTool : NetclawTool<ShellTool.Params>
                     : "Error: Command cancelled.";
             }
 
-            outputBuilder.Append(await stdoutTask);
-            errorBuilder.Append(await stderrTask);
+            var (stdoutText, _) = await stdoutTask;
+            var (stderrText, _) = await stderrTask;
 
-            var result = new StringBuilder();
-            if (outputBuilder.Length > 0)
-                result.Append(outputBuilder);
-            if (errorBuilder.Length > 0)
+            // Assemble the raw combined output (stdout then stderr). Each stream was
+            // drained to MaxOutputChars, so the concatenation can be up to 2x — re-window
+            // the COMBINED back to the capture ceiling so the spill body stays bounded by
+            // MaxOutputChars. Redaction and the inline-budget bound + spill+steer happen
+            // centrally in DispatchingToolExecutor; the tool only returns its bounded
+            // capture.
+            var combined = new StringBuilder();
+            if (stdoutText.Length > 0)
+                combined.Append(stdoutText);
+            if (stderrText.Length > 0)
             {
-                if (result.Length > 0)
-                    result.AppendLine();
-                result.Append(errorBuilder);
+                if (combined.Length > 0)
+                    combined.AppendLine();
+                combined.Append(stderrText);
             }
 
-            var sanitized = SecretOutputRedactor.Redact(result.ToString());
-            var output = TruncateOutput(sanitized, _config.MaxOutputChars);
-            return $"Exit code: {process.ExitCode}{Environment.NewLine}{output}";
+            var captured = BoundedOutputReader.Window(combined.ToString(), _config.MaxOutputChars);
+            return $"Exit code: {process.ExitCode}{Environment.NewLine}{captured}";
         }
     }
 
+    // Retained for compatibility with tests/benchmark that call it directly; the
+    // main execution path no longer uses this — output is bounded at read time by
+    // BoundedOutputReader.
     internal static string TruncateOutput(string output, int maxChars)
     {
         if (output.Length <= maxChars)

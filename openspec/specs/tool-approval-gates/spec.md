@@ -90,14 +90,24 @@ SHALL be able to add or remove patterns via configuration.
 
 The system SHALL extract verb-chain prefix patterns from shell commands
 using tokenization. The verb chain SHALL consist of non-flag tokens from
-the start of the command until the first flag (`-`), path, or URL
-argument. Extraction is greedy: bare-word operands that are neither flags,
-paths, nor URLs (subcommands, remote names, branch names, refs) SHALL
-remain in the verb chain — the extractor SHALL NOT attempt to distinguish
-subcommands from positional operands. For shell approval units, `&&`,
-`||`, and `;` SHALL split into separate units, while `|` SHALL remain
-inside the current unit. For `bash -c` or `sh -c` wrappers, the inner
-command SHALL be extracted and scanned recursively.
+the start of the command until the first flag (`-`), path, URL, or bare
+integer argument. Extraction is greedy: bare-word operands that are
+neither flags, paths, URLs, nor integers (subcommands, remote names,
+branch names, refs) SHALL remain in the verb chain — the extractor SHALL
+NOT attempt to distinguish subcommands from positional operands.
+
+> **Why integers are excluded:** Bare integers (pure digit sequences like
+> `123`, `8080`, `30`) are never CLI subcommands. They represent
+> call-specific values — ticket IDs, port numbers, timeouts — that vary
+> between invocations of the same verb chain. Baking them into the pattern
+> produces overly-specific approval entries that do not generalize:
+> `freshdesk ticket get 123` vs `freshdesk ticket get 456` would create
+> two unrelated entries, forcing separate approval for each unique value.
+
+For shell approval units, `&&`, `||`, and `;` SHALL split into separate
+units, while `|` SHALL remain inside the current unit. For `bash -c` or
+`sh -c` wrappers, the inner command SHALL be extracted and scanned
+recursively.
 
 When `ShellTokenizer.SplitCompoundCommand` detects bash control-flow
 tokens or unbalanced quotes/brackets, it SHALL return an empty
@@ -120,6 +130,34 @@ chain. Compound commands SHALL produce N entries from one user click on
 - **THEN** the pattern is `git push origin main`
 - **AND** the bare-word operands `origin` and `main` remain in the verb
   chain because greedy extraction does not strip positional operands
+
+#### Scenario: Verb chain strips bare integer positional argument
+
+- **GIVEN** the command `freshdesk ticket get 123`
+- **WHEN** the pattern is extracted
+- **THEN** the pattern is `freshdesk ticket get`
+- **AND** the bare integer `123` is excluded because it is call-specific
+
+#### Scenario: Verb chain generalizes across different integer values
+
+- **GIVEN** commands `nc host 8080` and `nc host 9090`
+- **WHEN** patterns are extracted for both
+- **THEN** both produce the same pattern `nc host`
+- **AND** approval granted for one integer value covers all values of the same verb chain
+
+#### Scenario: Verb chain terminates at integer (not just skips it)
+
+- **GIVEN** the command `timeout 30 curl http://example.com`
+- **WHEN** the pattern is extracted
+- **THEN** the pattern is `timeout`
+- **AND** everything after the integer (including wrapped subcommands like `curl`) is dropped from the pattern
+
+#### Scenario: Non-bare numeric tokens are preserved
+
+- **GIVEN** the command `docker run --name test123 --port=8080 -e VAR=1e5`
+- **WHEN** the pattern is extracted
+- **THEN** the pattern includes `test123`, `--port=8080`, and `VAR=1e5`
+- **AND** only pure digit-only tokens are treated as integers
 
 #### Scenario: Verb chain stops at flag
 
@@ -489,6 +527,11 @@ capability flag. When a tool requires approval and the active channel does NOT
 support it, the system SHALL immediately deny the tool with reason
 `channel_does_not_support_approval`. The system SHALL NOT hang or timeout.
 
+Channels that support interactive approval SHALL render approval prompts using
+their richest available interaction surface and SHALL always provide a
+deterministic text fallback path with equivalent decision options when the
+rich interaction surface is unavailable or not configured.
+
 #### Scenario: Unsupported channel auto-denies
 
 - **GIVEN** the headless channel (no interactive user)
@@ -503,6 +546,24 @@ support it, the system SHALL immediately deny the tool with reason
 - **AND** `shell_execute` is in Approval mode
 - **WHEN** the agent invokes an unapproved `shell_execute` command
 - **THEN** the channel renders the approval prompt as a text A/B/C/D reply flow
+
+#### Scenario: Mattermost channel renders interactive approval buttons
+
+- **GIVEN** the Mattermost channel (supports interactive approval)
+- **AND** interactive approvals are configured for the Mattermost channel
+- **AND** `shell_execute` is in Approval mode
+- **WHEN** the agent invokes an unapproved `shell_execute` command
+- **THEN** the channel renders the approval prompt as Mattermost interactive
+  buttons
+- **AND** a clicked button is routed as a `ToolInteractionResponse`
+
+#### Scenario: Mattermost channel falls back to deterministic text options
+
+- **GIVEN** the Mattermost channel (supports interactive approval)
+- **AND** interactive approvals are not configured for the Mattermost channel
+- **WHEN** the agent invokes an unapproved `shell_execute` command
+- **THEN** the channel renders a deterministic A/B/C/D text approval prompt
+- **AND** text replies map to equivalent approval decisions
 
 ### Requirement: Directory-root approvals for shell_execute
 
@@ -917,3 +978,96 @@ shares the candidate's verb, no near-miss diagnostic SHALL be emitted
 - **WHEN** the gate evaluates the candidate
 - **THEN** the candidate remains unapproved
 - **AND** the user is still prompted
+
+### Requirement: Sub-agent approval bridge preserves prompt correlation
+
+Sub-agent approval prompts SHALL use the same channel-agnostic `ToolInteractionRequest` contract as parent-session tool prompts. The request SHALL use a parent-scoped correlation call id that is unique per bridged approval request while preserving the child call id as part of the correlation value. The request SHALL preserve tool name, display text, exact blocked patterns, candidate verbs, per-candidate directories, cwd, messy-command flag, computed approval options, requester identity, principal, audience-derived authority, and adopted-context safety metadata from the parent turn authority context.
+
+#### Scenario: Sub-agent prompt includes approval candidates and options
+- **GIVEN** a sub-agent shell tool call requires approval
+- **WHEN** the parent approval bridge emits the prompt
+- **THEN** the prompt includes the exact blocked patterns shown to the user
+- **AND** the prompt includes candidate verbs and per-candidate directories for grant persistence
+- **AND** the prompt includes the same computed approval options the parent approval gate produced
+
+#### Scenario: Sub-agent prompt carries adopted-context safety metadata
+- **GIVEN** a sub-agent was spawned from a parent turn with adopted context
+- **WHEN** the sub-agent emits an approval prompt
+- **THEN** the prompt includes adopted-context and third-party adopted-context flags
+- **AND** the prompt includes adopted speaker ids when present
+
+#### Scenario: Duplicate child call ids do not share approval state
+- **GIVEN** two bridged sub-agent approval waits have the same child-local tool call id
+- **WHEN** the parent approval bridge emits prompts for both waits
+- **THEN** each prompt uses a distinct parent-scoped call id
+- **AND** approving one prompt cannot complete or authorize the other wait
+
+### Requirement: Sub-agent approval responses do not execute expired work
+
+Approval responses for sub-agent prompts SHALL execute a tool only while the originating sub-agent wait is still live and correlated to the pending call id. A response that arrives after the sub-agent wait was cancelled, completed, or abandoned SHALL fail closed as expired and SHALL NOT execute the gated tool.
+
+#### Scenario: Late approval after cancellation is expired
+- **GIVEN** a sub-agent approval prompt is pending
+- **AND** the parent cancels the `spawn_agent` call before the user responds
+- **WHEN** the user later approves the stale prompt
+- **THEN** the sub-agent tool is not executed
+- **AND** the response is treated as expired or no-longer-pending
+
+#### Scenario: Live session response requires live approval wait
+- **GIVEN** the parent session still has persisted prompt metadata for a sub-agent approval
+- **AND** the child sub-agent approval wait has already been cancelled or completed
+- **WHEN** an approval response arrives while the parent session is processing
+- **THEN** the response is rejected as expired
+- **AND** no approval grant is applied to execute stale sub-agent work
+
+#### Scenario: Durable grant is written only after live wait is claimed
+- **GIVEN** a sub-agent approval response requests a session or persistent grant
+- **AND** the child approval wait is cancelled before the parent claims the response
+- **WHEN** the response is handled
+- **THEN** no durable approval grant is written
+- **AND** the response is rejected as expired
+
+#### Scenario: No bridge fails closed
+- **GIVEN** a sub-agent tool call requires approval
+- **AND** no parent approval bridge is available
+- **WHEN** the tool executor reports that approval is required
+- **THEN** no approval prompt is emitted
+- **AND** the gated tool is not executed
+- **AND** the sub-agent completes with a failed `SubAgentResult`
+
+### Requirement: Approval pause persistence carries turn context
+
+When a tool approval prompt is emitted from a session turn, the persisted approval request SHALL carry the original turn context as a single durable context record. The approval request MAY continue to carry tool-specific prompt data, option keys, candidates, and compatibility fields, but authority-bearing session context SHALL have one canonical persisted representation for new events.
+
+#### Scenario: Approval request persists context record
+
+- **GIVEN** a tool call requires approval during a session turn
+- **WHEN** the session persists the approval request
+- **THEN** the journaled event includes the turn context for the original request
+- **AND** the pending interaction restored from that event carries the same context
+
+#### Scenario: Tool-specific prompt data remains separate
+
+- **GIVEN** an approval request includes command patterns, candidate verbs, option keys, and directory candidates
+- **WHEN** the turn context is persisted with the approval request
+- **THEN** tool-specific prompt data remains separate from the turn context
+- **AND** the turn context does not become a dumping ground for approval-rendering state
+
+### Requirement: Approval responses use persisted requester context
+
+Approval response authorization SHALL use the requester and principal from the persisted turn context for the pending approval. A recovered approval response SHALL enforce the same requester-only approval rule as the live path, unless the original requester principal represents verified automation where channel-member approval is allowed.
+
+#### Scenario: Non-requester approval rejected after recovery
+
+- **GIVEN** a pending approval was restored with requester `U-requester`
+- **WHEN** sender `U-other` approves the prompt
+- **THEN** the approval response is rejected
+- **AND** the tool is not redriven
+
+#### Scenario: Verified automation approval remains approvable by channel member
+
+- **GIVEN** a pending approval was restored with a verified automation principal
+- **WHEN** a valid channel member approves the prompt
+- **THEN** the approval response is accepted according to the same rule used on the live path
+- **AND** the redrive uses the original turn context
+

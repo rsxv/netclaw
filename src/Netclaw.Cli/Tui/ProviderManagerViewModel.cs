@@ -72,7 +72,6 @@ public sealed class ProviderDisplayItem
 /// </summary>
 public sealed class ProviderManagerViewModel : ReactiveViewModel
 {
-    private static readonly TimeSpan ProbeHardTimeout = TimeSpan.FromSeconds(20);
 
     private readonly NetclawPaths _paths;
     private readonly ProviderDescriptorRegistry _registry;
@@ -86,9 +85,7 @@ public sealed class ProviderManagerViewModel : ReactiveViewModel
     public ReactiveProperty<bool> IsProbing { get; } = new(false);
     public ReactiveProperty<ProviderProbeResult?> ProbeResult { get; } = new(null);
     public ReactiveProperty<int> ProbeElapsedSeconds { get; } = new(0);
-    public ReactiveProperty<int> SpinnerTick { get; } = new(0);
     public ReactiveProperty<bool> IsEagerProbing { get; } = new(false);
-    public ReactiveProperty<int> EagerProbeElapsedSeconds { get; } = new(0);
 
     /// <summary>
     /// Version counter for state changes that require DynamicLayoutNode invalidation.
@@ -246,16 +243,15 @@ public sealed class ProviderManagerViewModel : ReactiveViewModel
         }
 
         IsEagerProbing.Value = true;
-        EagerProbeElapsedSeconds.Value = 0;
 
         foreach (var item in configuredItems)
             item.Health = ProviderHealthStatus.Probing;
 
         NotifyStateChanged();
 
-        using var timerCts = new CancellationTokenSource();
-        _ = RunEagerProbeTimerAsync(timerCts.Token);
-
+        // Each provider's completion calls NotifyStateChanged() to refresh its
+        // health glyph; the in-progress spinners self-animate via SpinnerNode, so
+        // no eager-probe redraw timer is needed.
         var probeTasks = configuredItems.Select(async item =>
         {
             try
@@ -280,22 +276,9 @@ public sealed class ProviderManagerViewModel : ReactiveViewModel
 
         await Task.WhenAll(probeTasks);
 
-        timerCts.Cancel();
         IsEagerProbing.Value = false;
         CurrentState.Value = ProviderManagerState.List;
         NotifyStateChanged();
-    }
-
-    private async Task RunEagerProbeTimerAsync(CancellationToken ct)
-    {
-        while (!ct.IsCancellationRequested)
-        {
-            try { await Task.Delay(1000, ct); }
-            catch (OperationCanceledException) { return; }
-
-            EagerProbeElapsedSeconds.Value++;
-            RequestRedraw();
-        }
     }
 
     /// <summary>
@@ -901,8 +884,11 @@ public sealed class ProviderManagerViewModel : ReactiveViewModel
         var result = new ProviderProbeResult(false, "Validation failed before probe completed.", []);
         try
         {
+            // Whole-probe wall-clock (covers pre-request work like OAuth token exchange);
+            // ProbeTimeouts.InteractiveWallClock stays above the descriptor's per-request
+            // deadline so it never truncates a legitimately slow self-hosted probe (#1292).
             result = await _probe.ProbeAsync(probeEntry, ct)
-                .WaitAsync(ProbeHardTimeout, ct);
+                .WaitAsync(ProbeTimeouts.InteractiveWallClock, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -911,7 +897,7 @@ public sealed class ProviderManagerViewModel : ReactiveViewModel
         catch (TimeoutException)
         {
             result = new ProviderProbeResult(false,
-                $"Validation timed out after {(int)ProbeHardTimeout.TotalSeconds} seconds. Check network connectivity and try again.", []);
+                $"Validation timed out after {(int)ProbeTimeouts.InteractiveWallClock.TotalSeconds} seconds. Check network connectivity and try again.", []);
         }
         catch (Exception ex)
         {
@@ -964,21 +950,16 @@ public sealed class ProviderManagerViewModel : ReactiveViewModel
         NotifyStateChanged();
     }
 
+    // Drives only the cosmetic "(Ns)" elapsed counter now that the spinner glyph
+    // self-animates via SpinnerNode; a 1 Hz tick is all that's needed.
     private async Task RunProbeTimerAsync(CancellationToken ct)
     {
-        var tickCount = 0;
         while (!ct.IsCancellationRequested)
         {
-            try { await Task.Delay(120, ct); }
+            try { await Task.Delay(1000, ct); }
             catch (OperationCanceledException) { return; }
 
-            tickCount++;
-            SpinnerTick.Value = tickCount;
-
-            if (tickCount % 8 == 0)
-                ProbeElapsedSeconds.Value++;
-
-            RequestRedraw();
+            ProbeElapsedSeconds.Value++;
         }
     }
 
@@ -1095,9 +1076,7 @@ public sealed class ProviderManagerViewModel : ReactiveViewModel
         IsProbing.Dispose();
         ProbeResult.Dispose();
         ProbeElapsedSeconds.Dispose();
-        SpinnerTick.Dispose();
         IsEagerProbing.Dispose();
-        EagerProbeElapsedSeconds.Dispose();
         StateVersion.Dispose();
         base.Dispose();
     }

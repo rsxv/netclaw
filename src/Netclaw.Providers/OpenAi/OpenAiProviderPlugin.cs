@@ -37,6 +37,12 @@ public sealed class OpenAiProviderPlugin : ProviderPluginBase<OpenAiDescriptor>
             };
             options.AddPolicy(new OpenAiCodexRequestPolicy(accountId), PipelinePosition.PerCall);
 
+            // No non-streaming wrapper is needed here: Netclaw issues streaming-only
+            // LLM calls everywhere (the session loop and every auxiliary caller —
+            // title generation, memory extraction, compaction — go through the
+            // streaming transport), so the Codex backend's
+            // 400 {"detail":"Stream must be set to true"} on non-streaming Responses
+            // calls is structurally unreachable.
             return new OpenAI.Responses.ResponsesClient(
                     new ApiKeyCredential(token.Value), options)
                 .AsIChatClient(model.ModelId);
