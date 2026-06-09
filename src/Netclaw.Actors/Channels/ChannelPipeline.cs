@@ -330,11 +330,7 @@ public sealed class SessionPipeline : ISessionPipeline
         {
             var sessionDir = SessionDirectoryHelper.GetSessionDirectory(sessionId, paths.SessionsDirectory);
             foreach (var data in dataContents)
-            {
-                var mediaRef = SessionMediaStore.WriteDataContent(data, sessionDir);
-                if (mediaRef is not null)
-                    mediaRefs.Add(mediaRef);
-            }
+                content = SessionMediaStore.WriteMediaInto(data, sessionDir, mediaRefs, content);
         }
 
         return new SendUserMessage

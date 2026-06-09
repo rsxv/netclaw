@@ -160,9 +160,7 @@ public static class ChatMessageConverter
                     break;
 
                 case DataContent data when sessionDir is not null:
-                    var mediaRef = SessionMediaStore.WriteDataContent(data, sessionDir);
-                    if (mediaRef is not null)
-                        mediaRefs.Add(mediaRef);
+                    content = SessionMediaStore.WriteMediaInto(data, sessionDir, mediaRefs, content);
                     break;
             }
         }
