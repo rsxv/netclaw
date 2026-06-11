@@ -1,3 +1,61 @@
+#### 0.24.0-beta.4 2026-06-11 ####
+
+Netclaw v0.24.0-beta.4 — Reminder delivery fixes and shell approval normalization
+
+**Bug Fixes**
+
+* **In-session reminder delivery now confirms successfully** — fixed current-session reminders that were incorrectly reporting delivery failures. Reminders scheduled with `delivery_kind: current_session` now complete without spurious errors. ([#1387](https://github.com/netclaw-dev/netclaw/pull/1387))
+
+* **Reminder list includes disabled reminders** — the reminder list endpoint now correctly returns disabled reminders alongside active ones, so you can see the full schedule even for paused reminders. ([#1386](https://github.com/netclaw-dev/netclaw/pull/1386))
+
+* **Shell approval no longer matches version/value arguments** — normalized how version and value arguments are processed in shell approval verb chains, preventing false-positive pattern matches on numeric arguments. ([#1388](https://github.com/netclaw-dev/netclaw/pull/1388))
+
+---
+
+#### 0.24.0-beta.3 2026-06-10 ####
+
+Netclaw v0.24.0-beta.3 — Channel infrastructure standardization, Discord/Mattermost gateway self-healing, and install script fix
+
+**Features**
+
+* **Standardized channel infrastructure (SPEC-015)** — generic `ChannelLifecycleActor` and `RemoteChatChannelBuilder` reduce new channel implementations to ~80 LOC (down from 1,100+ duplicated LOC across Discord and Mattermost), while enforcing a standardized security pipeline and gateway lifecycle. ([#1375](https://github.com/netclaw-dev/netclaw/pull/1375))
+
+* **`lookup_channel_destination` blank-query support** — passing `query: null` or an empty string now returns all available destinations, enabling "Select Destination" TUI steps that list every channel without filtering. ([#1375](https://github.com/netclaw-dev/netclaw/pull/1375))
+
+**Bug Fixes**
+
+* **Discord gateway no longer enters zombie state after failed auto-retry** — fixed a critical reliability issue where the Discord gateway dropped every inbound message for 30+ minutes and would not recover without a daemon restart. The gateway now correctly enters its self-healing reconnect loop and publishes `ConnectionRestored` on recovery. ([#1374](https://github.com/netclaw-dev/netclaw/pull/1374))
+
+* **Mattermost auto-retry recovery publishes `ConnectionRestored`** — the same gateway-lifecycle fix applied to the Mattermost actor; auto-retry timeouts now correctly trigger the self-healing reconnect loop. ([#1375](https://github.com/netclaw-dev/netclaw/pull/1375))
+
+* **Install scripts persist `--channel` preference to config** — `Daemon.UpdateChannel` is now written to `netclaw.json` during `--channel beta` installs (both `install.sh` and `install.ps1`), so the daemon's self-update mechanism no longer silently defaults to stable. The init wizard preserves an existing beta channel from config. ([#1377](https://github.com/netclaw-dev/netclaw/pull/1377))
+
+---
+
+#### 0.24.0-beta.2 2026-06-09 ####
+
+Netclaw v0.24.0-beta.2 — Channel delivery descriptor registry, TUI improvements, and dependency updates
+
+**Features**
+
+* **Channel delivery descriptor registry** — new registration-based system for channel delivery descriptors, improving extensibility of channel integrations. ([#1326](https://github.com/netclaw-dev/netclaw/pull/1326))
+
+* **Native text selection in TUI** — text selection in the terminal UI is now handled natively via Termina 0.11.0, enabling proper copy/paste behavior. ([#1359](https://github.com/netclaw-dev/netclaw/pull/1359))
+
+**Bug Fixes**
+
+* **TUI list views are now scrollable** — fixed unresponsive scrolling in all TUI list views. ([#1363](https://github.com/netclaw-dev/netclaw/pull/1363))
+
+* **DaemonApi threaded into init wizard's provider step** — fixed the init wizard's provider step to properly use the DaemonApi. ([#1369](https://github.com/netclaw-dev/netclaw/pull/1369))
+
+**Dependencies**
+
+* **Verify.XunitV3 bumped to 31.19.1** — test framework update. ([#1367](https://github.com/netclaw-dev/netclaw/pull/1367))
+
+* **Aspire.Hosting.Testing bumped to 13.4.3** — .NET Aspire test hosting update. ([#1366](https://github.com/netclaw-dev/netclaw/pull/1366))
+
+---
+
 #### 0.24.0-beta.1 2026-06-08 ####
 
 Netclaw v0.24.0-beta.1 — Shell streaming, media improvements, bug fixes, and dependency updates
