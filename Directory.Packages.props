@@ -3,7 +3,7 @@
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
     <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
     <!-- Nuget package versions -->
-    <AkkaHostingVersion>1.5.68</AkkaHostingVersion>
+    <AkkaHostingVersion>1.5.69</AkkaHostingVersion>
     <AkkaPersistenceSqlHostingVersion>1.5.67</AkkaPersistenceSqlHostingVersion>
     <AkkaRemindersVersion>0.6.0</AkkaRemindersVersion>
     <OpenTelemetryVersion>1.16.0</OpenTelemetryVersion>
@@ -11,13 +11,13 @@
     <DiscordNetVersion>3.20.1</DiscordNetVersion>
     <MattermostNetVersion>5.0.0</MattermostNetVersion>
     <MicrosoftExtensionsAIVersion>10.6.0</MicrosoftExtensionsAIVersion>
-    <MicrosoftAspNetCoreVersion>10.0.8</MicrosoftAspNetCoreVersion>
+    <MicrosoftAspNetCoreVersion>10.0.9</MicrosoftAspNetCoreVersion>
     <SkiaSharpVersion>3.119.4</SkiaSharpVersion>
     <!-- Aspire pins are exercised only by samples/Netclaw.Demo.AppHost and its
          integration tests. The 13.x line is the .NET 10 generation of Aspire;
          9.x pulls a vulnerable KubernetesClient 17.0.4 (GHSA-w7r3-mgwf-4mqq)
          that trips NU1902 under our TreatWarningsAsErrors policy. -->
-    <AspireHostingVersion>13.4.3</AspireHostingVersion>
+    <AspireHostingVersion>13.4.4</AspireHostingVersion>
     <CommunityToolkitAspireVersion>13.4.0</CommunityToolkitAspireVersion>
   </PropertyGroup>
   <!-- App dependencies -->
@@ -29,7 +29,7 @@
     <PackageVersion Include="Akka.Persistence.Sql.Hosting" Version="$(AkkaPersistenceSqlHostingVersion)" />
     <PackageVersion Include="Aaron.Akka.Reminders" Version="$(AkkaRemindersVersion)" />
     <PackageVersion Include="Aaron.Akka.Reminders.Sqlite" Version="$(AkkaRemindersVersion)" />
-    <PackageVersion Include="Anthropic" Version="12.27.0" />
+    <PackageVersion Include="Anthropic" Version="12.29.1" />
     <PackageVersion Include="HtmlAgilityPack" Version="1.12.4" />
     <PackageVersion Include="Microsoft.AspNetCore.DataProtection.Extensions" Version="$(MicrosoftAspNetCoreVersion)" />
     <PackageVersion Include="Microsoft.AspNetCore.OpenApi" Version="$(MicrosoftAspNetCoreVersion)" />
@@ -67,8 +67,8 @@
   </ItemGroup>
   <!-- Serialization -->
   <ItemGroup>
-    <PackageVersion Include="Google.Protobuf" Version="3.35.0" />
-    <PackageVersion Include="Grpc.Tools" Version="2.81.0" />
+    <PackageVersion Include="Google.Protobuf" Version="3.35.1" />
+    <PackageVersion Include="Grpc.Tools" Version="2.81.1" />
     <PackageVersion Include="YamlDotNet" Version="18.0.0" />
   </ItemGroup>
   <!-- Test dependencies -->
