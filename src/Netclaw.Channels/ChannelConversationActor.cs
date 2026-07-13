@@ -9,6 +9,7 @@ using Netclaw.Actors.Channels;
 using Netclaw.Actors.Protocol;
 using Netclaw.Channels.Telemetry;
 using Netclaw.Configuration;
+using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Channels;
 
@@ -207,7 +208,7 @@ public abstract class ChannelConversationActor<TMessage> : ReceiveActor
 
         var log = Log
             .WithContext(ThreadLogContextKey, threadKey)
-            .WithContext("SessionId", sessionId.Value)
+            .WithContext(NetclawLogProperties.SessionId, sessionId.Value)
             .WithContext("TurnId", turnId)
             .WithContext(EventLogContextKey, eventId);
 

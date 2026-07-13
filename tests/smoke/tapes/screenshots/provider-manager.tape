@@ -16,8 +16,8 @@
 #
 # Navigation + anchors mirror tapes/provider-add.tape; see that file and
 # src/Netclaw.Cli/Tui/ProviderManagerPage.cs for the synchronization
-# rationale. The Screenshot is bracketed by Sleep 1s to settle the frame
-# and keep the next keystroke from leaking into the capture.
+# rationale. Wait+Screen anchors on the list content, then Sleep 1s lets
+# the full TUI frame flush before the screenshot is captured.
 #
 # Prepended preamble: tapes/screenshot-preamble.tape (determinism-pinned).
 
@@ -31,12 +31,23 @@ Enter
 # With no providers configured the list shows every known type as a
 # "(not configured)" row plus the "+ Add new provider..." sentinel.
 # Anchor on "Ollama" (a guaranteed type row) so we know the list rendered.
+# Sleep lets VHS flush the full frame; the SECOND Wait+Screen is an anti-blank
+# re-assert immediately before capture — if a Termina startup full-refresh
+# blanked the screen during the Sleep, this blocks until the list repaints.
+# (Defence in depth: run-smoke.sh also re-runs the tape if a blank slips through.)
 Wait+Screen@10s /Ollama/
 Sleep 1s
+Wait+Screen@5s /Ollama/
 Screenshot "/tmp/shot-provider-manager-empty.png"
-Sleep 1s
 
 # Frame captured; quit the TUI back to the shell.
+# Sleep 1s BEFORE Ctrl+Q: VHS's Screenshot is captured asynchronously on a
+# later render tick, so a screen-destroying key here can race the deferred
+# capture and land the restored shell transcript in the PNG instead of this
+# frame. This frame has not regressed on that race, but the guard makes it
+# immune to the timing jitter that broke mcp-permissions frame 2 (see that
+# tape's Exit-TUI comment for the full mechanism + repro).
+Sleep 1s
 Ctrl+Q
 Wait+Screen@10s /TAPE\$/
 

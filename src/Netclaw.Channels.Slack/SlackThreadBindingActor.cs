@@ -20,6 +20,8 @@ using Netclaw.Media;
 using Netclaw.Security;
 using Netclaw.Tools;
 using SlackNet.Blocks;
+using static Netclaw.Actors.Sessions.SessionProtocol;
+using static Netclaw.Actors.Reminders.ReminderProtocol;
 
 namespace Netclaw.Channels.Slack;
 
@@ -43,7 +45,7 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
     // told a ReminderDeliveryResult on its turn's TurnCompleted and removed.
     // Keyed (not a single field) because multiple reminders can target the
     // same session concurrently — a single field would be clobbered.
-    private readonly Dictionary<string, IActorRef> _reminderDeliveryObservers = new(StringComparer.Ordinal);
+    private readonly Dictionary<ReminderId, IActorRef> _reminderDeliveryObservers = new();
     private readonly List<PendingApprovalRequest> _pendingApprovalRequests = [];
 
     // Gates the text-approval cold path (TryHandleColdTextApprovalResponseAsync).
@@ -59,6 +61,9 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
     private readonly SessionPipelineHandle _handle;
     private SlackEventTs? _cursorTs;
     private SlackEventTs? _pendingCursorTs;
+    private volatile bool _processingIndicatorActive;
+    private readonly object _processingIndicatorRenderLock = new();
+    private Task _processingIndicatorRenderTail = Task.CompletedTask;
 
     // Set when PerformOneShotHydrationAsync fetched a non-empty thread gap but
     // found no authorized trigger to anchor a turn. This is the proactive-thread
@@ -71,6 +76,7 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
     private static readonly object ReinitializeTimerKey = new();
     private static readonly TimeSpan InboundProcessingTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan OperationTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan ProcessingIndicatorTimeout = TimeSpan.FromSeconds(1);
     private const string BackfillDetectorWarning = ":warning: I couldn't safely analyze some earlier thread messages, so they were excluded from context.";
     private const string LiveDetectorUnavailableWarning = ":warning: I couldn't safely analyze your message — please try again in a moment.";
     private const string LiveInjectionBlockedWarning = ":warning: Message blocked by prompt-injection policy.";
@@ -97,7 +103,7 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
         _handle = new SessionPipelineHandle(dependencies.Pipeline, Context.GetLogger(), "slack-thread");
         _log = Context.GetLogger()
             .WithContext("Adapter", "slack")
-            .WithContext("SessionId", _sessionId.Value)
+            .WithContext(NetclawLogProperties.SessionId, _sessionId.Value)
             .WithContext("SlackChannelId", _channelId)
             .WithContext("SlackThreadTs", _threadTs);
 
@@ -132,6 +138,7 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
 
     protected override void PostStop()
     {
+        QueueProcessingIndicatorClearIfActive();
         _handle.Dispose();
         base.PostStop();
     }
@@ -283,8 +290,9 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
         // second concurrent reminder to this session can't overwrite the
         // first's observer before its turn reaches TurnCompleted.
         if (message.Source.DeliveryObserver is { } deliveryObserver
-            && !string.IsNullOrWhiteSpace(message.Source.ReminderId))
-            _reminderDeliveryObservers[message.Source.ReminderId] = deliveryObserver;
+            && message.Source.ReminderId is { } reminderKey
+            && !string.IsNullOrWhiteSpace(reminderKey.Value))
+            _reminderDeliveryObservers[reminderKey] = deliveryObserver;
 
         try
         {
@@ -417,6 +425,8 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
                     if (_pendingCursorTs is not { } pending || ts.CompareTo(pending) > 0)
                         _pendingCursorTs = ts;
                 }
+
+                QueueProcessingIndicatorRefreshIfActive();
             }
             catch (OperationCanceledException ex)
             {
@@ -571,7 +581,7 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
     private SessionPipelineOptions BuildOptions() => new()
     {
         ChannelType = Actors.Channels.ChannelType.Slack,
-        Filter = OutputFilter.Text | OutputFilter.Files
+        Filter = OutputFilter.Text | OutputFilter.Files | OutputFilter.ProcessingState
     };
 
     private async Task EnsureInitializedAsync()
@@ -1013,6 +1023,7 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
 
     private async Task ReinitializePipelineAsync(string reason)
     {
+        QueueProcessingIndicatorClearIfActive();
         _pendingCursorTs = null;
         // Reset per-turn delivery flags: a reinit aborts the in-flight turn,
         // and a stale _postedThisTurn=true would otherwise leak into the next
@@ -1055,6 +1066,10 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
                 var uploadResult = await SafeUploadFileAsync(file);
                 if (!uploadResult.Success)
                     _lastFailedPost = uploadResult;
+                break;
+
+            case ProcessingStateOutput processing:
+                await RenderProcessingStateAsync(processing);
                 break;
 
             // BufferFlush and TextDeltaOutput are not received — Slack subscribes
@@ -1110,12 +1125,13 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
                     AdvanceCursor(pendingTs);
                 _pendingCursorTs = null;
 
-                if (!string.IsNullOrWhiteSpace(completed.SourceReminderId)
-                    && _reminderDeliveryObservers.Remove(completed.SourceReminderId, out var reminderObserver))
+                if (completed.SourceReminderId is { } sourceReminderKey
+                    && !string.IsNullOrWhiteSpace(sourceReminderKey.Value)
+                    && _reminderDeliveryObservers.Remove(sourceReminderKey, out var reminderObserver))
                 {
                     var delivered = _postedThisTurn || _uploadedFileThisTurn;
                     reminderObserver.Tell(new ReminderDeliveryResult(
-                        completed.SourceReminderId,
+                        sourceReminderKey,
                         ChannelType.Slack,
                         Delivered: delivered,
                         FailureReason: delivered ? null : "Slack post did not succeed",
@@ -1154,9 +1170,136 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
                         cleared => ApplyPendingApprovalPromptCleared(cleared));
                 }
                 _pendingApprovalRequests.Clear();
-
                 break;
         }
+    }
+
+    private Task RenderProcessingStateAsync(ProcessingStateOutput output)
+    {
+        _processingIndicatorActive = output.IsProcessing;
+        var requirement = output.IsRequired
+            ? ChannelOutputRequirement.Required
+            : ChannelOutputRequirement.Optional;
+        var request = new ChannelOutputRenderRequest(
+            BuildOutputRenderTarget(),
+            output,
+            ChannelOutputEffectKind.ProcessingIndicator,
+            requirement);
+
+        var renderTask = QueueProcessingStateRender(request, output.IsRequired);
+        return output.IsRequired ? renderTask : Task.CompletedTask;
+    }
+
+    private Task QueueProcessingStateRender(ChannelOutputRenderRequest request, bool isRequired)
+    {
+        lock (_processingIndicatorRenderLock)
+        {
+            _processingIndicatorRenderTail = RenderAfterPreviousAsync(
+                _processingIndicatorRenderTail,
+                request,
+                isRequired);
+            return _processingIndicatorRenderTail;
+        }
+    }
+
+    private async Task RenderAfterPreviousAsync(
+        Task previous,
+        ChannelOutputRenderRequest request,
+        bool isRequired)
+    {
+        try
+        {
+            await previous.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // A failed required render is reported to its caller. It must not
+            // poison the queue and prevent newer state from reaching Slack.
+            _log.Warning(ex, "Previous required Slack processing indicator render failed; continuing with newer state");
+        }
+
+        await RenderProcessingStateRequestAsync(request, isRequired).ConfigureAwait(false);
+    }
+
+    private void QueueProcessingIndicatorClearIfActive()
+    {
+        if (!_processingIndicatorActive)
+            return;
+
+        _ = RenderProcessingStateAsync(new ProcessingStateOutput(false)
+        {
+            SessionId = _sessionId
+        });
+    }
+
+    private void QueueProcessingIndicatorRefreshIfActive()
+    {
+        if (!_processingIndicatorActive)
+            return;
+
+        // Slack clears assistant thread status when the app sends a reply; keep
+        // long-running turns visible after Slack-side thread activity while the
+        // session still reports Processing. See SlackProcessingOutputRenderer.
+        _ = RenderProcessingStateAsync(new ProcessingStateOutput(true)
+        {
+            SessionId = _sessionId
+        });
+    }
+
+    private async Task RenderProcessingStateRequestAsync(
+        ChannelOutputRenderRequest request,
+        bool isRequired)
+    {
+        try
+        {
+            await RenderOutputWithTimeoutAsync(_dependencies.ChannelRegistry, request);
+        }
+        catch (Exception ex) when (!isRequired)
+        {
+            _log.Warning(ex, "Failed rendering optional Slack processing indicator");
+        }
+    }
+
+    private static async Task RenderOutputWithTimeoutAsync(
+        IChannelRegistry registry,
+        ChannelOutputRenderRequest request)
+    {
+        using var renderCts = new CancellationTokenSource(ProcessingIndicatorTimeout);
+        var renderTask = registry.RenderOutputAsync(request, renderCts.Token).AsTask();
+        try
+        {
+            await renderTask.WaitAsync(ProcessingIndicatorTimeout);
+        }
+        finally
+        {
+            if (!renderTask.IsCompleted)
+                ObserveLateProcessingRender(renderTask);
+        }
+    }
+
+    private static void ObserveLateProcessingRender(Task renderTask)
+    {
+        _ = renderTask.ContinueWith(
+            static task =>
+            {
+                _ = task.Exception;
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private ChannelDeliveryTarget BuildOutputRenderTarget()
+    {
+        var channelKey = ChannelDescriptorKey.FromChannelType(ChannelType.Slack);
+        return new ChannelDeliveryTarget(
+            channelKey,
+            new ResolvedChannelAddress(
+                channelKey,
+                ChannelAddressKind.Destination,
+                _channelId.Value,
+                _channelId.Value),
+            _threadTs.Value);
     }
 
     private async Task<bool> TryHandleTextApprovalResponseAsync(SlackThreadInbound message)
@@ -1312,7 +1455,7 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
         // already-resolved banner — both surfaced by the #939 code review. The
         // session is the authority on whether the call is still pending and
         // whether the sender is allowed. Only redraw on CommandAck.
-        ICommandReply feedbackResult;
+        ISessionResponse feedbackResult;
         try
         {
             using var feedbackCts = new CancellationTokenSource(OperationTimeout);
@@ -1350,7 +1493,7 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
                 break;
 
             default:
-                // ICommandReply is sealed-by-convention to Ack/Nack. Defensive guard.
+                // ISessionResponse is sealed-by-convention to Ack/Nack. Defensive guard.
                 _log.Warning(
                     "Slack approval response for call {CallId} returned unexpected feedback result {ResultType}",
                     message.CallId,
@@ -1432,6 +1575,7 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
 
             _log.Info("Posted Slack reply message");
             ChannelTelemetry.For(ChannelType.Slack).RecordReplyPosted(_dependencies.TimeProvider.GetElapsedTime(startedAt).TotalMilliseconds);
+            QueueProcessingIndicatorRefreshIfActive();
             return PostResult.Ok;
         }
         catch (OperationCanceledException ex)

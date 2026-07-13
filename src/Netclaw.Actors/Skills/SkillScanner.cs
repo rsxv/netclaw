@@ -1,4 +1,4 @@
-﻿// -----------------------------------------------------------------------
+// -----------------------------------------------------------------------
 // <copyright file="SkillScanner.cs" company="Petabridge, LLC">
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
@@ -14,8 +14,8 @@ namespace Netclaw.Actors.Skills;
 /// <summary>
 /// Discovers skills under the skills directory using the AgentSkills.io
 /// directory layout: each skill is a directory containing <c>SKILL.md</c>
-/// with YAML frontmatter. Optional subdirectories (<c>scripts/</c>,
-/// <c>references/</c>, <c>assets/</c>) hold progressive-disclosure resources.
+/// with YAML frontmatter. Additional files under the skill directory are
+/// progressive-disclosure resources.
 /// </summary>
 public static partial class SkillScanner
 {
@@ -27,11 +27,6 @@ public static partial class SkillScanner
     /// The directory name for system skills (synced from CDN, read-only).
     /// </summary>
     public const string SystemCategory = ".system";
-
-    /// <summary>
-    /// Standard subdirectories within a skill directory that contain resources.
-    /// </summary>
-    private static readonly string[] ResourceSubdirectories = ["scripts", "references", "assets"];
 
     [GeneratedRegex(@"^#\s+(.+)$", RegexOptions.Multiline)]
     private static partial Regex HeadingRegex();
@@ -285,24 +280,31 @@ public static partial class SkillScanner
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            var skillName = NormalizeSkillName(Path.GetFileName(Path.GetDirectoryName(canonicalSkillFilePath)!));
             issues.Add(new SkillScanIssue(
                 Path: canonicalSkillFilePath,
                 Kind: SkillScanIssueKind.UnreadableFile,
-                Message: $"Failed to read skill file: {ex.Message}"));
+                Message: $"Failed to read skill file: {ex.Message}",
+                SkillName: skillName));
             return null;
         }
 
         var frontmatter = ExtractFrontmatter(content);
         if (frontmatter is null)
         {
+            var skillName = NormalizeSkillName(Path.GetFileName(Path.GetDirectoryName(canonicalSkillFilePath)!));
+            // content is from File.ReadAllText, which already strips any UTF-8 BOM, so no TrimStart
+            // is needed here; BOM tolerance for direct-string callers lives in ExtractFrontmatter.
+            var hasFrontmatterStart = content.StartsWith("---", StringComparison.Ordinal);
             issues.Add(new SkillScanIssue(
                 Path: canonicalSkillFilePath,
-                Kind: content.StartsWith("---", StringComparison.Ordinal)
+                Kind: hasFrontmatterStart
                     ? SkillScanIssueKind.InvalidFrontmatter
                     : SkillScanIssueKind.MissingFrontmatter,
-                Message: content.StartsWith("---", StringComparison.Ordinal)
+                Message: hasFrontmatterStart
                     ? "Skill frontmatter is invalid or unparseable."
-                    : "Skill file must start with YAML frontmatter."));
+                    : "Skill file must start with YAML frontmatter.",
+                SkillName: skillName));
             return null;
         }
 
@@ -334,32 +336,28 @@ public static partial class SkillScanner
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            var skillName = NormalizeSkillName(Path.GetFileNameWithoutExtension(canonicalPath));
             issues.Add(new SkillScanIssue(
                 Path: canonicalPath,
                 Kind: SkillScanIssueKind.UnreadableFile,
-                Message: $"Failed to read flat skill file: {ex.Message}"));
+                Message: $"Failed to read flat skill file: {ex.Message}",
+                SkillName: skillName));
             return null;
         }
 
         var frontmatter = ExtractFrontmatter(content);
         if (frontmatter is null)
         {
+            // content is from File.ReadAllText (BOM already stripped), so no TrimStart needed.
             if (allowFrontmatterlessFlatFiles && !content.StartsWith("---", StringComparison.Ordinal))
                 return BuildFlatSkillEntryWithoutFrontmatter(canonicalPath, canonicalRoot, content, issues);
 
+            var skillName = NormalizeSkillName(Path.GetFileNameWithoutExtension(canonicalPath));
             issues.Add(new SkillScanIssue(
                 Path: canonicalPath,
                 Kind: SkillScanIssueKind.FlatFileMissingFrontmatter,
-                Message: "Flat .md file found but lacks valid YAML frontmatter. Add frontmatter with name and description, or move into a skill-name/SKILL.md directory."));
-            return null;
-        }
-
-        if (string.IsNullOrWhiteSpace(frontmatter.Description))
-        {
-            issues.Add(new SkillScanIssue(
-                Path: canonicalPath,
-                Kind: SkillScanIssueKind.FlatFileNoDescription,
-                Message: "Flat .md file has frontmatter but missing description field."));
+                Message: "Flat .md file found but lacks valid YAML frontmatter. Add frontmatter with name and description, or move into a skill-name/SKILL.md directory.",
+                SkillName: skillName));
             return null;
         }
 
@@ -368,6 +366,16 @@ public static partial class SkillScanner
         var name = !string.IsNullOrWhiteSpace(frontmatter.Name)
             ? NormalizeSkillName(frontmatter.Name)
             : NormalizeSkillName(fileNameWithoutExt);
+
+        if (string.IsNullOrWhiteSpace(frontmatter.Description))
+        {
+            issues.Add(new SkillScanIssue(
+                Path: canonicalPath,
+                Kind: SkillScanIssueKind.FlatFileNoDescription,
+                Message: "Flat .md file has frontmatter but missing description field.",
+                SkillName: name));
+            return null;
+        }
 
         if (strictNameMatch && !string.IsNullOrWhiteSpace(frontmatter.Name))
         {
@@ -410,6 +418,8 @@ public static partial class SkillScanner
     /// </summary>
     public static SkillFrontmatter? ExtractFrontmatter(string content)
     {
+        // Strip UTF-8 BOM — some editors (e.g., Notepad on Windows) prepend \uFEFF
+        content = content.TrimStart('\uFEFF');
         if (!content.StartsWith("---", StringComparison.Ordinal))
             return null;
 
@@ -418,7 +428,16 @@ public static partial class SkillScanner
         if (closingIndex < 0)
             return null;
 
-        var yamlBlock = content[(content.IndexOf('\n', 0) + 1)..closingIndex];
+        // Guard degenerate blocks like "---\n---" where the opening line's newline IS the
+        // closing delimiter: the YAML body is empty, so there is nothing to deserialize.
+        // Without this, content[(firstNewline+1)..closingIndex] slices a negative-length
+        // range and throws ArgumentOutOfRangeException, which propagates out of Scan (the
+        // parse calls are unguarded) and aborts the entire skill-discovery pass.
+        var firstNewline = content.IndexOf('\n', StringComparison.Ordinal);
+        if (firstNewline < 0 || firstNewline >= closingIndex)
+            return null;
+
+        var yamlBlock = content[(firstNewline + 1)..closingIndex];
 
         try
         {
@@ -456,10 +475,14 @@ public static partial class SkillScanner
         // Description is required per AgentSkills.io spec
         if (string.IsNullOrWhiteSpace(fm.Description))
         {
+            var skillName = !string.IsNullOrWhiteSpace(fm.Name)
+                ? NormalizeSkillName(fm.Name)
+                : NormalizeSkillName(Path.GetFileName(skillDirectory));
             issues.Add(new SkillScanIssue(
                 Path: filePath,
                 Kind: SkillScanIssueKind.MissingDescription,
-                Message: "Skill frontmatter must include a non-empty description."));
+                Message: "Skill frontmatter must include a non-empty description.",
+                SkillName: skillName));
             return null;
         }
 
@@ -571,7 +594,7 @@ public static partial class SkillScanner
     }
 
     /// <summary>
-    /// Enumerates resource files in standard subdirectories of a skill directory.
+    /// Enumerates non-root resource files under a skill directory.
     /// Returns null if no resources are found.
     /// </summary>
     private static IReadOnlyList<string>? EnumerateResources(string skillDirectory, string rootDirectory, List<SkillScanIssue> issues, bool allowSymlinks = false)
@@ -579,39 +602,36 @@ public static partial class SkillScanner
         List<string>? resources = null;
         var canonicalRoot = PathUtility.Normalize(rootDirectory);
 
-        foreach (var subDirName in ResourceSubdirectories)
+        string[] files;
+        try
         {
-            var subDir = Path.Combine(skillDirectory, subDirName);
-            if (!Directory.Exists(subDir))
+            files = Directory.GetFiles(skillDirectory, "*", SearchOption.AllDirectories);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // skillDirectory is already the skill's own directory, so its leaf name IS the
+            // skill name — do not climb to the parent (that yields the container dir, e.g. "files").
+            var skillName = NormalizeSkillName(Path.GetFileName(skillDirectory));
+            issues.Add(new SkillScanIssue(
+                Path: skillDirectory,
+                Kind: SkillScanIssueKind.ResourceEnumerationFailed,
+                Message: $"Failed to enumerate resources: {ex.Message}",
+                SkillName: skillName));
+            return null;
+        }
+
+        foreach (var file in files.OrderBy(static f => f, StringComparer.Ordinal))
+        {
+            if (PathUtility.AreEquivalentPaths(file, Path.Combine(skillDirectory, SkillFileName)))
                 continue;
 
-            if (ValidateCanonicalPath(subDir, canonicalRoot, issues, $"resource directory '{subDirName}'", allowSymlinks) is null)
+            if (ValidateCanonicalPath(file, canonicalRoot, issues, "resource file", allowSymlinks) is null)
                 return null;
 
-            string[] files;
-            try
-            {
-                files = Directory.GetFiles(subDir, "*", SearchOption.AllDirectories);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                issues.Add(new SkillScanIssue(
-                    Path: subDir,
-                    Kind: SkillScanIssueKind.ResourceEnumerationFailed,
-                    Message: $"Failed to enumerate resources: {ex.Message}"));
-                return null;
-            }
-
-            foreach (var file in files)
-            {
-                if (ValidateCanonicalPath(file, canonicalRoot, issues, "resource file", allowSymlinks) is null)
-                    return null;
-
-                var relativePath = Path.GetRelativePath(skillDirectory, file)
-                    .Replace(Path.DirectorySeparatorChar, '/');
-                resources ??= [];
-                resources.Add(relativePath);
-            }
+            var relativePath = Path.GetRelativePath(skillDirectory, file)
+                .Replace(Path.DirectorySeparatorChar, '/');
+            resources ??= [];
+            resources.Add(relativePath);
         }
 
         return resources;
@@ -644,10 +664,12 @@ public static partial class SkillScanner
         var description = ExtractFirstNonEmptyMarkdownLine(content);
         if (string.IsNullOrWhiteSpace(description))
         {
+            var skillName = NormalizeSkillName(Path.GetFileNameWithoutExtension(canonicalPath));
             issues.Add(new SkillScanIssue(
                 Path: canonicalPath,
                 Kind: SkillScanIssueKind.FlatFileNoDescription,
-                Message: "Flat .md file without frontmatter must contain at least one non-empty line to infer a description."));
+                Message: "Flat .md file without frontmatter must contain at least one non-empty line to infer a description.",
+                SkillName: skillName));
             return null;
         }
 

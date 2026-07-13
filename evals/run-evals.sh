@@ -328,7 +328,12 @@ start_eval_daemon() {
     if [[ -d "$template_dir" ]]; then
         # Substitute placeholders with eval-appropriate defaults
         substitute_identity_template "$template_dir/SOUL.template.md" "$EVAL_HOME/identity/SOUL.md"
-        substitute_identity_template "$template_dir/AGENTS.template.md" "$EVAL_HOME/identity/AGENTS.md"
+        if [[ -f "$REPO_ROOT/evals/fixtures/identity/AGENTS.md" ]]; then
+            cp "$REPO_ROOT/evals/fixtures/identity/AGENTS.md" "$EVAL_HOME/identity/AGENTS.md"
+        else
+            echo "ERROR: deployment mission eval fixture is missing." >&2
+            exit 1
+        fi
         substitute_identity_template "$template_dir/TOOLING.template.md" "$EVAL_HOME/identity/TOOLING.md"
     else
         echo "ERROR: no identity templates at $template_dir/ — Identity evals will fail." >&2
@@ -587,16 +592,16 @@ store_metrics() {
 
     # When no explicit usage line is passed, read the last one in STDOUT_FILE.
     if [[ -z "$usage_line" ]]; then
-        usage_line=$(grep -o '\[usage\].*' "$STDOUT_FILE" 2>/dev/null | tail -1) || return 0
+        usage_line=$(grep -ao '\[usage\].*' "$STDOUT_FILE" 2>/dev/null | tail -1) || return 0
     fi
 
     # Parse fields from: [usage] in=X out=Y total=Z cached=C prompt_ms=P tok_s=T
     local input_tokens output_tokens cached_tokens prompt_ms tok_s
-    input_tokens=$(echo "$usage_line" | grep -oP 'in=\K[0-9]+' || echo "")
-    output_tokens=$(echo "$usage_line" | grep -oP 'out=\K[0-9]+' || echo "")
-    cached_tokens=$(echo "$usage_line" | grep -oP 'cached=\K[0-9]+' || echo "")
-    prompt_ms=$(echo "$usage_line" | grep -oP 'prompt_ms=\K[0-9.]+' || echo "")
-    tok_s=$(echo "$usage_line" | grep -oP 'tok_s=\K[0-9.]+' || echo "")
+    input_tokens=$(echo "$usage_line" | grep -aoP 'in=\K[0-9]+' || echo "")
+    output_tokens=$(echo "$usage_line" | grep -aoP 'out=\K[0-9]+' || echo "")
+    cached_tokens=$(echo "$usage_line" | grep -aoP 'cached=\K[0-9]+' || echo "")
+    prompt_ms=$(echo "$usage_line" | grep -aoP 'prompt_ms=\K[0-9.]+' || echo "")
+    tok_s=$(echo "$usage_line" | grep -aoP 'tok_s=\K[0-9.]+' || echo "")
 
     # Skip if no metrics found
     [[ -z "$input_tokens" && -z "$cached_tokens" && -z "$prompt_ms" ]] && return 0
@@ -770,7 +775,7 @@ run_prompt_resume() {
     cat "$turn_file" >> "$STDOUT_FILE"
 
     # Per-turn metrics — read the usage line from this turn's file only.
-    LAST_TURN_USAGE_LINE=$(grep -o '\[usage\].*' "$turn_file" 2>/dev/null | tail -1 || echo "")
+    LAST_TURN_USAGE_LINE=$(grep -ao '\[usage\].*' "$turn_file" 2>/dev/null | tail -1 || echo "")
 
     sleep 2
 }
@@ -843,20 +848,25 @@ run_multi_turn_case() {
 
 # ─── Assertion Helpers ────────────────────────────────────────────────────────
 
+# Transcript greps use -a as cheap hardening: captured CLI output may carry
+# terminal control bytes, and -a keeps grep in text mode regardless. Note the
+# memory_identity_preference_routing flake was NOT this — it was a substring
+# bug in that assertion's pattern (see the comment there).
+
 stdout_contains() {
-    grep -qi "$1" "$STDOUT_FILE" 2>/dev/null
+    grep -qia "$1" "$STDOUT_FILE" 2>/dev/null
 }
 
 stdout_not_contains() {
-    ! grep -qi "$1" "$STDOUT_FILE" 2>/dev/null
+    ! grep -qia "$1" "$STDOUT_FILE" 2>/dev/null
 }
 
 stdout_response_contains() {
-    grep -v '^\[tool:call\]' "$STDOUT_FILE" 2>/dev/null | grep -qi "$1"
+    grep -av '^\[tool:call\]' "$STDOUT_FILE" 2>/dev/null | grep -qia "$1"
 }
 
 stdout_response_not_contains() {
-    if grep -v '^\[tool:call\]' "$STDOUT_FILE" 2>/dev/null | grep -qi "$1"; then
+    if grep -av '^\[tool:call\]' "$STDOUT_FILE" 2>/dev/null | grep -qia "$1"; then
         return 1
     fi
     return 0
@@ -869,20 +879,20 @@ daemon_log_tail() {
 }
 
 daemon_log_contains() {
-    daemon_log_tail | grep -qE "$1" 2>/dev/null
+    daemon_log_tail | grep -qaE "$1" 2>/dev/null
 }
 
 daemon_log_skill_loaded() {
     local skill_name="$1"
-    daemon_log_tail | grep -qE "turn_skill_loaded skill=$skill_name" 2>/dev/null
+    daemon_log_tail | grep -qaE "turn_skill_loaded skill=$skill_name" 2>/dev/null
 }
 
 daemon_log_no_skill_loaded() {
-    ! daemon_log_tail | grep -qE "turn_skill_loaded" 2>/dev/null
+    ! daemon_log_tail | grep -qaE "turn_skill_loaded" 2>/dev/null
 }
 
 stdout_tool_called() {
-    grep -qE "\\[tool:call\\] $1\\(" "$STDOUT_FILE" 2>/dev/null
+    grep -qaE "\\[tool:call\\] $1\\(" "$STDOUT_FILE" 2>/dev/null
 }
 
 # ─── Case Assertion Functions ─────────────────────────────────────────────────
@@ -904,10 +914,28 @@ assert_identity_session() {
     stdout_contains 'headless/' || stdout_contains 'signalr/' || stdout_contains 'slack/'
 }
 
+assert_identity_file_routing() {
+    stdout_response_contains 'SOUL.md' && \
+        stdout_response_contains 'AGENTS.md' && \
+        stdout_response_contains 'TOOLING.md' && \
+        daemon_log_no_skill_loaded
+}
+
 # Category 2: Skill Discovery — tests that the model retrieves procedural
 # knowledge from skills when needed AND actually loaded the skill to get it.
 assert_skill_scheduling_knowledge() {
     stdout_contains 'cron' && daemon_log_skill_loaded 'netclaw-operations'
+}
+
+# Two-hop progressive disclosure: the model must (1) load netclaw-operations, then
+# (2) call skill_read_resource on references/scheduling.md to recover a detail that
+# lives ONLY in the reference file (the auto-disable threshold + alert name), never
+# in the slim SKILL.md index. Catches a model that loads the index but skips the
+# second hop — the failure mode that silently regresses smaller local agents.
+assert_skill_progressive_disclosure() {
+    daemon_log_skill_loaded 'netclaw-operations' \
+        && stdout_tool_called 'skill_read_resource' \
+        && { stdout_contains 'ReminderAutoDisabled' || stdout_contains '5 consecutive'; }
 }
 
 assert_skill_memory_knowledge() {
@@ -975,11 +1003,26 @@ assert_skill_no_activation_general_code() {
 
 # Category 3: Memory Pipeline
 assert_memory_recall_active() {
-    daemon_log_contains 'turn_memory_recall.*degraded=False'
+    # The structured turn_memory_recall event (TurnLog/Akka) no longer lands in the file logs
+    # after the log-stream partition (#1472). Assert on the MEL recall-pipeline signals that do:
+    # a completed retrieval (memory_retrieval_final) with no degrade warning.
+    daemon_log_contains 'memory_retrieval_final' \
+        && ! daemon_log_contains 'memory_recall_degraded'
 }
 
+# Per the netclaw-agent-memory spec, durable user preferences are memory documents,
+# not identity-file edits. The invariant under test: the preference is routed to
+# memory and NOT written to an identity file (SOUL.md). The eval memory store is
+# shared across runs, so after the first store the model correctly recognizes the
+# fact is already in durable memory rather than re-storing it — both are correct
+# routing. The hard failure we guard against is a SOUL.md (file_edit/file_write) edit.
 assert_memory_identity_preference_routing() {
-    stdout_contains 'SOUL\.md' && (stdout_tool_called 'file_edit' || stdout_tool_called 'file_write')
+    # 'memor' not 'memory': correct responses often say "memories", and the
+    # plural drops the y — "memories" does not contain the substring "memory".
+    # Run af0883b5 rejected two behaviorally-correct runs on exactly this.
+    ! stdout_tool_called 'file_edit' \
+        && ! stdout_tool_called 'file_write' \
+        && { stdout_tool_called 'store_memory' || stdout_contains 'memor'; }
 }
 
 assert_memory_explicit_store() {
@@ -987,7 +1030,11 @@ assert_memory_explicit_store() {
 }
 
 assert_memory_checkpoint_enqueue() {
-    daemon_log_contains 'turn_memory_checkpoint_enqueued' \
+    # turn_memory_checkpoint_enqueued (TurnLog/Akka) no longer lands in the file logs after the
+    # log-stream partition (#1472). A turn-complete checkpoint that was enqueued is proven by the
+    # curation worker processing it (MEL, in daemon.log) — whether the fact is later kept or
+    # dropped. Combined with no explicit memory tool call, this verifies automatic enqueue.
+    daemon_log_contains 'Memory checkpoint curation completed.*trigger=turn-complete' \
         && ! stdout_tool_called 'store_memory' \
         && ! stdout_tool_called 'update_memory'
 }
@@ -1030,10 +1077,11 @@ assert_tool_file_list() {
 }
 
 assert_tool_timeout_arg_recovery() {
-    # Loud arg validation: if the model emits a near-miss timeout key
-    # (TimeoutSeconds, timeout_seconds), the rejection's did-you-mean must
-    # steer it to the canonical _timeout_seconds within the turn — the
-    # command actually running is the proof of recovery.
+    # Spelling-tolerant meta keys: a near-miss timeout key (TimeoutSeconds,
+    # timeout_seconds, Timeout) now resolves onto _timeout_seconds and is
+    # consumed directly — no rejection round-trip needed. If the model instead
+    # emits the canonical key, that works too. Either way the command running is
+    # the proof the timeout hint was honored, not dropped.
     stdout_contains '\[tool:call\] shell_execute' \
         && stdout_contains 'netclaw-timeout-eval-ok'
 }
@@ -1082,15 +1130,30 @@ assert_autonomy_web_fetch() {
     stdout_contains '\[tool:call\] web_search' || stdout_contains '\[tool:call\] web_fetch'
 }
 
+# Category 6a: Deployment Mission
+assert_deployment_mission_sales_email() {
+    daemon_log_skill_loaded 'business-email-review' && \
+        stdout_response_contains '^Subject:' && \
+        stdout_response_contains 'Would Tuesday or Wednesday work for a 15-minute call?'
+}
+
 # Category 6b: Subagents
 assert_subagent_headless_ambiguous_task() {
     stdout_tool_called 'spawn_agent' && \
-        daemon_log_contains 'SubAgent \[headless-analyst\] completed \(success=True' && \
+        stdout_contains '\[subagent:done\] headless-analyst (completed' && \
         stdout_response_contains 'assumption' && \
         stdout_response_not_contains 'which.*include' && \
         stdout_response_not_contains 'what.*include' && \
         stdout_response_not_contains 'please.*clarify' && \
         stdout_response_not_contains 'need.*more.*information'
+}
+
+assert_subagent_specialization_precedence() {
+    stdout_tool_called 'spawn_agent' && \
+        stdout_contains '\[subagent:done\] headless-analyst (completed' && \
+        stdout_contains 'SPECIALIZED ANALYST BRIEF' && \
+        stdout_response_contains '^Subject:' && \
+        stdout_response_contains 'Would Tuesday or Wednesday work for a 15-minute call?'
 }
 
 # Category 7: Complex Task Execution
@@ -1161,7 +1224,7 @@ assert_multi_turn_text_growth() {
     # The point of this case is the per-turn metrics, not a behavioral assertion.
     # We require that at least 5 [usage] lines were emitted (one per turn).
     local usage_count
-    usage_count=$(grep -c '\[usage\]' "$STDOUT_FILE" 2>/dev/null)
+    usage_count=$(grep -ac '\[usage\]' "$STDOUT_FILE" 2>/dev/null)
     usage_count="${usage_count:-0}"
     [[ "$usage_count" -ge 5 ]]
 }
@@ -1218,8 +1281,8 @@ assert_approval_set_working_directory_positive() {
     # If shell_execute also happened, ensure set_working_directory came first.
     if stdout_tool_called 'shell_execute'; then
         local swd_line shell_line
-        swd_line=$(grep -nE '\[tool:call\] set_working_directory' "$STDOUT_FILE" | head -1 | cut -d: -f1)
-        shell_line=$(grep -nE '\[tool:call\] shell_execute' "$STDOUT_FILE" | head -1 | cut -d: -f1)
+        swd_line=$(grep -anE '\[tool:call\] set_working_directory' "$STDOUT_FILE" | head -1 | cut -d: -f1)
+        shell_line=$(grep -anE '\[tool:call\] shell_execute' "$STDOUT_FILE" | head -1 | cut -d: -f1)
         [[ -n "$swd_line" && -n "$shell_line" && "$swd_line" -lt "$shell_line" ]]
     fi
 }
@@ -1381,6 +1444,10 @@ run_all() {
         "What is your session ID?" \
         "What session are we in?"
 
+    run_case identity_file_routing "routes all three identity concerns without loading a skill" \
+        "Which identity file should hold each of these: my communication style, this deployment's recurring sales workflow, and the tools available on this host?" \
+        "Map personality and operator context, deployment mission and review rules, and environment capabilities to the correct Netclaw identity files."
+
     end_category
 
     # ── Category 2: Skill Discovery ──
@@ -1392,6 +1459,9 @@ run_all() {
         "What types of schedules can I create with set_reminder? Be specific about the formats." \
         "What scheduling formats do Netclaw reminders support?" \
         "Explain the different schedule types I can use with reminders"
+
+    run_case skill_progressive_disclosure "reads reference via skill_read_resource (2nd hop)" \
+        "Exactly how many consecutive reminder execution failures cause Netclaw to auto-disable a reminder, and what is the exact name of the alert it raises when that happens? Be precise."
 
     run_case skill_memory_knowledge "knows memory classes from skill" \
         "What types of memory do you have? Explain the differences and how long each lasts." \
@@ -1478,7 +1548,7 @@ run_all() {
     run_case memory_recall_active "recall active, not degraded" \
         "What do you know about me?"
 
-    run_case memory_identity_preference_routing "personal preference routed to SOUL.md" \
+    run_case memory_identity_preference_routing "durable user preference routed to memory, not SOUL.md" \
         "Please remember this new preference for future conversations: my favorite color is chartreuse. Use whichever persistent storage path Netclaw's identity-vs-memory rules require, then acknowledge once you've saved it."
 
     run_case memory_explicit_store "explicit remember request uses store_memory" \
@@ -1548,12 +1618,30 @@ run_all() {
 
     end_category
 
+    # ── Category 6a: Deployment Mission ──
+    print_category "Deployment Mission"
+
+    run_case deployment_mission_sales_email "loads the required skill and returns reviewed mission-compliant email" \
+        "Write a short prospecting email to Morgan, an engineering director evaluating incident-response tools. Introduce Netclaw and ask for a call." \
+        "Draft a concise outbound email to Riley, a platform lead looking to reduce repetitive operations work. Offer a brief Netclaw introduction."
+
+    end_category
+
     # ── Category 6b: Subagents ──
     print_category "Subagents"
+
+    local previous_timeout="$PROMPT_TIMEOUT"
+    PROMPT_TIMEOUT=120
 
     run_case subagent_headless_ambiguous_task "spawned subagent completes ambiguous task without clarification" \
         "Use spawn_agent with agent headless-analyst. Ask it to prepare final release notes from these candidate changes without asking follow-up questions. Include everything that looks user-facing: fixed arrow-key input decoding; updated an internal test helper; improved file trace listener encoding. Return the subagent's assumptions and final notes." \
         "Delegate this to the headless-analyst subagent using spawn_agent: decide what belongs in release notes from this ambiguous list without asking me for clarification: legacy CSI key decoding fix; private test fixture cleanup; file trace listener writes UTF-8 correctly. Include all user-facing items and return assumptions plus final notes."
+
+    run_case subagent_specialization_precedence "specialized subagent guidance overrides a conflicting deployment playbook" \
+        "Use spawn_agent with agent headless-analyst to write a prospecting email to Casey, a VP of Engineering interested in reducing operational toil. Return its final email." \
+        "Delegate to headless-analyst: draft an outbound email for Jordan, a technology leader evaluating autonomous operations. Return the worker's final email."
+
+    PROMPT_TIMEOUT="$previous_timeout"
 
     end_category
 

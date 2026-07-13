@@ -9,11 +9,14 @@ using Akka.Serialization;
 using Google.Protobuf;
 using Netclaw.Actors.Channels;
 using Netclaw.Actors.Hosting;
+using Netclaw.Actors.Jobs;
 using Netclaw.Actors.Protocol;
 using Netclaw.Actors.Reminders;
+using Netclaw.Actors.Serialization;
 using Netclaw.Actors.Sessions;
 using Netclaw.Tools;
 using Xunit;
+using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Actors.Tests.Protocol;
 
@@ -130,6 +133,71 @@ public sealed class SerializationRoundTripTests : TestKit
     }
 
     [Fact]
+    public void TurnRecorded_round_trips_preserving_value_object_source_ids()
+    {
+        var original = new TurnRecorded
+        {
+            SessionId = new SessionId("C99999/1708531200.000100"),
+            UserMessage = new SerializableChatMessage { Role = ChatRole.User, Content = "check PR" },
+            AssistantReply = new SerializableChatMessage { Role = ChatRole.Assistant, Content = "merged" },
+            RecordedAtMs = 1_700_000_000_000,
+            SourceReminderId = new ReminderId("check-pr:1712000000000"),
+            SourceBackgroundJobId = new BackgroundJobId("bg-job:abc123")
+        };
+
+        var result = RoundTrip(original);
+
+        Assert.Equal(original.SourceReminderId, result.SourceReminderId);
+        Assert.Equal(original.SourceBackgroundJobId, result.SourceBackgroundJobId);
+    }
+
+    [Fact]
+    public void TurnRecorded_round_trips_with_null_source_ids()
+    {
+        var original = new TurnRecorded
+        {
+            SessionId = new SessionId("C99999/1708531200.000100"),
+            UserMessage = new SerializableChatMessage { Role = ChatRole.User, Content = "hi" },
+            AssistantReply = new SerializableChatMessage { Role = ChatRole.Assistant, Content = "hello" },
+            RecordedAtMs = 1_700_000_000_000
+        };
+
+        var result = RoundTrip(original);
+
+        Assert.Null(result.SourceReminderId);
+        Assert.Null(result.SourceBackgroundJobId);
+    }
+
+    [Fact]
+    public void TurnRecorded_value_object_source_ids_use_bare_string_proto_fields()
+    {
+        // Wire-compat: the reminder/background-job value objects map to the SAME
+        // bare-string proto fields the pre-value-object code used, so old journals
+        // deserialize unchanged and new journals are byte-identical. Proven at the
+        // proto-mapper boundary in both directions.
+        var evt = new TurnRecorded
+        {
+            SessionId = new SessionId("C99999/1708531200.000100"),
+            UserMessage = new SerializableChatMessage { Role = ChatRole.User, Content = "x" },
+            AssistantReply = new SerializableChatMessage { Role = ChatRole.Assistant, Content = "y" },
+            RecordedAtMs = 1_700_000_000_000,
+            SourceReminderId = new ReminderId("check-pr:1712000000000"),
+            SourceBackgroundJobId = new BackgroundJobId("bg-job:abc123")
+        };
+
+        // Forward: value object -> bare string on the wire (no nested object).
+        var proto = NetclawProtoMapper.ToProto(evt);
+        Assert.Equal("check-pr:1712000000000", proto.SourceReminderId);
+        Assert.Equal("bg-job:abc123", proto.SourceBackgroundJobId);
+
+        // Reverse: an "old" proto carrying bare strings deserializes into the
+        // value-object-typed event.
+        var restored = NetclawProtoMapper.FromProto(proto);
+        Assert.Equal(new ReminderId("check-pr:1712000000000"), restored.SourceReminderId);
+        Assert.Equal(new BackgroundJobId("bg-job:abc123"), restored.SourceBackgroundJobId);
+    }
+
+    [Fact]
     public void SessionCompacted_round_trips_with_messages()
     {
         var ts = new DateTimeOffset(2026, 2, 21, 11, 0, 0, TimeSpan.Zero);
@@ -154,29 +222,6 @@ public sealed class SerializationRoundTripTests : TestKit
         Assert.Equal("Summary: all services healthy.", result.CompactedMessages[0].Content);
         Assert.Equal(42, result.TurnCountBefore);
         Assert.Equal(original.CompactedAtMs, result.CompactedAtMs);
-    }
-
-    [Fact]
-    public void TurnBroadcast_round_trips()
-    {
-        var ts = new DateTimeOffset(2026, 2, 21, 10, 1, 5, TimeSpan.Zero);
-        var original = new TurnBroadcast
-        {
-            SessionId = new SessionId("C99999/1708531200.000100"),
-            AssistantReply = new SerializableChatMessage
-            {
-                Role = ChatRole.Assistant,
-                Content = "Here is your answer."
-            },
-            BroadcastAtMs = ts.ToUnixTimeMilliseconds()
-        };
-
-        var result = RoundTrip(original);
-
-        Assert.Equal(original.SessionId, result.SessionId);
-        Assert.Equal(ChatRole.Assistant, result.AssistantReply.Role);
-        Assert.Equal("Here is your answer.", result.AssistantReply.Content);
-        Assert.Equal(original.BroadcastAtMs, result.BroadcastAtMs);
     }
 
     [Fact]
@@ -293,24 +338,6 @@ public sealed class SerializationRoundTripTests : TestKit
 
         Assert.Null(result.ProjectDirectory);
         Assert.Single(result.RecentFiles);
-    }
-
-    [Fact]
-    public void CompactionBroadcast_round_trips()
-    {
-        var ts = new DateTimeOffset(2026, 2, 21, 11, 0, 1, TimeSpan.Zero);
-        var original = new CompactionBroadcast
-        {
-            SessionId = new SessionId("C99999/1708531200.000100"),
-            Summary = "Context compacted after 42 turns.",
-            CompactedAtMs = ts.ToUnixTimeMilliseconds()
-        };
-
-        var result = RoundTrip(original);
-
-        Assert.Equal(original.SessionId, result.SessionId);
-        Assert.Equal(original.Summary, result.Summary);
-        Assert.Equal(original.CompactedAtMs, result.CompactedAtMs);
     }
 
     [Fact]
@@ -782,8 +809,8 @@ public sealed class SerializationRoundTripTests : TestKit
             OptionKeys = [ApprovalOptionKeys.ApproveOnce, ApprovalOptionKeys.ApproveEverywhere, ApprovalOptionKeys.Deny],
             Candidates =
             [
-                new ToolApprovalRequested.ApprovalCandidateRecord { Verb = "git", Directory = "/home/user/project" },
-                new ToolApprovalRequested.ApprovalCandidateRecord { Verb = "ls", Directory = null }
+                new Netclaw.Security.ApprovalCandidate("git", "/home/user/project"),
+                new Netclaw.Security.ApprovalCandidate("ls", null)
             ],
             TurnContext = new TurnContextRecord
             {

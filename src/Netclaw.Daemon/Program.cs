@@ -356,12 +356,15 @@ static NetclawPaths ConfigureConfigServices(IServiceCollection services, IConfig
     // TimeProvider (virtualized for testing)
     services.AddSingleton(TimeProvider.System);
 
-    // Providers and model resolution via plugin architecture
+    // Providers and model resolution via plugin architecture.
+    // No silent fallback to local-ollama: an empty Providers section yields
+    // the NoProviderConfigured outcome and the host registers NoOpChatClientProvider.
     var providers = ProviderConfigurationLoader.Load(configuration.GetSection("Providers"));
-    if (providers.Count == 0)
-        providers = new() { ["local-ollama"] = new ProviderEntry() };
-    var models = configuration.GetSection("Models")
-        .Get<ModelSelection>() ?? new ModelSelection();
+    var models = ModelConfigurationResolver.Resolve(configuration).Selection;
+    var validation = ProviderRuntimeValidation.Evaluate(
+        providers,
+        models,
+        ProviderRuntimeConfiguration.FromConfiguration(configuration));
 
     // The transport RetryingChatClient is the single owner of LLM transient-failure
     // retry, so it uses the configured streaming-retry budget.
@@ -369,7 +372,8 @@ static NetclawPaths ConfigureConfigServices(IServiceCollection services, IConfig
         .BindFromConfiguration(configuration.GetSection("Session"))
         .Tuning.StreamingRetryPolicy;
 
-    services.AddDaemonLlmProviders(providers, models, streamingRetryPolicy);
+    services.AddSingleton(validation);
+    services.AddDaemonLlmProviders(providers, models, validation, streamingRetryPolicy);
 
     return paths;
 }
@@ -393,9 +397,15 @@ static void ConfigureDaemonServices(
     services.AddHostedService<ExposureModeValidationService>();
     services.AddHostedService<BootstrapCompletionMarkerService>();
 
+    var resolvedModels = ModelConfigurationResolver.Resolve(configuration).Selection;
     services
         .AddOptions<ModelSelection>()
-        .Bind(configuration.GetSection("Models"))
+        .Configure(options =>
+        {
+            options.Main = resolvedModels.Main;
+            options.Fallback = resolvedModels.Fallback;
+            options.Compaction = resolvedModels.Compaction;
+        })
         .ValidateOnStart();
     services.AddSingleton<IValidateOptions<ModelSelection>, ModelSelectionValidator>();
     services
@@ -413,8 +423,7 @@ static void ConfigureDaemonServices(
     });
 
     // Resolve models for session config
-    var models = configuration.GetSection("Models")
-        .Get<ModelSelection>() ?? new ModelSelection();
+    var models = resolvedModels;
     services.AddSingleton(models);
 
     // Auto-detect model capabilities via the runtime IModelCapabilityResolver
@@ -423,9 +432,10 @@ static void ConfigureDaemonServices(
     // / LoggerFactory needed, and per-resolver Debug output is visible. The
     // factory is invoked eagerly after Build() (see RunDaemonAsync) so timing
     // matches a startup-bound resolution rather than first-session lazy hit.
+    // Capability resolution runs against the loaded providers as-is — if
+    // no providers are configured we never reach a real plugin, the No-Op
+    // client supersedes, and capabilities default to text-only below.
     var providers = ProviderConfigurationLoader.Load(configuration.GetSection("Providers"));
-    if (providers.Count == 0)
-        providers = new() { ["local-ollama"] = new ProviderEntry() };
     var mainProviderType = providers.TryGetValue(models.Main.Provider, out var mainProvider)
         ? mainProvider.Type
         : null;
@@ -445,37 +455,54 @@ static void ConfigureDaemonServices(
 
     services.AddSingleton<ModelCapabilities>(sp =>
     {
-        var resolver = sp.GetRequiredService<IModelCapabilityResolver>();
         var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("Netclaw.Startup");
 
+        // In degraded mode (No-Op chat client) we never talk to a real model;
+        // skip capability detection (which may do network I/O) and use defaults.
+        var chatProvider = sp.GetRequiredService<IChatClientProvider>();
+        if (chatProvider.IsDegraded)
+        {
+            logger.LogInformation(
+                "No-Op chat client active; skipping model capability detection and using text-only defaults.");
+            return ModelCapabilityResolution.ResolveModelCapabilities(models, detected: null);
+        }
+
+        var resolver = sp.GetRequiredService<IModelCapabilityResolver>();
         var detected = resolver.ResolveAsync(models.Main.ModelId, CancellationToken.None)
             .GetAwaiter().GetResult();
         var resolved = ModelCapabilityResolution.ResolveModelCapabilities(models, detected, logger: logger);
 
-        if (detected is not null)
+        // Report the *effective* capabilities the runtime will use, with per-field
+        // provenance — not the raw detector output. Precedence mirrors
+        // ModelCapabilityResolution: configured override > detected > default. The
+        // previous version logged the detected values, so setting an InputModalities
+        // override on a provider that reports no modalities but does report a context
+        // window (e.g. vLLM) printed "input=unknown" and looked like the override had
+        // been ignored, even though it was applied.
+        var inputSource = models.Main.InputModalities is not null ? "configured"
+            : detected?.InputModalities is not null ? "detected" : "default";
+        var outputSource = models.Main.OutputModalities is not null ? "configured"
+            : detected?.OutputModalities is not null ? "detected" : "default";
+        var contextSource = models.Main.ContextWindow is not null ? "configured"
+            : detected?.ContextWindowTokens is > 0 ? "detected" : "default";
+
+        logger.LogInformation(
+            "Resolved model capabilities for {ModelId}: input={Input} ({InputSource}), "
+            + "output={Output} ({OutputSource}), context_window={ContextWindow} ({ContextSource})",
+            models.Main.ModelId,
+            resolved.InputModalities, inputSource,
+            resolved.OutputModalities, outputSource,
+            resolved.ContextWindowTokens, contextSource);
+
+        // Nudge for the common trap: a multimodal model behind a provider that
+        // advertises no modality metadata runs text-only until an operator sets the
+        // override. Fires only when nothing supplied input modalities.
+        if (inputSource == "default")
         {
             logger.LogInformation(
-                "Auto-detected model capabilities for {ModelId}: input={Input}, output={Output}, context_window={ContextWindow}",
-                models.Main.ModelId,
-                detected.InputModalities?.ToString() ?? "unknown",
-                detected.OutputModalities?.ToString() ?? "unknown",
-                detected.ContextWindowTokens?.ToString() ?? "unknown");
-        }
-        else if (models.Main.ContextWindow is not null
-                 || models.Main.InputModalities is not null
-                 || models.Main.OutputModalities is not null)
-        {
-            logger.LogInformation(
-                "Using configured model capabilities for {ModelId}: input={Input}, output={Output}, context_window={ContextWindow}",
-                models.Main.ModelId,
-                resolved.InputModalities,
-                resolved.OutputModalities,
-                resolved.ContextWindowTokens);
-        }
-        else
-        {
-            logger.LogInformation(
-                "Model {ModelId} not found in capability oracles; defaulting to text-only",
+                "{ModelId} resolved to text-only input; no modality data came from the provider or "
+                + "capability oracles. If this model accepts images, set Models:Main:InputModalities "
+                + "to \"Text, Image\" to enable vision.",
                 models.Main.ModelId);
         }
 
@@ -549,6 +576,11 @@ static void ConfigureDaemonServices(
         paths.PidFilePath,
         paths.LockFilePath,
         paths.RestartManifestPath,
+        // Skill directories managed by the sync service — writes from agent tools
+        // are lost on the next sync cycle and corrupt the sync service's view of
+        // on-disk state. The sync service writes directly via filesystem, not tools.
+        paths.SystemSkillsDirectory,
+        paths.ServerFeedsDirectory,
     };
     var readDenyList = new[]
     {
@@ -642,7 +674,7 @@ static void ConfigureDaemonServices(
     services.AddSingleton<IToolApprovalService, AkkaToolApprovalService>();
 
     var toolRegistry = new ToolRegistry();
-    toolRegistry.WithFirstPartyTools(toolConfig, searchBackend, toolPathPolicy, shellCommandPolicy, toolAccessPolicy, paths,
+    toolRegistry.WithFirstPartyTools(toolConfig, paths, toolPathPolicy, shellCommandPolicy, searchBackend, toolAccessPolicy,
         webhooksConfig.Enabled ? webhookRouteStore : null);
 
     // Skills system: seed built-in skills to .system/, register sync service
@@ -710,9 +742,7 @@ static void ConfigureDaemonServices(
         toolRegistry.Register(new SqliteFindMemoriesTool(memoryStore));
         toolRegistry.Register(new SqliteGetMemoriesTool(memoryStore));
         toolRegistry.Register(new SqliteStoreMemoryTool(new SQLiteMemoryCheckpointSink(memoryStore, TimeProvider.System)));
-        toolRegistry.Register(new SqliteUpdateMemoryTool(
-            memoryStore,
-            new SQLiteMemoryCheckpointSink(memoryStore, TimeProvider.System)));
+        toolRegistry.Register(new SqliteUpdateMemoryTool(memoryStore));
     }
 
     services.AddSingleton<IMemoryExtractor>(NullMemoryExtractor.Instance);
@@ -743,6 +773,13 @@ static void ConfigureDaemonServices(
     {
         services.AddSingleton<IOperationalNotificationSink>(NullNotificationSink.Instance);
     }
+
+    // Posts reminder failure notices to the reminder's destination channel.
+    // IChannelRegistry is always registered (AddChannelRegistry below), so the
+    // real notifier is always available; it no-ops gracefully for reminders whose
+    // channel has no outbound client.
+    services.AddSingleton<Netclaw.Actors.Reminders.IReminderChannelNotifier,
+        Netclaw.Daemon.Reminders.ReminderChannelFailureNotifier>();
 
     // Daemon lifecycle notifier (startup/shutdown webhooks + logging)
     services.AddSingleton<DaemonLifecycleNotifier>();

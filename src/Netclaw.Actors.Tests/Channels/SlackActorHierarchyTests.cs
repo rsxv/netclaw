@@ -11,11 +11,13 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Netclaw.Actors.Channels;
 using Netclaw.Actors.Protocol;
+using Netclaw.Actors.Reminders;
 using Netclaw.Actors.Tests.Channels.TestHelpers;
 using Netclaw.Channels.Slack;
 using Netclaw.Configuration;
 using Netclaw.Security;
 using Xunit;
+using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Actors.Tests.Channels;
 
@@ -277,6 +279,7 @@ public sealed class SlackActorHierarchyTests(ITestOutputHelper output) : TestKit
             },
             BotUserId: new SlackUserId("UBOT"),
             DefaultChannelId: null,
+            ChannelRegistry: TestSlackGatewayDeps.DefaultChannelRegistry,
             ReplyClient: new NoopReplyClient(),
             ContentScanner: new NullContentScanner(),
             ThreadHistoryFetcher: EmptyThreadHistoryFetcher.Instance,
@@ -441,7 +444,7 @@ public sealed class SlackActorHierarchyTests(ITestOutputHelper output) : TestKit
             SourceKind = new Netclaw.Actors.Channels.SourceKind("reminder")
         },
         ReceivedAt = DateTimeOffset.UtcNow,
-        ReminderId = reminderId
+        ReminderId = new ReminderId(reminderId)
     };
 
 }

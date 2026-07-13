@@ -16,6 +16,8 @@ using Netclaw.Actors.Reminders;
 using Netclaw.Actors.Tests.Hosting;
 using Netclaw.Configuration;
 using Xunit;
+using static Netclaw.Actors.Sessions.SessionProtocol;
+using static Netclaw.Actors.Reminders.ReminderProtocol;
 
 namespace Netclaw.Actors.Tests.Reminders;
 
@@ -71,7 +73,8 @@ public class ReminderManagerActorTests : TestKit
                     TimeProvider.System,
                     definitionStore,
                     historyStore,
-                    _notificationSink)),
+                    _notificationSink,
+                    NullReminderChannelNotifier.Instance)),
                 "reminder-manager-test");
 
             registry.Register<ReminderManagerActorKey>(reminderManager);
@@ -170,6 +173,44 @@ public class ReminderManagerActorTests : TestKit
         Assert.Equal(0, health.ScheduledCount);
         Assert.Equal(0, health.ActiveExecutions);
         Assert.Equal(0, health.FailedCount);
+    }
+
+    [Fact]
+    public async Task Status_query_returns_per_reminder_health()
+    {
+        var manager = await GetManagerAsync();
+
+        var definition = CreateDefinition("test-status", "Check status");
+        var authorization = new ReminderAudienceAuthorizationContext(TrustAudience.Team, "test");
+        await manager.Ask<ReminderSavedResponse>(
+            new SaveReminderCommand(definition, Authorization: authorization), TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        var status = await manager.Ask<ReminderStatusResponse>(
+            new GetReminderStatusQuery(definition.Id), TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.True(status.Found);
+        Assert.True(status.Enabled);
+        Assert.False(status.Executing);
+        Assert.Equal(0, status.ConsecutiveFailures);
+        Assert.Equal(0, status.SkippedDuplicates);
+        Assert.NotNull(status.NextFire);
+        Assert.Empty(status.RecentHistory);
+    }
+
+    [Fact]
+    public async Task Status_query_for_unknown_reminder_returns_not_found()
+    {
+        var manager = await GetManagerAsync();
+
+        var status = await manager.Ask<ReminderStatusResponse>(
+            new GetReminderStatusQuery(new ReminderId("does-not-exist")),
+            TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.False(status.Found);
+        Assert.False(status.Enabled);
+        Assert.Equal(0, status.ConsecutiveFailures);
+        Assert.Equal(0, status.SkippedDuplicates);
+        Assert.Empty(status.RecentHistory);
     }
 
     [Fact]
@@ -409,7 +450,8 @@ public class ReminderManagerActorTests : TestKit
                 TimeProvider.System,
                 store,
                 new ReminderHistoryStore(paths),
-                sink)),
+                sink,
+                NullReminderChannelNotifier.Instance)),
             "legacy-reminder-alert-manager");
 
         // The legacy-schema alert is emitted synchronously inside PreStart, and
@@ -508,7 +550,7 @@ public class ReminderManagerActorTests : TestKit
         Assert.Equal(TrustAudience.Team, delivered.Source.Audience);
         Assert.Equal(TrustBoundary.TrustedInstance, delivered.Source.Boundary);
         Assert.NotNull(delivered.Source.ReminderId);
-        Assert.StartsWith("mode-b-anchor:", delivered.Source.ReminderId);
+        Assert.StartsWith("mode-b-anchor:", delivered.Source.ReminderId!.Value.Value);
         Assert.Equal(PrincipalClassification.VerifiedAutomation, delivered.Source.Principal);
         Assert.Equal("reminder", delivered.Source.Provenance.SourceKind?.Value);
 
@@ -657,7 +699,7 @@ public class ReminderManagerActorTests : TestKit
             // Channel reports the post failed — execution must report failure
             // (so Akka.Reminders redelivers) without acking the envelope.
             delivered.Source.DeliveryObserver!.Tell(new ReminderDeliveryResult(
-                delivered.Source.ReminderId!,
+                delivered.Source.ReminderId!.Value,
                 ChannelType.Slack,
                 Delivered: false,
                 FailureReason: "channel API down"));
@@ -708,7 +750,7 @@ public class ReminderManagerActorTests : TestKit
 
         var delivered = await gatewayProbe.ExpectMsgAsync<DeliverTrustedSessionTurn>(
             TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
-        Assert.Equal($"{definition.Id}:{fireTime.ToUnixTimeMilliseconds()}", delivered.Source.ReminderId);
+        Assert.Equal(new ReminderId($"{definition.Id}:{fireTime.ToUnixTimeMilliseconds()}"), delivered.Source.ReminderId);
     }
 
     [Fact]
@@ -738,7 +780,7 @@ public class ReminderManagerActorTests : TestKit
             Assert.NotNull(delivered.Source.DeliveryObserver);
 
             delivered.Source.DeliveryObserver!.Tell(new ReminderDeliveryResult(
-                delivered.Source.ReminderId!,
+                delivered.Source.ReminderId!.Value,
                 ChannelType.Slack,
                 Delivered: true,
                 ObservedAtMs: TimeProvider.System.GetUtcNow().ToUnixTimeMilliseconds()));
@@ -1022,7 +1064,7 @@ public class ReminderManagerActorTests : TestKit
             Assert.NotNull(delivered.Source.DeliveryObserver);
 
             delivered.Source.DeliveryObserver!.Tell(new ReminderDeliveryResult(
-                delivered.Source.ReminderId!,
+                delivered.Source.ReminderId!.Value,
                 ChannelType.Discord,
                 Delivered: true,
                 ObservedAtMs: TimeProvider.System.GetUtcNow().ToUnixTimeMilliseconds()));

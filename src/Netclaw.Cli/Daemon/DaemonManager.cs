@@ -112,8 +112,10 @@ public sealed partial class DaemonManager
     /// Why the daemon is being stopped (e.g., "cli-stop", "update").
     /// Included in the shutdown webhook notification.
     /// </param>
-    public async Task<DaemonResult> StopAsync(string reason)
+    public async Task<DaemonResult> StopAsync(string reason, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (!TryGetRunningPid(out var pid))
             return new DaemonResult(false, "Daemon is not running.");
 
@@ -150,12 +152,15 @@ public sealed partial class DaemonManager
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
             await http.PostAsync(
                 $"{endpoint}/api/lifecycle/shutdown?reason={Uri.EscapeDataString(reason)}",
-                null);
+                null,
+                cancellationToken);
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested && ex is (HttpRequestException or TaskCanceledException))
         {
             Console.Error.WriteLine($"Note: could not notify daemon of shutdown reason: {ex.Message}");
         }
+
+        cancellationToken.ThrowIfCancellationRequested();
 
         // Graceful shutdown: SIGTERM on Unix, Kill on Windows (no SIGTERM equivalent)
         if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
@@ -173,7 +178,7 @@ public sealed partial class DaemonManager
         }
 
         // Wait up to 10 seconds for graceful exit.
-        if (!await WaitForExitAsync(process, TimeSpan.FromSeconds(10)))
+        if (!await WaitForExitAsync(process, TimeSpan.FromSeconds(10), cancellationToken))
         {
             // Timed out — hard cutoff.
             string? killError = null;
@@ -186,7 +191,7 @@ public sealed partial class DaemonManager
             if (!TryKillProcess(process, out var processKillError) && string.IsNullOrWhiteSpace(killError))
                 killError = processKillError;
 
-            if (!await WaitForExitAsync(process, TimeSpan.FromSeconds(5)))
+            if (!await WaitForExitAsync(process, TimeSpan.FromSeconds(5), cancellationToken))
             {
                 var details = string.IsNullOrWhiteSpace(killError)
                     ? string.Empty
@@ -269,40 +274,30 @@ public sealed partial class DaemonManager
                 "Cannot find netclawd binary. Set NETCLAW_DAEMON_PATH or ensure it is " +
                 "in the same directory as the CLI.");
 
-        var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         Directory.CreateDirectory(SystemdUserUnitDirectory);
 
         // CLI binary is in the same directory as the daemon binary
         var installDir = Path.GetDirectoryName(binaryPath)!;
         var cliBinaryPath = Path.Combine(installDir, "netclaw");
 
-        // systemd --user services start with a sanitized PATH that does not include
-        // installDir or ~/.local/bin, so the agent's shell tool cannot resolve
-        // `netclaw` (or other user-installed binaries) when invoked from the daemon.
-        // We compose PATH explicitly: installDir first (so the daemon's bundled CLI
-        // wins), then ~/.local/bin (common user-bin location), then the systemd
-        // default. Keep this in sync with SystemdUnitPathDoctorCheck.
-        var unitPathEnv = ComposeSystemdUnitPath(installDir, userHome);
+        // A systemd --user service starts with a sanitized PATH that excludes installDir,
+        // ~/.dotnet, ~/.local/bin, and everything else the operator has on their shell
+        // PATH, so the agent's shell tool cannot resolve `netclaw`, `dotnet`, etc. Rather
+        // than guess a directory list (which can never anticipate every environment —
+        // #1544, where ~/.dotnet was invisible), capture the operator's REAL PATH from
+        // this CLI process — a child of the operator's shell, so it already holds the live
+        // PATH with no shell spawned — and hand it to the daemon via a netclaw-owned
+        // EnvironmentFile. The daemon only ever reads that file; `doctor --fix` rehydrates
+        // it and SystemdUnitPathDoctorCheck validates it. All three go through
+        // DaemonPathEnvironmentFile so the contract stays in lockstep.
+        var envFilePath = _paths.DaemonEnvironmentFilePath;
+        var capturedPath = DaemonPathEnvironmentFile.CaptureCurrentPath();
+        Directory.CreateDirectory(Path.GetDirectoryName(envFilePath)!);
+        await File.WriteAllTextAsync(envFilePath, DaemonPathEnvironmentFile.Render(installDir, capturedPath));
 
         var unitPath = SystemdUserUnitFilePath;
         var isUpgrade = File.Exists(unitPath);
-        var unitContent = $"""
-            [Unit]
-            Description=Netclaw Daemon
-            After=network.target
-
-            [Service]
-            Type=simple
-            ExecStart={binaryPath}
-            ExecStop={cliBinaryPath} daemon stop
-            Restart=always
-            RestartSec=5
-            Environment=DOTNET_ENVIRONMENT=Production
-            Environment=PATH={unitPathEnv}
-
-            [Install]
-            WantedBy=default.target
-            """;
+        var unitContent = BuildDaemonUnitContent(binaryPath, cliBinaryPath, envFilePath);
 
         await File.WriteAllTextAsync(unitPath, unitContent);
 
@@ -322,8 +317,8 @@ public sealed partial class DaemonManager
         var startMessage = $"Service installed at {unitPath}. Start with: systemctl --user start netclaw";
         if (isUpgrade)
         {
-            startMessage += "\nUnit file refreshed (PATH for the daemon's shell tool) — " +
-                "restart the service to pick up the change.";
+            startMessage += $"\nUnit refreshed and shell-tool PATH captured to {envFilePath} — " +
+                "restart to pick up the change: systemctl --user restart netclaw.";
         }
 
         return new DaemonResult(true, startMessage);
@@ -341,29 +336,46 @@ public sealed partial class DaemonManager
     internal static string SystemdUserUnitFilePath => Path.Combine(SystemdUserUnitDirectory, "netclaw.service");
 
     /// <summary>
-    /// Builds the PATH value baked into the systemd user unit so the daemon's
-    /// shell tool can resolve user-installed binaries like <c>netclaw</c>.
+    /// Deletes the netclaw-owned PATH env file written at install so uninstall leaves no
+    /// orphan behind. Idempotent. Separated from <see cref="UninstallAsync"/> (which is
+    /// coupled to real <c>systemctl</c>/<c>loginctl</c> and cannot be driven in-process
+    /// without mutating the developer's live service) so the deletion contract is
+    /// unit-testable on its own.
     /// </summary>
-    /// <remarks>
-    /// systemd <c>--user</c> services start with a minimal default PATH that does
-    /// not include <c>~/.local/bin</c> or any custom install directory, so we
-    /// compose one explicitly. The doctor check
-    /// <c>SystemdUnitPathDoctorCheck</c> validates that an existing unit file
-    /// contains <paramref name="installDir"/> on PATH; keep both call sites in
-    /// agreement.
-    /// </remarks>
-    internal static string ComposeSystemdUnitPath(string installDir, string userHome)
+    internal void RemoveDaemonEnvironmentFile()
     {
-        var localBin = Path.Combine(userHome, ".local", "bin");
-        return string.Join(':',
-            installDir,
-            localBin,
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin",
-            "/usr/sbin",
-            "/sbin");
+        var envFilePath = _paths.DaemonEnvironmentFilePath;
+        if (File.Exists(envFilePath))
+            File.Delete(envFilePath);
     }
+
+    /// <summary>
+    /// Builds the systemd <c>--user</c> unit content. The daemon's shell-tool PATH is
+    /// supplied out-of-band via <c>EnvironmentFile=</c> (see
+    /// <see cref="DaemonPathEnvironmentFile"/>) rather than an inline
+    /// <c>Environment=PATH=</c>, so it can be captured from the operator's real
+    /// environment and rehydrated by <c>doctor --fix</c> without rewriting the unit.
+    /// The <c>-</c> prefix makes systemd tolerant of a missing env file: a deleted PATH
+    /// file degrades tool resolution (which <c>SystemdUnitPathDoctorCheck</c> flags)
+    /// rather than preventing the entire daemon from starting.
+    /// </summary>
+    internal static string BuildDaemonUnitContent(string binaryPath, string cliBinaryPath, string environmentFilePath) => $"""
+        [Unit]
+        Description=Netclaw Daemon
+        After=network.target
+
+        [Service]
+        Type=simple
+        ExecStart={binaryPath}
+        ExecStop={cliBinaryPath} daemon stop
+        Restart=always
+        RestartSec=5
+        Environment=DOTNET_ENVIRONMENT=Production
+        EnvironmentFile=-{environmentFilePath}
+
+        [Install]
+        WantedBy=default.target
+        """;
 
     /// <summary>
     /// Uninstalls the systemd user service (Linux only).
@@ -385,6 +397,8 @@ public sealed partial class DaemonManager
         var unitPath = SystemdUserUnitFilePath;
         if (File.Exists(unitPath))
             File.Delete(unitPath);
+
+        RemoveDaemonEnvironmentFile();
 
         await RunCommandAsync("systemctl", "--user daemon-reload");
 
@@ -602,30 +616,10 @@ public sealed partial class DaemonManager
 
     private static async Task<DaemonResult> RunCommandAsync(string command, string arguments)
     {
-        try
-        {
-            var psi = new ProcessStartInfo
-            {
-                FileName = command,
-                Arguments = arguments,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-            };
-
-            using var proc = Process.Start(psi)!;
-            var stderr = await proc.StandardError.ReadToEndAsync();
-            await proc.WaitForExitAsync();
-
-            return proc.ExitCode == 0
-                ? new DaemonResult(true, "OK")
-                : new DaemonResult(false, stderr.Trim());
-        }
-        catch (Exception ex)
-        {
-            return new DaemonResult(false, ex.Message);
-        }
+        var result = await ProcessSystemCommandRunner.Instance.RunAsync(command, arguments);
+        return result.Success
+            ? new DaemonResult(true, "OK")
+            : new DaemonResult(false, result.Message);
     }
 
     // POSIX signals via P/Invoke
@@ -643,15 +637,17 @@ public sealed partial class DaemonManager
         return kill(pid, (int)signal) == 0;
     }
 
-    private async Task<bool> WaitForExitAsync(Process process, TimeSpan timeout)
+    private async Task<bool> WaitForExitAsync(Process process, TimeSpan timeout, CancellationToken cancellationToken)
     {
         var deadline = _timeProvider.GetUtcNow() + timeout;
         while (_timeProvider.GetUtcNow() < deadline)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             if (process.HasExited)
                 return true;
 
-            await Task.Delay(200);
+            await Task.Delay(200, cancellationToken);
         }
 
         return process.HasExited;

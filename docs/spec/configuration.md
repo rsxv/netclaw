@@ -96,30 +96,35 @@ keys used by model references.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `Type` | string | `"ollama"` | Provider SDK to use. Currently supported: `ollama`. Future: `openrouter`, `openai`, `anthropic`. |
+| `Type` | string | `"ollama"` | Provider SDK to use. Supported: `ollama`, `openai-compatible`, `openrouter`, `openai`, `anthropic`, `github-copilot`, `veniceai`. |
 | `Endpoint` | string | `"http://localhost:11434"` | Base URL for the provider API. |
 | `ApiKey` | string? | `null` | API key. Should go in `secrets.json` or an environment variable. |
+| `VendorOptions` | object? | `null` | Provider-owned non-secret options. For `github-copilot`, `GitHubHost` and `GitHubApiBase` select the GitHub Enterprise host used for OAuth and Copilot token exchange; the Copilot API base remains `Endpoint`. |
 
 ### Models
 
-Named model roles. Each role points to a provider and model ID.
+Named model definitions own provider/model identity and metadata. Roles reference definitions,
+so changing Main or Fallback does not destroy overrides belonging to the previous model.
 
 ```json
 {
   "Models": {
-    "Main": {
+    "Definitions": {
+      "qwen-main": {
       "Provider": "remote-gpu",
       "ModelId": "qwen3:30b",
       "ContextWindow": 32768
+      },
+      "qwen-small": {
+        "Provider": "remote-gpu",
+        "ModelId": "qwen3:8b",
+        "ContextWindow": 32768
+      }
     },
-    "Fallback": {
-      "Provider": "remote-gpu",
-      "ModelId": "qwen3:8b",
-      "ContextWindow": 32768
-    },
-    "Compaction": {
-      "Provider": "remote-gpu",
-      "ModelId": "qwen3:8b"
+    "Roles": {
+      "Main": "qwen-main",
+      "Fallback": "qwen-small",
+      "Compaction": "qwen-small"
     }
   }
 }
@@ -480,8 +485,9 @@ following the standard .NET convention.
 
 ```bash
 # Override the main model
-export NETCLAW_Models__Main__Provider="openrouter"
-export NETCLAW_Models__Main__ModelId="anthropic/claude-sonnet-4"
+export NETCLAW_Models__Definitions__claude__Provider="openrouter"
+export NETCLAW_Models__Definitions__claude__ModelId="anthropic/claude-sonnet-4"
+export NETCLAW_Models__Roles__Main="claude"
 
 # Set a provider API key
 export NETCLAW_Providers__openrouter__ApiKey="sk-or-v1-..."
@@ -512,17 +518,27 @@ export NETCLAW_Session__MaxToolIterationsPerTurn="60"
     "openrouter": {
       "Type": "openrouter",
       "Endpoint": "https://openrouter.ai/api/v1"
+    },
+    "ds4": {
+      "Type": "openai-compatible",
+      "Endpoint": "http://127.0.0.1:8000"
     }
   },
   "Models": {
-    "Main": {
-      "Provider": "local",
-      "ModelId": "qwen3:30b",
-      "ContextWindow": 32768
+    "Definitions": {
+      "qwen-main": {
+        "Provider": "local",
+        "ModelId": "qwen3:30b",
+        "ContextWindow": 32768
+      },
+      "qwen-small": {
+        "Provider": "local",
+        "ModelId": "qwen3:8b"
+      }
     },
-    "Compaction": {
-      "Provider": "local",
-      "ModelId": "qwen3:8b"
+    "Roles": {
+      "Main": "qwen-main",
+      "Compaction": "qwen-small"
     }
   },
   "Session": {

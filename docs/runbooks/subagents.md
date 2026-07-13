@@ -93,8 +93,11 @@ first user message is just the raw task, identical to the pre-context protocol.
    lifecycle-managed — stops when the session stops).
 4. The subagent runs an autonomous LLM loop: call tools, process results, repeat.
 5. After at most 30 tool iterations, a final response, or an inactivity timeout,
-   the subagent returns its final text response.
-6. The main agent receives this response as the `spawn_agent` tool result.
+   the subagent returns a terminal run result.
+6. The main agent receives the `spawn_agent` tool result as an explicit text
+   envelope: agent name, run id, outcome (`completed`, `partial`, or `failed`),
+   optional reason, diagnostics pointer, and either a `Summary:` or `Error:`
+   section containing the subagent's final text.
 
 Child creation is marshaled back onto the session actor thread, so supervision
 stays within Akka's actor-thread rules. If the parent tool call is cancelled or
@@ -117,10 +120,16 @@ are suppressed in Slack.
 Completion events are emitted for every finished subagent run, even when the
 subagent returns no structured findings. In that case `FindingsCount` is `0`
 and the memory-decision fields are empty because there was nothing to review.
+The completion event carries the same terminal outcome and reason used by the
+tool-result envelope, so operators can distinguish a useful partial summary from
+a failed run.
 
 Structured findings are conservative, parent-reviewed durable-memory candidates.
 They should be emitted as explicit conclusion envelopes with review metadata,
-not inferred from free-form work logs or tool transcripts.
+not inferred from free-form work logs or tool transcripts. They are not the
+parent-facing `spawn_agent` result; they exist so accepted subagent conclusions
+can enter the memory checkpoint pipeline without asking the parent model to parse
+free-form work logs.
 
 ## Defining subagents
 
@@ -140,6 +149,13 @@ skill system uses and the de facto format used by Claude Code and OpenCode.
 
 One file per agent. No JSON sidecar. The filename is a convenience for humans;
 the authoritative agent name comes from the `name` field in the frontmatter.
+
+SkillServer feed sync can also install managed subagent definitions under
+`~/.netclaw/agents/.server-feeds/<feed-name>/<agent-name>.md`. Those files are
+owned by the server-feed sync process: edit local user-authored agents in the
+top-level `~/.netclaw/agents/*.md` namespace instead. If a top-level local agent
+and a managed feed agent declare the same `name`, the local definition wins and
+the managed one is skipped with a warning.
 
 ### Frontmatter fields
 
@@ -185,15 +201,15 @@ written.
 ### Loader behavior (fail loud)
 
 On the next turn or subagent lookup, `FileSubAgentDefinitionLoader` rescans
-`~/.netclaw/agents/*.md` and logs a specific warning for every file it rejects.
-A rejection does not stop the scan — other valid files in the same directory
-still load. Rejection
-reasons:
+top-level `~/.netclaw/agents/*.md` files first, then managed server-feed files
+under `~/.netclaw/agents/.server-feeds/*/*.md`. It logs a specific warning for
+every file it rejects. A rejection does not stop the scan — other valid files in
+the same directory still load. Rejection reasons:
 
 - Missing or unparseable YAML frontmatter
 - Missing required field (`name` or `description`)
 - Empty body (system prompt)
-- Duplicate `name` across files (the alphabetically-first file wins)
+- Duplicate `name` across files (top-level local files win over managed feed files; managed feed duplicates use configured feed order)
 
 Non-`.md` files in the agents directory (`stray.json`, `README.txt`, etc.) are
 ignored at the glob layer and never logged.

@@ -34,6 +34,61 @@ public sealed class SQLiteMemoryStoreTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task InitializeAsync_repairs_legacy_compaction_boundary_recall_mode()
+    {
+        await _store.InitializeAsync(TestContext.Current.CancellationToken);
+
+        var anchor = _store.CreateDefaultAnchor("session-compaction");
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        // A pre-#1225 compaction summary (searchable => still in the automatic
+        // recall pool) and an unrelated searchable doc that must NOT be touched.
+        await UpsertSimpleDoc("doc-legacy-compaction", anchor, "compaction-boundary", "searchable", now);
+        await UpsertSimpleDoc("doc-other-searchable", anchor, "Some Other Memory", "searchable", now);
+
+        // Re-running initialization applies the idempotent data repair.
+        await _store.InitializeAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal("manual", await ReadRecallMode("doc-legacy-compaction"));
+        Assert.Equal("searchable", await ReadRecallMode("doc-other-searchable"));
+
+        // Idempotent: a third run changes nothing.
+        await _store.InitializeAsync(TestContext.Current.CancellationToken);
+        Assert.Equal("manual", await ReadRecallMode("doc-legacy-compaction"));
+    }
+
+    private async Task UpsertSimpleDoc(string id, SQLiteMemoryAnchor anchor, string title, string recallMode, long now)
+    {
+        await _store.UpsertDocumentAsync(new SQLiteMemoryDocument(
+            DocumentId: id,
+            Anchor: anchor,
+            MemoryClass: "evidence",
+            Title: title,
+            MarkdownBody: "Summary body.",
+            AliasesJson: null,
+            FacetsJson: null,
+            SlotsJson: null,
+            UpdateSemantics: "merge-document",
+            Sensitivity: "normal",
+            RecallMode: recallMode,
+            Confidence: 0.9,
+            FreshnessAtMs: now,
+            ExpiresAtMs: null,
+            CreatedAtMs: now,
+            UpdatedAtMs: now), TestContext.Current.CancellationToken);
+    }
+
+    private async Task<string?> ReadRecallMode(string documentId)
+    {
+        await using var conn = new SqliteConnection($"Data Source={_dbPath}");
+        await conn.OpenAsync(TestContext.Current.CancellationToken);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT recall_mode FROM memory_documents WHERE document_id = $id";
+        cmd.Parameters.AddWithValue("$id", documentId);
+        return (string?)await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
     public async Task UpsertAndSearchAutoRecallDocuments_filters_by_policy()
     {
         await _store.InitializeAsync(TestContext.Current.CancellationToken);
@@ -242,6 +297,31 @@ public sealed class SQLiteMemoryStoreTests : IAsyncLifetime
         Assert.Contains(personalResults, x => x.Id == "doc-personal");
     }
 
+    [Fact]
+    public async Task ResolveMemoryHandleAsync_maps_each_id_form_to_its_exact_storage_key()
+    {
+        await _store.InitializeAsync(TestContext.Current.CancellationToken);
+
+        var anchor = _store.CreateDefaultAnchor("distinct-memory");
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        // Two distinct rows whose keys differ only by the legacy prefix. Because the parsed id is
+        // used as the exact primary key, each id form resolves to exactly one row — no ambiguity.
+        await _store.UpsertDocumentAsync(CreateDocument("abc", anchor, "Bare ID", now), TestContext.Current.CancellationToken);
+        await _store.UpsertDocumentAsync(CreateDocument("doc-abc", anchor, "Legacy ID", now), TestContext.Current.CancellationToken);
+
+        var bare = await _store.ResolveMemoryHandleAsync("doc:abc", TrustBoundary.TrustedInstanceValue, TrustAudience.Personal, TestContext.Current.CancellationToken);
+        var dash = await _store.ResolveMemoryHandleAsync("doc-abc", TrustBoundary.TrustedInstanceValue, TrustAudience.Personal, TestContext.Current.CancellationToken);
+        var envelope = await _store.ResolveMemoryHandleAsync("doc:doc-abc", TrustBoundary.TrustedInstanceValue, TrustAudience.Personal, TestContext.Current.CancellationToken);
+
+        Assert.True(bare.Resolved);
+        Assert.Equal("abc", bare.StorageId!.Value.Value);
+        Assert.True(dash.Resolved);
+        Assert.Equal("doc-abc", dash.StorageId!.Value.Value);
+        // The colon envelope over the dash key resolves to the same row as the dash key.
+        Assert.True(envelope.Resolved);
+        Assert.Equal("doc-abc", envelope.StorageId!.Value.Value);
+    }
+
     public ValueTask InitializeAsync() => ValueTask.CompletedTask;
 
     public async ValueTask DisposeAsync()
@@ -276,4 +356,25 @@ public sealed class SQLiteMemoryStoreTests : IAsyncLifetime
         // Best effort cleanup: file handles can remain briefly open on Windows CI.
         // Leaving temp dirs behind is preferable to failing the test run.
     }
+
+    private static SQLiteMemoryDocument CreateDocument(string id, SQLiteMemoryAnchor anchor, string title, long now)
+        => new(
+            DocumentId: id,
+            Anchor: anchor,
+            MemoryClass: MemoryClass.DurableFact.ToWireValue(),
+            Title: title,
+            MarkdownBody: $"Content for {title}.",
+            AliasesJson: null,
+            FacetsJson: null,
+            SlotsJson: null,
+            UpdateSemantics: MemoryUpdateSemantics.MergeDocument.ToWireValue(),
+            Sensitivity: MemorySensitivity.Normal.ToWireValue(),
+            RecallMode: MemoryRecallMode.Auto.ToWireValue(),
+            Confidence: 0.9,
+            FreshnessAtMs: now,
+            ExpiresAtMs: null,
+            CreatedAtMs: now,
+            UpdatedAtMs: now,
+            Boundary: TrustBoundary.TrustedInstanceValue,
+            Audience: TrustAudience.Team.ToWireValue());
 }

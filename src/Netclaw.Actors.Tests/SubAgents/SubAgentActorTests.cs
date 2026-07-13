@@ -19,8 +19,10 @@ using ApprovalOptionKeys = Netclaw.Actors.Protocol.ApprovalOptionKeys;
 using Netclaw.Configuration;
 using Netclaw.Security;
 using Netclaw.Tests.Utilities;
+using FakeChatClient = Netclaw.Tests.Utilities.FakeChatClient;
 using Netclaw.Tools;
 using Xunit;
+using static Netclaw.Actors.SubAgents.SubAgentProtocol;
 
 namespace Netclaw.Actors.Tests.SubAgents;
 
@@ -67,6 +69,8 @@ public class SubAgentActorTests : TestKit
             TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         Assert.True(result.Success);
+        Assert.Equal(SubAgentRunOutcome.Completed, result.Outcome);
+        Assert.Null(result.OutcomeReason);
         Assert.Contains("Response #1", result.Output);
         Assert.Equal("test-agent", result.AgentName.Value);
         Assert.Empty(result.Findings);
@@ -183,8 +187,44 @@ public class SubAgentActorTests : TestKit
         Assert.NotNull(fakeClient.LastReceivedMessages);
         Assert.Equal(ChatRole.System, fakeClient.LastReceivedMessages[0].Role);
         Assert.Contains("headless, non-interactive worker", fakeClient.LastReceivedMessages[0].Text);
+        Assert.Contains("subagent role guidance and assigned task are more specific", fakeClient.LastReceivedMessages[0].Text);
+        Assert.Contains("safety, security, trust-boundary, approval, and tool-policy rules remain mandatory", fakeClient.LastReceivedMessages[0].Text);
         Assert.Contains("Do not ask the user clarifying questions", fakeClient.LastReceivedMessages[0].Text);
         Assert.Contains("Parent-mediated tool approval", fakeClient.LastReceivedMessages[0].Text);
+    }
+
+    [Fact]
+    public async Task System_prompt_layers_operating_rules_before_project_role_and_headless_contract()
+    {
+        var fakeClient = new FakeChatClient();
+        var definition = CreateDefinition() with
+        {
+            OperatingRules = "Operating rules: never invent runtime facts.\n\nDeployment playbook: review customer email.",
+            ProjectInstructions = "Project rules: prefer C#.",
+            SystemPrompt = "You are a test agent.\n\n[Skill Overlay]\nUse focused analysis."
+        };
+        var agent = Sys.ActorOf(SubAgentActor.CreateProps(definition, fakeClient));
+
+        var result = await agent.Ask<SubAgentResult>(
+            new RunSubAgent { Task = "Do the thing.", Timeout = TimeSpan.FromSeconds(5), Audience = TrustAudience.Personal },
+            TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.True(result.Success);
+        Assert.NotNull(fakeClient.LastReceivedMessages);
+        var systemPrompt = fakeClient.LastReceivedMessages!.Single(m => m.Role == ChatRole.System).Text;
+
+        AssertPromptOrder(
+            systemPrompt,
+            "Operating rules: never invent runtime facts.",
+            "Deployment playbook: review customer email.",
+            "Project rules: prefer C#.",
+            "You are a test agent.",
+            "[Skill Overlay]",
+            "[Subagent Execution Contract]");
+        Assert.EndsWith(
+            "Always end by emitting a final output for the parent session.",
+            systemPrompt.TrimEnd(),
+            StringComparison.Ordinal);
     }
 
     [Fact]
@@ -663,7 +703,7 @@ public class SubAgentActorTests : TestKit
     }
 
     [Fact]
-    public async Task SubAgent_approval_wait_activity_suspends_parent_tool_watchdog()
+    public async Task SubAgent_surfaces_approval_wait_and_resolution_to_parent_stream()
     {
         var fakeTool = new FakeNetclawTool("shell_execute", "ok");
         var policy = CreateApprovalRequiredPolicy();
@@ -694,19 +734,21 @@ public class SubAgentActorTests : TestKit
             },
             ApprovalAskTimeout, TestContext.Current.CancellationToken);
 
+        // The sub-agent surfaces its approval state to the parent stream so the run
+        // stays visible while a human is in the loop. (Pausing the parent watchdog
+        // is no longer a flag on the activity — the parent no longer wall-clock-
+        // supervises a self-monitoring sub-agent.)
         await approvalBridge.EnteredApprovalWait.WaitAsync(TestContext.Current.CancellationToken);
-        var waitingActivity = await ReadActivityAsync(
+        await ReadActivityAsync(
             activityChannel.Reader,
             "awaiting human approval",
             TestContext.Current.CancellationToken);
-        Assert.True(waitingActivity.SuspendsInactivityWatchdog);
 
         releaseSignal.SetResult(ParentApprovalDecision.ApprovedOnce);
-        var resolvedActivity = await ReadActivityAsync(
+        await ReadActivityAsync(
             activityChannel.Reader,
             "approval resolved",
             TestContext.Current.CancellationToken);
-        Assert.False(resolvedActivity.SuspendsInactivityWatchdog);
 
         var result = await runTask;
         Assert.True(result.Success, $"Expected success but got: {result.Output}");
@@ -917,6 +959,18 @@ public class SubAgentActorTests : TestKit
             .Result?.ToString();
     }
 
+    private static void AssertPromptOrder(string prompt, params string[] markers)
+    {
+        var previousIndex = -1;
+        foreach (var marker in markers)
+        {
+            var index = prompt.IndexOf(marker, StringComparison.Ordinal);
+            Assert.True(index >= 0, $"Expected prompt to contain marker: {marker}");
+            Assert.True(index > previousIndex, $"Expected marker '{marker}' to appear after the previous marker.");
+            previousIndex = index;
+        }
+    }
+
     private static async Task<ToolActivityUpdate> ReadActivityAsync(
         ChannelReader<ToolActivityUpdate> reader,
         string phase,
@@ -973,6 +1027,8 @@ public class SubAgentActorTests : TestKit
 
         // After the configured tool budget, force a no-tools call which returns text.
         Assert.True(result.Success);
+        Assert.Equal(SubAgentRunOutcome.Partial, result.Outcome);
+        Assert.Equal(SubAgentOutcomeReason.ToolIterationBudgetExhausted, result.OutcomeReason);
         Assert.Equal(4, fakeClient.CallCount);
         Assert.NotNull(fakeClient.LastReceivedMessages);
         Assert.Contains(fakeClient.LastReceivedMessages,
@@ -1123,7 +1179,7 @@ public class SubAgentActorTests : TestKit
     [Fact]
     public async Task LLM_failure_returns_failure()
     {
-        var throwingClient = new ThrowingChatClient();
+        var throwingClient = new FakeChatClient { Failure = new InvalidOperationException("LLM connection failed") };
         var definition = CreateDefinition();
         var agent = Sys.ActorOf(SubAgentActor.CreateProps(definition, throwingClient));
 
@@ -1222,11 +1278,14 @@ public class SubAgentActorTests : TestKit
     }
 
     [Fact]
-    public async Task Long_text_response_emits_findings_when_enabled()
+    public async Task Long_text_response_emits_untruncated_findings_when_enabled()
     {
+        var longSummary = string.Concat(
+            new string('a', 1900),
+            "\nTAIL_CONCLUSION: preserve this final conclusion and citation.");
         var fakeClient = new FakeChatClient
         {
-            ResponseText = "This is a durable subagent summary with enough detail to be considered a memory candidate for parent-session checkpoint review."
+            ResponseText = longSummary
         };
         var definition = CreateDefinition() with { EmitStructuredFindings = true };
         var agent = Sys.ActorOf(SubAgentActor.CreateProps(definition, fakeClient));
@@ -1237,11 +1296,14 @@ public class SubAgentActorTests : TestKit
 
         Assert.True(result.Success);
         Assert.Single(result.Findings);
+        Assert.Equal(longSummary, result.Findings[0].Content);
+        Assert.Contains("TAIL_CONCLUSION", result.Findings[0].Content, StringComparison.Ordinal);
         Assert.Equal(SubAgentFindingShape.Conclusion, result.Findings[0].Shape);
         Assert.Equal("subagent:test-agent", result.Findings[0].Title);
         Assert.Equal(SubAgentFindingDurability.Durable, result.Findings[0].Durability);
         Assert.Equal(SubAgentFindingReusability.Reusable, result.Findings[0].Reusability);
         Assert.Equal(SubAgentFindingRecallMode.Searchable, result.Findings[0].RecallMode);
+        Assert.Contains("subagent_outcome:completed", result.Findings[0].Evidence);
     }
 
     [Fact]
@@ -1297,123 +1359,9 @@ public class SubAgentActorTests : TestKit
         Assert.DoesNotContain("Context:", fakeClient.LastReceivedMessages[1].Text);
     }
 
-    /// <summary>
-    /// IChatClient that always throws on GetResponseAsync.
-    /// </summary>
-    private sealed class ThrowingChatClient : IChatClient
-    {
-        public Task<ChatResponse> GetResponseAsync(
-            IEnumerable<ChatMessage> messages,
-            ChatOptions? options = null,
-            CancellationToken cancellationToken = default)
-            => throw new InvalidOperationException("LLM connection failed");
-
-        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
-            IEnumerable<ChatMessage> messages,
-            ChatOptions? options = null,
-            CancellationToken cancellationToken = default)
-            => throw new InvalidOperationException("LLM connection failed");
-
-        public object? GetService(Type serviceType, object? serviceKey = null) => null;
-        public void Dispose() { }
-    }
-
     // Real PNG: the egress normalizer decodes every model-input image, so a
     // fake magic-byte stub would now be dropped. Small enough to pass through.
     private static readonly byte[] FakePngBytes = TestImages.SmallPng();
-}
-
-/// <summary>
-/// Fake IChatClient for SubAgentActor tests (and other test files that need it).
-/// Copied from LlmSessionIntegrationTests — kept internal for cross-file reuse.
-/// </summary>
-internal sealed class FakeChatClient : IChatClient
-{
-    private int _callCount;
-
-    public int CallCount => _callCount;
-
-    /// <summary>
-    /// Snapshot of the messages passed to the most recent call. Replaced on every call.
-    /// </summary>
-    public IReadOnlyList<ChatMessage>? LastReceivedMessages { get; private set; }
-
-    public TimeSpan Delay { get; set; } = TimeSpan.Zero;
-
-    /// <summary>
-    /// When set, the first response returns these tool calls instead of text.
-    /// Subsequent calls return normal text (simulating the LLM completing after tool results).
-    /// When <see cref="AlwaysReturnToolCalls"/> is true, every call returns tool calls
-    /// as long as tools are available in options.
-    /// </summary>
-    public List<FunctionCallContent>? ToolCallsOnFirstCall { get; set; }
-
-    /// <summary>
-    /// When true, every call returns tool calls as long as options.Tools is non-empty.
-    /// </summary>
-    public bool AlwaysReturnToolCalls { get; set; }
-
-    public string? ResponseText { get; set; }
-
-    public IReadOnlyList<string>? ResponseTextsByCall { get; set; }
-
-    public async Task<ChatResponse> GetResponseAsync(
-        IEnumerable<ChatMessage> messages,
-        ChatOptions? options = null,
-        CancellationToken cancellationToken = default)
-    {
-        Interlocked.Increment(ref _callCount);
-        LastReceivedMessages = messages.ToList();
-
-        if (Delay > TimeSpan.Zero)
-            await Task.Delay(Delay, cancellationToken);
-
-        if (ToolCallsOnFirstCall is not null)
-        {
-            var returnToolCalls = AlwaysReturnToolCalls
-                ? options?.Tools?.Count > 0
-                : _callCount == 1;
-
-            if (returnToolCalls)
-            {
-                var toolCallContents = new List<AIContent>(ToolCallsOnFirstCall);
-                var toolCallMessage = new ChatMessage(
-                    ChatRole.Assistant, toolCallContents);
-                return new ChatResponse(toolCallMessage);
-            }
-        }
-
-        var responseText = ResponseTextsByCall is { Count: > 0 } responses && _callCount <= responses.Count
-            ? responses[_callCount - 1]
-            : ResponseText ?? $"[fake] Response #{_callCount}";
-
-        var responseMessage = new ChatMessage(
-            ChatRole.Assistant,
-            [new TextContent(responseText)]);
-        return new ChatResponse(responseMessage);
-    }
-
-    public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
-        IEnumerable<ChatMessage> messages,
-        ChatOptions? options = null,
-        CancellationToken cancellationToken = default)
-        => CreateStreamingUpdatesAsync(messages, options, cancellationToken);
-
-    private async IAsyncEnumerable<ChatResponseUpdate> CreateStreamingUpdatesAsync(
-        IEnumerable<ChatMessage> messages,
-        ChatOptions? options,
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
-    {
-        var response = await GetResponseAsync(messages, options, cancellationToken);
-        foreach (var update in response.ToChatResponseUpdates())
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            yield return update;
-        }
-    }
-
-    public object? GetService(Type serviceType, object? serviceKey = null) => null;
-    public void Dispose() { }
 }
 
 /// <summary>

@@ -1,4 +1,4 @@
-﻿// -----------------------------------------------------------------------
+// -----------------------------------------------------------------------
 // <copyright file="ISystemPromptProvider.cs" company="Petabridge, LLC">
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
@@ -24,6 +24,13 @@ public interface ISystemPromptProvider
     /// Returns null when no project instructions are available for the audience.
     /// </summary>
     string? GetProjectInstructions(TrustAudience audience, string? projectDirectory);
+
+    /// <summary>
+    /// Get the audience-specific embedded operating core followed by the optional
+    /// deployment AGENTS.md playbook. Used by sub-agents to inherit platform rules
+    /// and the operator's mission without receiving SOUL.md or TOOLING.md.
+    /// </summary>
+    string? GetOperatingRules(TrustAudience audience);
 }
 
 /// <summary>
@@ -81,6 +88,8 @@ public sealed class StaticSystemPromptProvider : ISystemPromptProvider
     public string GetSystemPrompt(TrustAudience audience, string? projectDirectory = null) => _prompt;
 
     public string? GetProjectInstructions(TrustAudience audience, string? projectDirectory) => null;
+
+    public string? GetOperatingRules(TrustAudience audience) => null;
 }
 
 /// <summary>
@@ -93,6 +102,8 @@ public sealed class NullSystemPromptProvider : ISystemPromptProvider
     public string GetSystemPrompt(TrustAudience audience, string? projectDirectory = null) => string.Empty;
 
     public string? GetProjectInstructions(TrustAudience audience, string? projectDirectory) => null;
+
+    public string? GetOperatingRules(TrustAudience audience) => null;
 }
 
 /// <summary>
@@ -150,8 +161,9 @@ public sealed class FileContextLayerProvider : IContextLayerProvider
 
 /// <summary>
 /// Loads system prompt layers from the filesystem under <see cref="NetclawPaths.IdentityDirectory"/>.
-/// AGENTS.md is loaded from embedded resources per audience — Public gets a stripped-down version,
-/// Team/Personal get the full version with placeholder substitution.
+/// Operating rules combine audience-specific embedded resources with an optional deployment
+/// playbook from disk. Public gets a stripped-down embedded core; all audiences receive the same
+/// operator-authored deployment mission when present.
 /// Missing files are silently skipped. Falls back to legacy <c>soul/</c> paths for SOUL.md if identity
 /// files don't exist yet.
 /// </summary>
@@ -178,10 +190,9 @@ public sealed class FileSystemPromptProvider : ISystemPromptProvider
         // SOUL.md: always from disk, all audiences
         var soul = TryReadFile(_paths.SoulPath) ?? TryReadFile(_paths.PersonalityPath);
 
-        // AGENTS.md: from embedded resources, audience-dependent
-        var agents = audience == TrustAudience.Public
-            ? CachedAgentsPublic.Value
-            : SubstitutePlaceholders(CachedAgents.Value);
+        // Operating rules: audience-specific embedded machinery followed by the
+        // deployment's mission and workflow playbook.
+        var agents = ComposeOperatingRules(audience);
 
         // TOOLING.md and project instructions: suppressed for Public
         string? tooling = null;
@@ -205,6 +216,39 @@ public sealed class FileSystemPromptProvider : ISystemPromptProvider
             return null;
 
         return TryReadProjectIdentityFile(projectDirectory);
+    }
+
+    public string? GetOperatingRules(TrustAudience audience)
+    {
+        return ComposeOperatingRules(audience);
+    }
+
+    private string ComposeOperatingRules(TrustAudience audience)
+    {
+        var embedded = audience == TrustAudience.Public
+            ? CachedAgentsPublic.Value
+            : CachedAgents.Value;
+        var embeddedRules = SubstitutePlaceholders(embedded);
+        var deploymentPlaybook = ReadDeploymentPlaybook();
+
+        if (string.IsNullOrWhiteSpace(deploymentPlaybook))
+            return embeddedRules;
+
+        return string.Concat(
+            embeddedRules.TrimEnd(),
+            "\n\n# Deployment Mission and Operating Playbook\n\n",
+            SubstitutePlaceholders(deploymentPlaybook).Trim());
+    }
+
+    private string? ReadDeploymentPlaybook()
+    {
+        if (!File.Exists(_paths.AgentsPath))
+            return null;
+
+        // Unlike an absent optional file, an unreadable configured playbook is an
+        // operational failure. Propagate the exception instead of silently dropping
+        // the deployment's mission and quality controls.
+        return File.ReadAllText(_paths.AgentsPath);
     }
 
     /// <summary>

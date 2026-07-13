@@ -4,6 +4,7 @@
 // </copyright>
 // -----------------------------------------------------------------------
 using System.Text.Json.Nodes;
+using Netclaw.Cli;
 using Netclaw.Configuration;
 
 namespace Netclaw.Cli.Doctor;
@@ -31,14 +32,48 @@ internal static class DoctorJsonConfigReader
             .Cast<string>()];
     }
 
+    /// <summary>
+    /// True when NETCLAW_-prefixed configuration-binding environment variables
+    /// are present (double-underscore section keys, e.g.
+    /// <c>NETCLAW_Models__Main__ModelId</c>). Plain control variables like
+    /// <c>NETCLAW_HOME</c> or <c>NETCLAW_DAEMON_ENDPOINT</c> do not count —
+    /// they configure path/endpoint resolution, not the daemon itself.
+    /// </summary>
+    public static bool HasEnvironmentConfig(System.Collections.IDictionary? environment = null)
+    {
+        environment ??= Environment.GetEnvironmentVariables();
+        foreach (var key in environment.Keys)
+        {
+            if (key is string name
+                && name.StartsWith("NETCLAW_", StringComparison.Ordinal)
+                && name.Contains("__", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public static (JsonObject? Root, DoctorCheckResult? Error) TryReadConfig(NetclawPaths paths)
     {
         if (!File.Exists(paths.NetclawConfigPath))
         {
+            // An env-only instance is configured, just not via this file — a
+            // "not configured, run init" warning here is a misdiagnosis (the
+            // daemon binds NETCLAW_ env vars over an optional JSON file).
+            // File-content checks are legitimately skipped; say so truthfully.
+            if (HasEnvironmentConfig())
+            {
+                return (null, DoctorCheckResult.Pass(
+                    "Config File",
+                    "No netclaw.json; NETCLAW_ environment configuration detected — file-based checks skipped."));
+            }
+
             return (null, DoctorCheckResult.Warning(
                 "Config File",
-                $"Config file not found at {paths.NetclawConfigPath}.",
-                "Run `netclaw init` to scaffold a baseline config."));
+                CliConfigPreflight.MissingConfigMessage,
+                $"Run `netclaw init` to create {paths.NetclawConfigPath}."));
         }
 
         try

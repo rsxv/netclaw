@@ -12,6 +12,8 @@ using Netclaw.Actors.Hosting;
 using Netclaw.Actors.Protocol;
 using Netclaw.Configuration;
 using Netclaw.Security;
+using static Netclaw.Actors.Sessions.SessionProtocol;
+using static Netclaw.Actors.Jobs.BackgroundJobProtocol;
 
 namespace Netclaw.Actors.Jobs;
 
@@ -429,7 +431,7 @@ public sealed class BackgroundJobManagerActor : ReceiveActor
                 SourceKind = new SourceKind(BackgroundJobManagerActor.SourceKind)
             },
             ReceivedAt = _timeProvider.GetUtcNow(),
-            BackgroundJobId = jobDeliveryKey
+            BackgroundJobId = new BackgroundJobId(jobDeliveryKey)
         };
 
         var deliverMsg = new DeliverTrustedSessionTurn(sessionId, content, source);

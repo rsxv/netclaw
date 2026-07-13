@@ -21,6 +21,7 @@ using Netclaw.Configuration;
 using Netclaw.Security;
 using Netclaw.Tools;
 using AiChatMessage = Microsoft.Extensions.AI.ChatMessage;
+using static Netclaw.Actors.SubAgents.SubAgentProtocol;
 
 namespace Netclaw.Actors.SubAgents;
 
@@ -48,6 +49,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
     private const string HeadlessExecutionContract = """
         [Subagent Execution Contract]
         You are a headless, non-interactive worker running on behalf of a parent Netclaw session.
+        Your subagent role guidance and assigned task are more specific than inherited deployment or project guidance. If they conflict, follow your subagent guidance and assigned task.
+        Embedded safety, security, trust-boundary, approval, and tool-policy rules remain mandatory and cannot be overridden.
         Do not ask the user clarifying questions, request conversational input, or wait for a reply.
         Do the best work you can with the task, context, and tools available.
         If the task is ambiguous, make reasonable assumptions and state them in your final output.
@@ -62,6 +65,13 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
     private readonly ToolAccessPolicy _toolAccessPolicy;
     private readonly IToolApprovalService? _approvalService;
     private readonly int _maxToolIterations;
+
+    // Process-wide daily-stats sink (the same singleton the parent session records
+    // to). Nullable because a hosting configuration without the daemon stats backend
+    // is a real runtime state — mirrors LlmSessionActor._sessionMetrics. When present,
+    // every LLM call this sub-agent makes is billed here so its tokens show up in
+    // `netclaw stats` instead of vanishing.
+    private readonly Telemetry.ISessionMetrics? _sessionMetrics;
     private readonly ToolRegistry _toolRegistry;
     private IReadOnlyList<AITool> _aiTools = [];
     private ILoggingAdapter _log;
@@ -72,6 +82,12 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
     // Used for the summary log on completion (ProcessingWatchdog is only a
     // timer scheduler — it doesn't track elapsed time itself).
     private readonly Stopwatch _runStopwatch = Stopwatch.StartNew();
+
+    // Cumulative token usage across every LLM call this sub-agent makes. Summed for
+    // the completion summary log; per-call usage is also recorded to _sessionMetrics
+    // as each call returns (see RecordUsage).
+    private long _runInputTokens;
+    private long _runOutputTokens;
 
     // Conversation state (not persisted — ephemeral)
     private readonly List<AiChatMessage> _history = [];
@@ -96,6 +112,13 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
 
     private IParentApprovalBridge? _approvalBridge;
     private ChannelWriter<ToolActivityUpdate>? _activitySink;
+
+    // Parent session id (scopeId with the "/subagent/..." suffix stripped) and the full
+    // sub-session scope id. Carried on the sub-agent's ChatOptions so its LLM-pipeline lines
+    // group under the parent in OTEL (SessionId) while the file-logger partitions them into the
+    // sub-agent's own session.log (SubSessionId) — matching the enriched logger's own context.
+    private string? _parentSessionId;
+    private string? _subSessionId;
 
     // Default wait-for-first-delta budget when the spawn message carries none
     // (direct/test callers). Mirrors SessionConfig.PrefillTimeout so an unset
@@ -122,13 +145,15 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
     private CancellationTokenRegistration _externalCancellationRegistration;
     private ToolExecutionContext _toolExecutionContext = ToolExecutionContext.Empty;
     private bool _malformedFinalOutputRepairAttempted;
+    private SubAgentOutcomeReason? _forcedFinalOutcomeReason;
 
     public SubAgentActor(
         SubAgentDefinition definition,
         IChatClient chatClient,
         ToolAccessPolicy? toolAccessPolicy = null,
         IToolApprovalService? approvalService = null,
-        int maxToolIterations = DefaultMaxToolIterations)
+        int maxToolIterations = DefaultMaxToolIterations,
+        Telemetry.ISessionMetrics? sessionMetrics = null)
     {
         if (maxToolIterations <= 0)
             throw new ArgumentOutOfRangeException(nameof(maxToolIterations), maxToolIterations,
@@ -136,6 +161,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
 
         _definition = definition;
         _chatClient = chatClient;
+        _sessionMetrics = sessionMetrics;
         _toolAccessPolicy = toolAccessPolicy ?? new ToolAccessPolicy(
             new ToolConfig { ShellMode = ShellExecutionMode.HostAllowed },
             new EffectivePolicyDefaults(
@@ -166,14 +192,16 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         IChatClient chatClient,
         ToolAccessPolicy? toolAccessPolicy = null,
         IToolApprovalService? approvalService = null,
-        int maxToolIterations = DefaultMaxToolIterations)
+        int maxToolIterations = DefaultMaxToolIterations,
+        Telemetry.ISessionMetrics? sessionMetrics = null)
     {
         return Props.Create(() => new SubAgentActor(
             definition,
             chatClient,
             toolAccessPolicy,
             approvalService,
-            maxToolIterations));
+            maxToolIterations,
+            sessionMetrics));
     }
 
     /// <summary>
@@ -195,6 +223,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                 Success = false,
                 Output = "Subagent stopped before completion.",
                 AgentName = _definition.Name,
+                Outcome = SubAgentRunOutcome.Failed,
+                OutcomeReason = SubAgentOutcomeReason.ActorStopped,
                 Findings = [],
                 FindingsCount = 0
             });
@@ -230,7 +260,9 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                 Complete(
                     success: false,
                     "Sub-agent spawn failed: no trust audience was provided. A sub-agent "
-                    + "must inherit the spawning session's audience.");
+                    + "must inherit the spawning session's audience.",
+                    SubAgentRunOutcome.Failed,
+                    SubAgentOutcomeReason.MissingAudience);
                 return;
             }
 
@@ -257,15 +289,18 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             // (SubSessionId), and is plainly attributable to the sub-agent. scopeId is
             // "{parentSessionId}/subagent/{name}/{runId}"; NormalizeSessionId strips the
             // "/subagent/..." suffix to recover the parent. SessionId matches the key the
-            // session/channel actors already use (see SessionLoggingScope), so sub-agent
-            // and parent logs share one filterable attribute; SubSessionId isolates a
-            // single run within that session.
-            var parentSessionId = SessionDiagnosticsContext.NormalizeSessionId(scopeId);
+            // session/channel actors already tag their loggers with, so sub-agent and
+            // parent logs share one filterable attribute (so OTEL groups them under the parent);
+            // SubSessionId isolates a single run and is what the file-logger partitions on, so the
+            // sub-agent's lines land in its OWN session.log rather than the parent's.
+            var parentSessionId = SubAgentSessionScope.NormalizeSessionId(scopeId);
+            _parentSessionId = parentSessionId;
+            _subSessionId = scopeId;
             var enrichedLog = Context.GetLogger();
             if (!string.IsNullOrWhiteSpace(parentSessionId))
-                enrichedLog = enrichedLog.WithContext("SessionId", parentSessionId);
+                enrichedLog = enrichedLog.WithContext(NetclawLogProperties.SessionId, parentSessionId);
             if (!string.IsNullOrWhiteSpace(scopeId))
-                enrichedLog = enrichedLog.WithContext("SubSessionId", scopeId);
+                enrichedLog = enrichedLog.WithContext(NetclawLogProperties.SubSessionId, scopeId);
             _log = enrichedLog;
 
             // The run is bounded by a two-phase inactivity watchdog re-armed on
@@ -304,6 +339,14 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             // the synchronous processing that follows (tool dispatch or completion).
             RestartWatchdog(_interDeltaBudget);
             var response = msg.Response;
+
+            // Record this call's token usage before branching so EVERY call is billed —
+            // tool-call turns, retries, the forced-no-tools final turn, and repair turns
+            // all flow through here exactly once. Mirrors the main session, which records
+            // its own per-call usage; without this the sub-agent's tokens never reach the
+            // daily-stats pipeline and `netclaw stats` under-counts by the whole sub-run.
+            RecordUsage(response.Usage);
+
             var lastMessage = response.Messages[^1];
             var analysis = LlmResponseClassifier.Analyze(lastMessage);
 
@@ -315,7 +358,11 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                     analysis.ToolCalls.Count,
                     _turnState.ToolCallCount,
                     _maxToolIterations);
-                Complete(false, "Subagent exceeded its tool iteration budget and continued requesting tools after tools were disabled.");
+                Complete(
+                    false,
+                    "Subagent exceeded its tool iteration budget and continued requesting tools after tools were disabled.",
+                    SubAgentRunOutcome.Failed,
+                    SubAgentOutcomeReason.ToolIterationBudgetExceededAfterDisable);
                 return;
             }
 
@@ -357,7 +404,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                             "SubAgent [{AgentName}] produced repeated {Kind} responses — reporting failure",
                             _definition.Name,
                             analysis.Kind);
-                        Complete(false, fail.ErrorMessage);
+                        Complete(false, fail.ErrorMessage, SubAgentRunOutcome.Failed, SubAgentOutcomeReason.EmptyFinalResponse);
                         return;
                 }
             }
@@ -372,7 +419,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                 _log.Warning(
                     "SubAgent [{AgentName}] LLM returned empty text after non-empty analysis — reporting as failure",
                     _definition.Name);
-                Complete(false, "Subagent returned an empty final response.");
+                Complete(false, "Subagent returned an empty final response.", SubAgentRunOutcome.Failed, SubAgentOutcomeReason.EmptyFinalResponse);
                 return;
             }
 
@@ -392,11 +439,15 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                 _log.Warning(
                     "SubAgent [{AgentName}] repeatedly emitted unexecuted tool-call markup as final text; reporting failure",
                     _definition.Name);
-                Complete(false, MalformedFinalOutputMessage);
+                Complete(false, MalformedFinalOutputMessage, SubAgentRunOutcome.Failed, SubAgentOutcomeReason.MalformedFinalOutput);
                 return;
             }
 
-            Complete(true, text);
+            Complete(
+                true,
+                text,
+                _forcedFinalOutcomeReason.HasValue ? SubAgentRunOutcome.Partial : SubAgentRunOutcome.Completed,
+                _forcedFinalOutcomeReason);
         });
 
         Receive<ToolExecutionCompleted>(msg =>
@@ -435,6 +486,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                 case ToolBudgetStatus.Exhausted exhausted:
                     _log.Warning("SubAgent [{AgentName}] hit tool iteration limit ({Count}), forcing text response",
                         _definition.Name, _turnState.ToolIterationCount);
+                    _forcedFinalOutcomeReason = SubAgentOutcomeReason.ToolIterationBudgetExhausted;
                     AddSystemNudge(exhausted.NudgeText);
                     FireLlmCall(forceNoTools: true);
                     return;
@@ -458,13 +510,13 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         {
             _toolExecutionWatchdogState = ToolExecutionWatchdogState.None;
             _log.Error(msg.Cause, "SubAgent [{AgentName}] tool execution failed", _definition.Name);
-            Complete(false, $"Tool execution failed: {msg.Cause.Message}");
+            Complete(false, $"Tool execution failed: {msg.Cause.Message}", SubAgentRunOutcome.Failed, SubAgentOutcomeReason.ToolExecutionFailed);
         });
 
         Receive<LlmCallFailed>(msg =>
         {
             _log.Error(msg.Cause, "SubAgent [{AgentName}] LLM call failed callId={CallId}", _definition.Name, msg.CallId);
-            Complete(false, $"LLM call failed: {msg.Cause.Message}");
+            Complete(false, $"LLM call failed: {msg.Cause.Message}", SubAgentRunOutcome.Failed, SubAgentOutcomeReason.LlmCallFailed);
         });
 
         Receive<SubAgentCancelled>(_ =>
@@ -472,7 +524,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             _executionCts?.Cancel();
             _externalCts?.Cancel();
             _log.Warning("SubAgent [{AgentName}] cancelled by parent", _definition.Name);
-            Complete(false, "Subagent cancelled by parent");
+            Complete(false, "Subagent cancelled by parent", SubAgentRunOutcome.Failed, SubAgentOutcomeReason.CancelledByParent);
         });
 
         Receive<ProcessingWatchdogExpired>(msg =>
@@ -497,7 +549,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                 _log.Warning(
                     "SubAgent [{AgentName}] timed out: no substantive output for {Budget:F0}s after {Iterations} tool iterations",
                     _definition.Name, noProgress, _turnState.ToolIterationCount);
-                Complete(false, $"Subagent timed out: no substantive output for {noProgress:F0}s.");
+                Complete(false, $"Subagent timed out: no substantive output for {noProgress:F0}s.", SubAgentRunOutcome.Failed, SubAgentOutcomeReason.NoSubstantiveOutputTimeout);
                 return;
             }
 
@@ -529,7 +581,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                 "SubAgent [{AgentName}] timed out: no activity for {Budget}s ({Phase}) after {Iterations} tool iterations",
                 _definition.Name, activeBudget.TotalSeconds,
                 _anyContentStreamed ? "inter-delta" : "prefill", _turnState.ToolIterationCount);
-            Complete(false, $"Subagent timed out: no activity for {activeBudget.TotalSeconds:F0}s.");
+            Complete(false, $"Subagent timed out: no activity for {activeBudget.TotalSeconds:F0}s.", SubAgentRunOutcome.Failed, SubAgentOutcomeReason.NoActivityTimeout);
         });
 
         Receive<SubAgentApprovalWaitStarted>(_ =>
@@ -544,7 +596,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
 
             _toolExecutionWatchdogState = ToolExecutionWatchdogState.WaitingForParentApproval;
             _pendingApprovalWaits++;
-            EmitActivity("awaiting human approval", suspendsInactivityWatchdog: true);
+            EmitActivity("awaiting human approval");
         });
 
         Receive<SubAgentApprovalWaitCompleted>(_ =>
@@ -605,6 +657,24 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         });
     }
 
+    // Bill one LLM call's token usage to the shared daily-stats sink and accumulate
+    // the run totals for the completion summary log. We record at the source (here in
+    // the child) rather than propagating totals up to the parent: the parent's
+    // ISessionMetrics is the SAME process-wide singleton, so re-recording there would
+    // double-count, and folding sub-agent tokens into the parent's UsageOutput would
+    // corrupt its context-window percentage (the sub-agent has its own context window).
+    private void RecordUsage(UsageDetails? usage)
+    {
+        if (usage is null)
+            return;
+
+        var input = usage.InputTokenCount ?? 0;
+        var output = usage.OutputTokenCount ?? 0;
+        _runInputTokens += input;
+        _runOutputTokens += output;
+        _sessionMetrics?.RecordTokenUsage(input, output);
+    }
+
     private void HandleToolCalls(AiChatMessage assistantMessage, List<FunctionCallContent> toolCalls)
     {
         _turnState.ResetEmptyResponseGuards();
@@ -661,16 +731,19 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         var messages = new List<AiChatMessage>(_history);
         var callId = ++_llmCallId;
 
-        ChatOptions? options = null;
+        // Carry the parent session id (when known) so the chat-client decorators group this
+        // sub-agent's LLM-pipeline lines under the spawning session in OTEL, plus the sub-session
+        // id so the file-logger partitions them into the sub-agent's OWN session.log. Direct/test
+        // callers leave both unset.
+        ChatOptions? options = _parentSessionId is { Length: > 0 } sid
+            ? new SessionScopedChatOptions { SessionId = sid, SubSessionId = _subSessionId }
+            : null;
         if (!forceNoTools && _aiTools.Count > 0)
         {
-            options = new ChatOptions
-            {
-                Tools = [.. _aiTools]
-            };
+            options ??= new ChatOptions();
+            options.Tools = [.. _aiTools];
         }
 
-        var sessionId = _toolExecutionContext.SessionId is null ? (SessionId?)null : new SessionId(_toolExecutionContext.SessionId);
         _log.Info(
             "SubAgent [{AgentName}] LLM call start callId={CallId} iteration={Iteration} messages={MessageCount} toolsEnabled={ToolsEnabled} forceNoTools={ForceNoTools}",
             _definition.Name,
@@ -679,7 +752,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             messages.Count,
             options?.Tools?.Count > 0,
             forceNoTools);
-        _ = InvokeLlmAsync(client, messages, options, sessionId, self, callId, _executionCts?.Token ?? CancellationToken.None);
+        _ = InvokeLlmAsync(client, messages, options, self, callId, _executionCts?.Token ?? CancellationToken.None);
     }
 
     private IReadOnlyList<AITool> ResolveExposedAiTools()
@@ -693,7 +766,11 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
 
     private bool _completed;
 
-    private void Complete(bool success, string output)
+    private void Complete(
+        bool success,
+        string output,
+        SubAgentRunOutcome? outcome = null,
+        SubAgentOutcomeReason? outcomeReason = null)
     {
         // Idempotent guard: a stale ProcessingWatchdogExpired or other handler can
         // land after Complete has already run (Tell from a thread-pool finally
@@ -715,20 +792,26 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         _externalCts = null;
         _pendingApprovalWaits = 0;
 
-        _log.Info("SubAgent [{AgentName}] completed (success={Success}, output={OutputLength} chars, iterations={Iterations})",
-            _definition.Name, success, output.Length, _turnState.ToolIterationCount);
+        var resolvedOutcome = outcome ?? (success ? SubAgentRunOutcome.Completed : SubAgentRunOutcome.Failed);
 
-        // Log cumulative stats for observability — total LLM calls, tool usage, etc.
-        // This gives operators a single summary line for sub-agent duration analysis.
+        _log.Info("SubAgent [{AgentName}] completed (success={Success}, outcome={Outcome}, reason={Reason}, output={OutputLength} chars, iterations={Iterations})",
+            _definition.Name, success, resolvedOutcome, outcomeReason?.Value ?? "-", output.Length, _turnState.ToolIterationCount);
+
+        // Log cumulative stats for observability — total LLM calls, tool usage, tokens.
+        // This gives operators a single summary line for sub-agent cost/duration analysis.
+        // (success is already on the "completed" line above; omitted here to stay within
+        // ILoggingAdapter's 6-argument ceiling.)
         _log.Info(
-            "SubAgent [{AgentName}] summary: success={Success}, totalToolCalls={TotalToolCalls}, "
-            + "iterations={Iterations}, duration={Duration}s",
-            _definition.Name, success, _turnState.ToolCallCount,
+            "SubAgent [{AgentName}] summary: totalToolCalls={TotalToolCalls}, "
+            + "iterations={Iterations}, inputTokens={InputTokens}, outputTokens={OutputTokens}, "
+            + "duration={Duration}s",
+            _definition.Name, _turnState.ToolCallCount,
             _turnState.ToolIterationCount,
+            _runInputTokens, _runOutputTokens,
             _runStopwatch.Elapsed.TotalSeconds);
 
         var findings = success && _definition.EmitStructuredFindings
-            ? BuildFindings(output, _toolExecutionContext.SessionId)
+            ? BuildFindings(output, _toolExecutionContext.SessionId, resolvedOutcome, outcomeReason)
             : [];
 
         _replyTo.Tell(new SubAgentResult
@@ -736,6 +819,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             Success = success,
             Output = output,
             AgentName = _definition.Name,
+            Outcome = resolvedOutcome,
+            OutcomeReason = outcomeReason,
             Findings = findings,
             FindingsCount = findings.Count
         });
@@ -767,15 +852,12 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
     /// <see cref="SubAgentStreamPing"/> handler already logs that liveness at Debug —
     /// logging it here too would emit one Info line per streamed delta.
     /// </summary>
-    private void EmitActivity(string phase, bool suspendsInactivityWatchdog = false, bool log = true)
+    private void EmitActivity(string phase, bool log = true)
     {
         if (log)
             _log.Info("SubAgent [{AgentName}] {Phase}", _definition.Name, phase);
 
-        _activitySink?.TryWrite(new ToolActivityUpdate(phase)
-        {
-            SuspendsInactivityWatchdog = suspendsInactivityWatchdog
-        });
+        _activitySink?.TryWrite(new ToolActivityUpdate(phase));
     }
 
     /// <summary>
@@ -790,7 +872,11 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         EmitActivity(phase);
     }
 
-    private List<SubAgentFinding> BuildFindings(string output, string? sessionId)
+    private List<SubAgentFinding> BuildFindings(
+        string output,
+        string? sessionId,
+        SubAgentRunOutcome outcome,
+        SubAgentOutcomeReason? outcomeReason)
     {
         var content = output?.Trim() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(content))
@@ -799,11 +885,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         if (content.Length < 30)
             return [];
 
-        var normalized = content.Length <= 1800
-            ? content
-            : content[..1800];
-
-        var confidence = 0.65;
+        var confidence = outcome == SubAgentRunOutcome.Partial ? 0.6 : 0.65;
         var policy = _policyEvaluator.EvaluateWrite(
             sensitivity: SubAgentFindingSensitivity.Normal.ToWireValue(),
             recallMode: SubAgentFindingRecallMode.Auto.ToWireValue(),
@@ -813,13 +895,17 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         if (!policy.Allowed)
             return [];
 
+        var evidence = new List<string> { $"subagent_outcome:{outcome.ToString().ToLowerInvariant()}" };
+        if (outcomeReason is { } reason)
+            evidence.Add($"subagent_outcome_reason:{reason.Value}");
+
         return
         [
             new SubAgentFinding
             {
                 Shape = SubAgentFindingShape.Conclusion,
                 Title = $"subagent:{_definition.Name}",
-                Content = normalized,
+                Content = content,
                 Kind = "record",
                 Sensitivity = SubAgentFindingSensitivity.Normal,
                 RecallMode = SubAgentFindingRecallMode.Searchable,
@@ -827,7 +913,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                 Confidence = confidence,
                 Durability = SubAgentFindingDurability.Durable,
                 Reusability = SubAgentFindingReusability.Reusable,
-                Evidence = []
+                Evidence = evidence
             }
         ];
     }
@@ -889,27 +975,20 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         IChatClient client,
         List<AiChatMessage> messages,
         ChatOptions? options,
-        SessionId? sessionId,
         IActorRef self,
         CancellationToken ct)
-        => InvokeLlmAsync(client, messages, options, sessionId, self, callId: 0, ct);
+        => InvokeLlmAsync(client, messages, options, self, callId: 0, ct);
 
     internal static async Task InvokeLlmAsync(
         IChatClient client,
         List<AiChatMessage> messages,
         ChatOptions? options,
-        SessionId? sessionId,
         IActorRef self,
         long callId,
         CancellationToken ct)
     {
         try
         {
-            // Sub-agents share the parent's diagnostics scope: SessionDiagnosticsContext
-            // strips the "/subagent/..." suffix back to the parent id. Null is intentional
-            // for sub-agents that run outside any session.
-            using var diagnosticsScope = SessionDiagnosticsContext.Push(sessionId?.Value);
-
             // Use streaming to match the main session path. The non-streaming
             // GetResponseAsync path drops reasoning content for some providers
             // (e.g., Qwen emits <think> blocks that surface as TextReasoningContent
@@ -1064,10 +1143,25 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             var tasks = toolCalls.Select(async tc =>
             {
                 var toolContext = CreatePerToolExecutionContext(executionContext);
+
+                // Same execution-preflight seam as the main pipeline: validate +
+                // extract in one step (the sub-agent previously skipped extraction
+                // entirely, silently dropping timeout hints). meta.Background and
+                // meta.Rationale are intentionally not consumed here — sub-agents
+                // have no background-job manager or audit logger; only the timeout
+                // hint maps onto the per-tool context via ApplyMeta.
+                var interpretation = executor.InterpretToolCall(tc);
+                if (interpretation.Rejection is { } rejection)
+                    return BuildToolResult(tc, rejection.Message, toolContext, modelInputBudget);
+
+                var meta = interpretation.Meta;
+                var cleanedTc = interpretation.Cleaned;
+                toolContext.ApplyMeta(meta);
+
                 try
                 {
-                    var result = await executor.ExecuteAsync(tc, toolContext, ct);
-                    return BuildToolResult(tc, result, toolContext, modelInputBudget);
+                    var result = await executor.ExecuteAsync(cleanedTc, toolContext, ct);
+                    return BuildToolResult(cleanedTc, result, toolContext, modelInputBudget);
                 }
                 catch (ToolApprovalRequiredException approvalEx)
                     when (approvalBridge is not null)
@@ -1119,9 +1213,10 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                         var retryContext = CreatePerToolExecutionContext(executionContext);
                         retryContext.OneTimeApprovedToolName = tc.Name;
                         retryContext.SetOneTimeApprovedPatterns(ctx.Patterns);
+                        retryContext.ApplyMeta(meta);
 
-                        var result = await executor.ExecuteAsync(tc, retryContext, ct);
-                        return BuildToolResult(tc, result, retryContext, modelInputBudget);
+                        var result = await executor.ExecuteAsync(cleanedTc, retryContext, ct);
+                        return BuildToolResult(cleanedTc, result, retryContext, modelInputBudget);
                     }
 
                     var reason = decision == ParentApprovalDecision.TimedOut
@@ -1236,11 +1331,21 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
 
     private static string BuildSystemPrompt(SubAgentDefinition definition)
     {
-        var basePrompt = string.IsNullOrWhiteSpace(definition.ProjectInstructions)
-            ? definition.SystemPrompt
-            : SystemPromptAssembler.Assemble(agents: definition.SystemPrompt, projectInstructions: definition.ProjectInstructions);
+        // Assemble the identity stack that sub-agents inherit from the parent session:
+        // 1. Embedded operating core + deployment AGENTS.md mission playbook
+        // 2. Project instructions (workspace/domain context from the parent's working directory)
+        var basePrompt = SystemPromptAssembler.Assemble(
+            agents: definition.OperatingRules,
+            projectInstructions: definition.ProjectInstructions);
 
-        return string.Concat(basePrompt.TrimEnd(), "\n\n", HeadlessExecutionContract);
+        // Append the sub-agent's own system prompt (markdown body + optional skill overlay)
+        var rolePrompt = string.IsNullOrWhiteSpace(basePrompt)
+            ? definition.SystemPrompt
+            : string.Concat(basePrompt.TrimEnd(), "\n\n", definition.SystemPrompt);
+
+        // Append the headless execution and precedence contract — always at the bottom,
+        // after the specialized role prompt it protects from inherited mission conflicts.
+        return string.Concat(rolePrompt.TrimEnd(), "\n\n", HeadlessExecutionContract);
     }
 
     private sealed class SubAgentCancelled

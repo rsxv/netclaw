@@ -11,6 +11,7 @@ using Netclaw.Actors.Tools;
 using Netclaw.Configuration;
 using Netclaw.Security;
 using Netclaw.Tools;
+using static Netclaw.Actors.SubAgents.SubAgentProtocol;
 
 namespace Netclaw.Actors.SubAgents;
 
@@ -32,6 +33,12 @@ public sealed class SubAgentSpawner
     private readonly SubAgentConfig _subAgentConfig;
     private readonly ILogger<SubAgentSpawner> _logger;
 
+    // The process-wide daily-stats sink, handed to each spawned SubAgentActor so its
+    // LLM calls are billed to `netclaw stats`. Nullable to match the rest of the stats
+    // wiring (a host without the daemon stats backend is a real runtime state); DI
+    // injects the registered singleton in production.
+    private readonly Telemetry.ISessionMetrics? _sessionMetrics;
+
     public SubAgentSpawner(
         IChatClientProvider chatClientProvider,
         ToolRegistry toolRegistry,
@@ -39,7 +46,8 @@ public sealed class SubAgentSpawner
         IToolApprovalService? approvalService,
         ISystemPromptProvider promptProvider,
         ILogger<SubAgentSpawner> logger,
-        SubAgentConfig? subAgentConfig = null)
+        SubAgentConfig? subAgentConfig = null,
+        Telemetry.ISessionMetrics? sessionMetrics = null)
     {
         _chatClientProvider = chatClientProvider;
         _toolRegistry = toolRegistry;
@@ -48,6 +56,7 @@ public sealed class SubAgentSpawner
         _promptProvider = promptProvider;
         _subAgentConfig = subAgentConfig ?? new SubAgentConfig();
         _logger = logger;
+        _sessionMetrics = sessionMetrics;
     }
 
     /// <summary>
@@ -66,30 +75,37 @@ public sealed class SubAgentSpawner
         string? systemPromptOverlay = null,
         ChannelWriter<ToolActivityUpdate>? activitySink = null)
     {
+        // Parent-side spawn breadcrumbs — each event is fanned out to daemon.log/Seq and
+        // the parent's session.log from one place (see SubAgentSpawnBreadcrumbs), covering
+        // request → outcome plus early rejections that happen before the child even exists.
+        SubAgentSpawnBreadcrumbs.SpawnRequested(_logger, context, profile.Name, task.Length);
+
         if (context.SpawnChildActor is null)
         {
-            _logger.LogWarning("SubAgent [{AgentName}] cannot spawn — no session context available", profile.Name);
+            SubAgentSpawnBreadcrumbs.NoSessionContext(_logger, context, profile.Name);
             activitySink?.TryComplete();
             return new SubAgentResult
             {
                 Success = false,
                 Output = $"Cannot spawn subagent '{profile.Name}': no session context available.",
-                AgentName = new AgentName(profile.Name)
+                AgentName = new AgentName(profile.Name),
+                Outcome = SubAgentRunOutcome.Failed,
+                OutcomeReason = SubAgentOutcomeReason.SpawnUnavailable
             };
         }
 
         var tools = ResolveTools(profile, context);
         if (tools.Count == 0)
         {
-            _logger.LogWarning(
-                "SubAgent [{AgentName}] has no tools available under the parent audience policy — cannot spawn",
-                profile.Name);
+            SubAgentSpawnBreadcrumbs.NoToolsAvailable(_logger, context, profile.Name);
             activitySink?.TryComplete();
             return new SubAgentResult
             {
                 Success = false,
                 Output = $"Cannot spawn subagent '{profile.Name}': no tools are available under the parent audience policy.",
-                AgentName = new AgentName(profile.Name)
+                AgentName = new AgentName(profile.Name),
+                Outcome = SubAgentRunOutcome.Failed,
+                OutcomeReason = SubAgentOutcomeReason.NoToolsAvailable
             };
         }
 
@@ -100,10 +116,11 @@ public sealed class SubAgentSpawner
             Tools = tools,
             ModelRole = profile.ModelRole,
             EmitStructuredFindings = profile.EmitStructuredFindings,
-            ProjectInstructions = ResolveProjectInstructions(context)
+            ProjectInstructions = ResolveProjectInstructions(context),
+            OperatingRules = ResolveOperatingRules(context)
         };
 
-        var runId = Guid.NewGuid().ToString("N");
+        var runId = SubAgentRunId.New();
 
         // Notify session that subagent is starting
         context.OnSubAgentActivity?.Invoke(new SubAgentNotificationInfo
@@ -122,6 +139,7 @@ public sealed class SubAgentSpawner
         var subAgentScopeId = !string.IsNullOrWhiteSpace(context.SessionId)
             ? $"{context.SessionId}/subagent/{definition.Name}/{runId}"
             : $"subagent/{definition.Name}/{runId}";
+        var scopeId = new SubAgentScopeId(subAgentScopeId);
 
         // Spawn as child of the session actor via the context factory
         var props = SubAgentActor.CreateProps(
@@ -129,9 +147,37 @@ public sealed class SubAgentSpawner
             chatClient,
             _toolAccessPolicy,
             _approvalService,
-            SubAgentMaxToolIterations);
+            SubAgentMaxToolIterations,
+            _sessionMetrics);
         var actorName = $"subagent-{definition.Name}-{runId}";
-        var subAgent = (IActorRef)await context.SpawnChildActor(props, actorName, ct);
+        IActorRef subAgent;
+        try
+        {
+            subAgent = (IActorRef)await context.SpawnChildActor(props, actorName, ct);
+        }
+        catch (Exception ex)
+        {
+            // The child actor was never created (session actor ActorOf failed or the
+            // spawn ask timed out). Record it to the session transcript before the
+            // exception propagates to the tool pipeline.
+            SubAgentSpawnBreadcrumbs.ChildSpawnFailed(_logger, context, profile.Name, runId, ex);
+            // Balance the IsStarted=true notification above: the non-streaming path
+            // (activitySink is null) relies solely on OnSubAgentActivity, so without
+            // a terminal event the session UI shows a sub-agent stuck in "Started".
+            context.OnSubAgentActivity?.Invoke(new SubAgentNotificationInfo
+            {
+                RunId = runId,
+                AgentName = definition.Name.Value,
+                IsStarted = false,
+                Success = false,
+                Outcome = SubAgentRunOutcome.Failed,
+                OutcomeReason = SubAgentOutcomeReason.SpawnError
+            });
+            activitySink?.TryComplete();
+            throw;
+        }
+
+        SubAgentSpawnBreadcrumbs.ChildSpawned(_logger, context, profile.Name, runId);
 
         var sw = Stopwatch.StartNew();
         try
@@ -155,7 +201,12 @@ public sealed class SubAgentSpawner
                     ParentProjectDirectory = context.ProjectDirectory,
                     ParentCwd = context.ResolveShellCwd(null),
                     Cancellation = ct,
-                    ApprovalBridge = context.ApprovalBridge,
+                    // A session owns an approval channel even when its transport cannot
+                    // service prompts. Preserve the channel capability as the authority:
+                    // bridge presence alone must never make an unattended child interactive.
+                    ApprovalBridge = context.SupportsInteractiveApproval == true
+                        ? context.ApprovalBridge
+                        : null,
                     // Null for non-streaming callers such as routed skills and the
                     // legacy ExecuteAsync path; the sub-agent surfaces its progress
                     // through its own session-correlated logs regardless. Streaming
@@ -184,15 +235,19 @@ public sealed class SubAgentSpawner
                 AgentName = definition.Name.Value,
                 IsStarted = false,
                 Success = result.Success,
+                Outcome = result.Outcome,
+                OutcomeReason = result.OutcomeReason,
                 Duration = sw.Elapsed,
                 Findings = result.Findings
             });
 
-            _logger.LogInformation(
-                "SubAgent [{AgentName}] completed (success={Success}, duration={Duration}ms)",
-                profile.Name, result.Success, sw.ElapsedMilliseconds);
+            SubAgentSpawnBreadcrumbs.Completed(_logger, context, profile.Name, runId, result.Success, sw.ElapsedMilliseconds);
 
-            return result;
+            return result with
+            {
+                RunId = runId,
+                ScopeId = scopeId
+            };
         }
         catch (Exception ex)
         {
@@ -206,15 +261,21 @@ public sealed class SubAgentSpawner
                 AgentName = definition.Name.Value,
                 IsStarted = false,
                 Success = false,
+                Outcome = SubAgentRunOutcome.Failed,
+                OutcomeReason = SubAgentOutcomeReason.SpawnError,
                 Duration = sw.Elapsed
             });
 
-            _logger.LogError(ex, "SubAgent [{AgentName}] spawn failed", profile.Name);
+            SubAgentSpawnBreadcrumbs.RunFailed(_logger, context, profile.Name, runId, ex);
             return new SubAgentResult
             {
                 Success = false,
                 Output = $"Subagent error: {ex.Message}",
-                AgentName = new AgentName(profile.Name)
+                AgentName = new AgentName(profile.Name),
+                Outcome = SubAgentRunOutcome.Failed,
+                OutcomeReason = SubAgentOutcomeReason.SpawnError,
+                RunId = runId,
+                ScopeId = scopeId
             };
         }
         finally
@@ -239,12 +300,7 @@ public sealed class SubAgentSpawner
             }
             else
             {
-                // Log at INFO so tool denials are visible in production logs.
-                // Sub-agents without certain tools may be unable to complete
-                // their tasks, and this information is important for debugging.
-                _logger.LogInformation(
-                    "SubAgent [{AgentName}] tool '{ToolName}' denied by SubAgentToolPolicy",
-                    profile.Name, tool.Name);
+                SubAgentSpawnBreadcrumbs.ToolDenied(_logger, context, profile.Name, tool.Name);
             }
         }
 
@@ -274,5 +330,13 @@ public sealed class SubAgentSpawner
             return null;
 
         return _promptProvider.GetProjectInstructions(context.Audience, context.ProjectDirectory);
+    }
+
+    private string? ResolveOperatingRules(ToolExecutionContext context)
+    {
+        // Sub-agents inherit the audience-appropriate embedded operating core and
+        // the deployment mission playbook. This keeps safety, grounding, and the
+        // operator's quality workflow aligned without exposing SOUL.md or TOOLING.md.
+        return _promptProvider.GetOperatingRules(context.Audience);
     }
 }

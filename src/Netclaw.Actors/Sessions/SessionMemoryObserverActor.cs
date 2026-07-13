@@ -15,6 +15,7 @@ using Netclaw.Actors.Serialization;
 using Netclaw.Actors.Sessions.Pipelines;
 using Netclaw.Actors.SubAgents;
 using Netclaw.Configuration;
+using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Actors.Sessions;
 
@@ -347,7 +348,6 @@ public sealed class SessionMemoryObserverActor : ReceivePersistentActor
         try
         {
             using var cts = new CancellationTokenSource(timeout);
-            using var diagnosticsScope = SessionDiagnosticsContext.Push(sessionId.Value);
             var messages = new List<ChatMessage>
             {
                 new(Microsoft.Extensions.AI.ChatRole.System, DistillationSystemPrompt),
@@ -355,7 +355,10 @@ public sealed class SessionMemoryObserverActor : ReceivePersistentActor
                     sessionId, turnCount, transcript, existingProposals))
             };
 
-            var response = (await StreamingResponseReader.ReadAsync(client, messages, options: null, cts.Token)).Response;
+            // Carry the session id so memory-distillation chat-client diagnostics route to the
+            // session's session.log and correlate in Seq/OTLP (replaces the deleted AsyncLocal).
+            var options = new SessionScopedChatOptions { SessionId = sessionId.Value };
+            var response = (await StreamingResponseReader.ReadAsync(client, messages, options, cts.Token)).Response;
             var text = response.Text ?? string.Empty;
 
             inputTokens = response.Usage?.InputTokenCount;
@@ -590,7 +593,7 @@ public sealed class SessionMemoryObserverActor : ReceivePersistentActor
         CompactionOutput
             => "[session compacted]",
         SubAgentOutput sa when sa.Phase == SubAgentPhase.Completed
-            => $"[subagent] {sa.AgentName} completed (findings={sa.FindingsCount})",
+            => $"[subagent] {sa.AgentName} {sa.Outcome.ToString().ToLowerInvariant()} (findings={sa.FindingsCount})",
         ErrorOutput error
             => $"[error] {error.Message}",
         _ => null

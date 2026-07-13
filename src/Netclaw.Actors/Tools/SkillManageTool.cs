@@ -24,9 +24,6 @@ namespace Netclaw.Actors.Tools;
     Grant = "builtin")]
 public sealed partial class SkillManageTool : NetclawTool<SkillManageTool.Params>
 {
-    private static readonly HashSet<string> AllowedResourcePrefixes =
-        new(StringComparer.OrdinalIgnoreCase) { "references", "scripts", "assets" };
-
     [GeneratedRegex(@"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")]
     private static partial Regex ValidNameRegex();
 
@@ -167,11 +164,8 @@ public sealed partial class SkillManageTool : NetclawTool<SkillManageTool.Params
                 return $"Skill '{name}' not found.";
         }
 
-        if (IsSystemCategory(skill))
-            return "Cannot edit system skills. System skills are read-only.";
-
-        if (IsExternalSkill(skill))
-            return "Cannot edit external skills. External skill directories are read-only.";
+        var readOnlyError = GuardReadOnly(skill, "edit");
+        if (readOnlyError is not null) return readOnlyError;
 
         var contentError = ValidateFrontmatter(args.Content);
         if (contentError is not null) return contentError;
@@ -208,19 +202,16 @@ public sealed partial class SkillManageTool : NetclawTool<SkillManageTool.Params
         if (skill is null)
             return $"Skill '{name}' not found.";
 
-        if (IsSystemCategory(skill))
-            return "Cannot patch system skills. System skills are read-only.";
-
-        if (IsExternalSkill(skill))
-            return "Cannot patch external skills. External skill directories are read-only.";
+        var readOnlyError = GuardReadOnly(skill, "patch");
+        if (readOnlyError is not null) return readOnlyError;
 
         // Determine target file
         var targetPath = skill.FilePath;
         if (!string.IsNullOrWhiteSpace(args.FilePath))
         {
-            var fileError = ValidateResourcePath(args.FilePath);
-            if (fileError is not null) return fileError;
-            targetPath = Path.Combine(skill.SkillDirectory, args.FilePath);
+            if (!SkillResourcePath.TryNormalize(args.FilePath, out var normalizedPath, out var fileError))
+                return SkillResourcePath.FormatManageError(fileError);
+            targetPath = Path.Combine(skill.SkillDirectory, normalizedPath);
         }
 
         if (!File.Exists(targetPath))
@@ -250,7 +241,7 @@ public sealed partial class SkillManageTool : NetclawTool<SkillManageTool.Params
 
         var scanSubject = targetPath == skill.FilePath
             ? name
-            : $"{name}:{args.FilePath}";
+            : $"{name}:{Path.GetRelativePath(skill.SkillDirectory, targetPath).Replace(Path.DirectorySeparatorChar, '/')}";
         var scanResult = await _scanner.ScanAsync(scanSubject, newContent, ct);
         if (!scanResult.IsAllowed)
             return $"Content scan rejected: {scanResult.Reason}";
@@ -283,11 +274,8 @@ public sealed partial class SkillManageTool : NetclawTool<SkillManageTool.Params
         if (skill is null)
             return $"Skill '{name}' not found.";
 
-        if (IsSystemCategory(skill))
-            return "Cannot delete system skills. System skills are read-only.";
-
-        if (IsExternalSkill(skill))
-            return "Cannot delete external skills. External skill directories are read-only.";
+        var readOnlyError = GuardReadOnly(skill, "delete");
+        if (readOnlyError is not null) return readOnlyError;
 
         if (skill.IsFlatFile)
         {
@@ -325,21 +313,18 @@ public sealed partial class SkillManageTool : NetclawTool<SkillManageTool.Params
         if (skill is null)
             return $"Skill '{name}' not found.";
 
-        if (IsSystemCategory(skill))
-            return "Cannot write files in system skills. System skills are read-only.";
+        var readOnlyError = GuardReadOnly(skill, "write files in");
+        if (readOnlyError is not null) return readOnlyError;
 
-        if (IsExternalSkill(skill))
-            return "Cannot write files in external skills. External skill directories are read-only.";
+        if (!SkillResourcePath.TryNormalize(args.FilePath, out var normalizedPath, out var fileError))
+            return SkillResourcePath.FormatManageError(fileError);
 
-        var fileError = ValidateResourcePath(args.FilePath);
-        if (fileError is not null) return fileError;
-
-        var fullPath = Path.GetFullPath(Path.Combine(skill.SkillDirectory, args.FilePath));
+        var fullPath = Path.GetFullPath(Path.Combine(skill.SkillDirectory, normalizedPath));
         if (!PathUtility.IsWithinRoot(fullPath, skill.SkillDirectory))
             return "Resolved path is outside the skill directory.";
 
         var scanResult = await _scanner.ScanAsync(
-            $"{name}:{args.FilePath}",
+            $"{name}:{normalizedPath}",
             args.FileContent,
             ct);
         if (!scanResult.IsAllowed)
@@ -350,7 +335,7 @@ public sealed partial class SkillManageTool : NetclawTool<SkillManageTool.Params
         AtomicWrite(fullPath, args.FileContent);
         var rescan = RescanAndUpdateIndex();
 
-        var message = $"File written: {args.FilePath}";
+        var message = $"File written: {normalizedPath}";
         if (scanResult.Verdict == ScanVerdict.Warning)
             message += $" (warning: {scanResult.Reason})";
 
@@ -370,21 +355,18 @@ public sealed partial class SkillManageTool : NetclawTool<SkillManageTool.Params
         if (skill is null)
             return $"Skill '{name}' not found.";
 
-        if (IsSystemCategory(skill))
-            return "Cannot remove files from system skills. System skills are read-only.";
+        var readOnlyError = GuardReadOnly(skill, "remove files from");
+        if (readOnlyError is not null) return readOnlyError;
 
-        if (IsExternalSkill(skill))
-            return "Cannot remove files from external skills. External skill directories are read-only.";
+        if (!SkillResourcePath.TryNormalize(args.FilePath, out var normalizedPath, out var fileError))
+            return SkillResourcePath.FormatManageError(fileError);
 
-        var fileError = ValidateResourcePath(args.FilePath);
-        if (fileError is not null) return fileError;
-
-        var fullPath = Path.GetFullPath(Path.Combine(skill.SkillDirectory, args.FilePath));
+        var fullPath = Path.GetFullPath(Path.Combine(skill.SkillDirectory, normalizedPath));
         if (!PathUtility.IsWithinRoot(fullPath, skill.SkillDirectory))
             return "Resolved path is outside the skill directory.";
 
         if (!File.Exists(fullPath))
-            return $"File not found: {args.FilePath}";
+            return $"File not found: {normalizedPath}";
 
         File.Delete(fullPath);
 
@@ -396,7 +378,7 @@ public sealed partial class SkillManageTool : NetclawTool<SkillManageTool.Params
             Directory.Delete(dir);
         }
 
-        return AppendScanWarnings($"File removed: {args.FilePath}", RescanAndUpdateIndex());
+        return AppendScanWarnings($"File removed: {normalizedPath}", RescanAndUpdateIndex());
     }
 
     // --- Helpers ---
@@ -456,27 +438,26 @@ public sealed partial class SkillManageTool : NetclawTool<SkillManageTool.Params
         return null;
     }
 
-    private static string? ValidateResourcePath(string? path)
+    private string? GuardReadOnly(SkillEntry skill, string verb)
     {
-        if (string.IsNullOrWhiteSpace(path))
-            return "FilePath is required.";
-
-        if (Path.IsPathRooted(path))
-            return "Absolute paths are not allowed.";
-
-        if (path.Contains("..", StringComparison.Ordinal))
-            return "Path traversal ('..') is not allowed.";
-
-        var normalized = path.Replace('\\', '/');
-        var firstSegment = normalized.Split('/')[0];
-        if (!AllowedResourcePrefixes.Contains(firstSegment))
-            return $"FilePath must start with one of: {string.Join(", ", AllowedResourcePrefixes)}. Got '{firstSegment}'.";
-
+        if (IsSystemCategory(skill))
+            return $"Cannot {verb} system skills. System skills are read-only.";
+        if (IsServerFeedSkill(skill))
+            return $"Cannot {verb} server feed skills. Server feed skill directories are read-only.";
+        if (IsExternalSkill(skill))
+            return $"Cannot {verb} external skills. External skill directories are read-only.";
         return null;
     }
 
     private static bool IsSystemCategory(SkillEntry skill)
         => string.Equals(skill.Category, SkillScanner.SystemCategory, StringComparison.Ordinal);
+
+    private bool IsServerFeedSkill(SkillEntry skill)
+    {
+        var feedRoot = PathUtility.Normalize(_paths.ServerFeedsDirectory);
+        var skillPath = PathUtility.Normalize(Path.GetDirectoryName(skill.FilePath)!);
+        return PathUtility.IsWithinRoot(skillPath, feedRoot);
+    }
 
     private bool IsExternalSkill(SkillEntry skill)
     {

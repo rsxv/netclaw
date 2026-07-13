@@ -105,9 +105,18 @@ public sealed class MemoryRecallScenarioTests : IAsyncLifetime
             "What transport does Akka.Remote use?",
             expected: ["M11"],
             forbidden: NoiseBand);
+        // P09 is a PARAPHRASE-GAP scenario: the query shares almost no lexical
+        // tokens with M16 ("versions ... cover" vs "runs net8.0 net9.0 ...
+        // runners"), so under lexical recall M16 only ever surfaced via a
+        // single weak token match — the exact signature of the measured
+        // pollution vector (docs/research/memory-audit-2026-07.md). With the calibrated floor the
+        // correct deterministic behavior is to inject NOTHING here rather
+        // than admit single-token matches corpus-wide. Semantic (embedding)
+        // recall is what serves this query; when hybrid recall lands, flip
+        // this back to expected: ["M16"].
         yield return Row("P09",
             "Which .NET versions does our CI cover?",
-            expected: ["M16"],
+            expected: [],
             forbidden: NoiseBand);
         yield return Row("P10",
             "Are our NuGet packages signed?",
@@ -189,8 +198,8 @@ public sealed class MemoryRecallScenarioTests : IAsyncLifetime
             result.Degraded,
             $"[{scenarioId}] recall degraded: {result.DegradeStage}/{result.DegradeReason}");
 
-        var returnedIds = result.Items.Select(i => i.Id).ToArray();
-        var returnedWithScores = string.Join(", ", result.Items.Select(i => $"{i.Id}={i.Score:F3}"));
+        var returnedIds = result.Items.Select(i => i.Id.Value).ToArray();
+        var returnedWithScores = string.Join(", ", result.Items.Select(i => $"{i.Id.Value}={i.Score:F3}"));
 
         foreach (var expected in expectedIds)
         {

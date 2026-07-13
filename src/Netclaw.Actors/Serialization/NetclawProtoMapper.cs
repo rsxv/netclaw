@@ -13,6 +13,7 @@ using Netclaw.Actors.Reminders;
 using Netclaw.Actors.Sessions;
 using Netclaw.Media;
 using Proto = Netclaw.Actors.Serialization.Proto;
+using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Actors.Serialization;
 
@@ -35,8 +36,6 @@ internal static class NetclawProtoMapper
         ToolBatchAbandoned v => ToProto(v),
         SessionBackgroundJobsReaped v => ToProto(v),
         SessionSnapshot v => ToProto(v),
-        TurnBroadcast v => ToProto(v),
-        CompactionBroadcast v => ToProto(v),
         WorkingContext v => ToProto(v),
         ReminderId v => ToProto(v),
         ReminderDelivery v => ToProto(v),
@@ -160,10 +159,12 @@ internal static class NetclawProtoMapper
             AssistantReply = ToProto(evt.AssistantReply),
             RecordedAtMs = evt.RecordedAtMs
         };
-        if (evt.SourceReminderId is not null)
-            proto.SourceReminderId = evt.SourceReminderId;
-        if (evt.SourceBackgroundJobId is not null)
-            proto.SourceBackgroundJobId = evt.SourceBackgroundJobId;
+        // Value objects map to the existing string proto fields, so the on-disk
+        // form is byte-identical to the pre-value-object representation.
+        if (evt.SourceReminderId is { } reminderId)
+            proto.SourceReminderId = reminderId.Value;
+        if (evt.SourceBackgroundJobId is { } backgroundJobId)
+            proto.SourceBackgroundJobId = backgroundJobId.Value;
         return proto;
     }
 
@@ -173,8 +174,8 @@ internal static class NetclawProtoMapper
         UserMessage = FromProto(proto.UserMessage),
         AssistantReply = FromProto(proto.AssistantReply),
         RecordedAtMs = proto.RecordedAtMs,
-        SourceReminderId = proto.HasSourceReminderId ? proto.SourceReminderId : null,
-        SourceBackgroundJobId = proto.HasSourceBackgroundJobId ? proto.SourceBackgroundJobId : null
+        SourceReminderId = proto.HasSourceReminderId ? new ReminderId(proto.SourceReminderId) : (ReminderId?)null,
+        SourceBackgroundJobId = proto.HasSourceBackgroundJobId ? new BackgroundJobId(proto.SourceBackgroundJobId) : (BackgroundJobId?)null
     };
 
     // ── SessionTitleSet ──
@@ -356,7 +357,7 @@ internal static class NetclawProtoMapper
     };
 
     private static Proto.ToolApprovalRequestedProto.Types.ApprovalCandidateProto ToApprovalCandidateProto(
-        ToolApprovalRequested.ApprovalCandidateRecord c)
+        Netclaw.Security.ApprovalCandidate c)
     {
         var proto = new Proto.ToolApprovalRequestedProto.Types.ApprovalCandidateProto
         {
@@ -367,12 +368,9 @@ internal static class NetclawProtoMapper
         return proto;
     }
 
-    private static ToolApprovalRequested.ApprovalCandidateRecord FromApprovalCandidateProto(
-        Proto.ToolApprovalRequestedProto.Types.ApprovalCandidateProto proto) => new()
-    {
-        Verb = proto.Verb,
-        Directory = proto.HasDirectory ? proto.Directory : null
-    };
+    private static Netclaw.Security.ApprovalCandidate FromApprovalCandidateProto(
+        Proto.ToolApprovalRequestedProto.Types.ApprovalCandidateProto proto) =>
+        new(proto.Verb, proto.HasDirectory ? proto.Directory : null);
 
     private static Proto.ToolApprovalRequestedProto.Types.TurnContextRecordProto ToProto(TurnContextRecord record)
     {
@@ -552,38 +550,6 @@ internal static class NetclawProtoMapper
         SenderId = new SenderId(proto.SenderId),
         TimestampMs = proto.TimestampMs,
         AuthorityAtInclusion = proto.AuthorityAtInclusion
-    };
-
-    // ── TurnBroadcast ──
-
-    internal static Proto.TurnBroadcastProto ToProto(TurnBroadcast evt) => new()
-    {
-        SessionId = ToProto(evt.SessionId),
-        AssistantReply = ToProto(evt.AssistantReply),
-        BroadcastAtMs = evt.BroadcastAtMs
-    };
-
-    internal static TurnBroadcast FromProto(Proto.TurnBroadcastProto proto) => new()
-    {
-        SessionId = FromProto(proto.SessionId),
-        AssistantReply = FromProto(proto.AssistantReply),
-        BroadcastAtMs = proto.BroadcastAtMs
-    };
-
-    // ── CompactionBroadcast ──
-
-    internal static Proto.CompactionBroadcastProto ToProto(CompactionBroadcast evt) => new()
-    {
-        SessionId = ToProto(evt.SessionId),
-        Summary = evt.Summary,
-        CompactedAtMs = evt.CompactedAtMs
-    };
-
-    internal static CompactionBroadcast FromProto(Proto.CompactionBroadcastProto proto) => new()
-    {
-        SessionId = FromProto(proto.SessionId),
-        Summary = proto.Summary,
-        CompactedAtMs = proto.CompactedAtMs
     };
 
     // ── WorkingContext ──

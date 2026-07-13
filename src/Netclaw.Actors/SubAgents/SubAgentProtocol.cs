@@ -1,4 +1,4 @@
-﻿// -----------------------------------------------------------------------
+// -----------------------------------------------------------------------
 // <copyright file="SubAgentProtocol.cs" company="Petabridge, LLC">
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
@@ -41,12 +41,31 @@ public sealed record SubAgentDefinition
     /// Optional project-scoped identity content inherited from the parent session.
     /// </summary>
     public string? ProjectInstructions { get; init; }
+
+    /// <summary>
+    /// Embedded operating core and deployment playbook inherited from the parent session's trust audience.
+    /// Provides sub-agents with the same safety, grounding, and policy constraints as main agents.
+    /// </summary>
+    public string? OperatingRules { get; init; }
 }
+
+/// <summary>
+/// External message contract for <see cref="SubAgentActor"/>: spawn request and result.
+/// </summary>
+public static class SubAgentProtocol
+{
+    /// <summary>Marker for subagent commands.</summary>
+    public interface ISubAgentCommand : INoSerializationVerificationNeeded;
+
+    /// <summary>Marker for subagent responses.</summary>
+    public interface ISubAgentResponse : INoSerializationVerificationNeeded;
+
+// ===== Commands =====
 
 /// <summary>
 /// Message sent to a <see cref="SubAgentActor"/> to begin execution.
 /// </summary>
-public sealed record RunSubAgent : INoSerializationVerificationNeeded
+public sealed record RunSubAgent : ISubAgentCommand
 {
     /// <summary>The task for the subagent to perform (becomes part of the user message).</summary>
     public required string Task { get; init; }
@@ -150,10 +169,12 @@ public sealed record RunSubAgent : INoSerializationVerificationNeeded
     public ChannelWriter<ToolActivityUpdate>? ActivitySink { get; init; }
 }
 
+// ===== Responses =====
+
 /// <summary>
 /// Result returned by a <see cref="SubAgentActor"/> when execution completes.
 /// </summary>
-public sealed record SubAgentResult : INoSerializationVerificationNeeded
+public sealed record SubAgentResult : ISubAgentResponse
 {
     /// <summary>Whether the subagent completed successfully.</summary>
     public required bool Success { get; init; }
@@ -164,6 +185,18 @@ public sealed record SubAgentResult : INoSerializationVerificationNeeded
     /// <summary>Name of the subagent that produced this result.</summary>
     public required AgentName AgentName { get; init; }
 
+    /// <summary>Terminal outcome of the run, separate from the legacy success flag.</summary>
+    public SubAgentRunOutcome Outcome { get; init; } = SubAgentRunOutcome.Completed;
+
+    /// <summary>Machine-readable reason when <see cref="Outcome"/> is not completed.</summary>
+    public SubAgentOutcomeReason? OutcomeReason { get; init; }
+
+    /// <summary>Spawner-generated run id used to correlate logs and notifications.</summary>
+    public SubAgentRunId? RunId { get; init; }
+
+    /// <summary>Subagent scope id used in structured logs.</summary>
+    public SubAgentScopeId? ScopeId { get; init; }
+
     /// <summary>
     /// Structured findings returned to the owning session for policy and checkpoint review.
     /// </summary>
@@ -173,4 +206,5 @@ public sealed record SubAgentResult : INoSerializationVerificationNeeded
     /// Total number of structured findings returned before parent-session review.
     /// </summary>
     public int FindingsCount { get; init; }
+}
 }

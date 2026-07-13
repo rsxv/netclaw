@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 5
     steps:
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         lfs: true
         fetch-depth: 0
@@ -74,7 +74,7 @@ jobs:
       run: |
         $content = Get-Content RELEASE_NOTES.md -Raw
         # Match from the first #### heading to just before the second one
-        if ($content -match '(?s)(####.+?)(?=\n####|\z)') {
+        if ($content -match '(?s)(## \d.+?)(?=\n## \d|\z)') {
           $Matches[1].Trim() | Set-Content RELEASE_NOTES_LATEST.md
         } else {
           $content | Set-Content RELEASE_NOTES_LATEST.md
@@ -120,7 +120,7 @@ jobs:
             archive_ext: tar.gz
     steps:
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         lfs: true
         fetch-depth: 0
@@ -258,7 +258,7 @@ jobs:
       packages: write
     steps:
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         lfs: true
         fetch-depth: 0
@@ -373,7 +373,7 @@ jobs:
       latest_prerelease: ${{ steps.pointers.outputs.latest_prerelease }}
     steps:
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         lfs: true
         fetch-depth: 0

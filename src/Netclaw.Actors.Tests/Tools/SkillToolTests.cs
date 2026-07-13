@@ -337,6 +337,25 @@ public class SkillToolTests : IDisposable
     }
 
     [Fact]
+    public async Task SkillReadResource_ReadsArbitraryAdditionalFilePath()
+    {
+        WriteSkill("my-skill", """
+            ---
+            name: my-skill
+            description: Test skill.
+            ---
+            # My Skill
+            """);
+        WriteFile("my-skill", "tools/check", "#!/bin/bash\necho ok");
+        ScanSkills();
+
+        var tool = new SkillReadResourceTool(_registry, new NoOpSkillContentScanner());
+        var result = await tool.ExecuteAsync(ToolInput.Create("SkillName", "my-skill", "ResourcePath", "tools/check"), PersonalCtx, TestContext.Current.CancellationToken);
+
+        Assert.Contains("echo ok", result);
+    }
+
+    [Fact]
     public async Task SkillReadResource_RejectsPathTraversal()
     {
         WriteSkill("my-skill", """
@@ -351,7 +370,7 @@ public class SkillToolTests : IDisposable
         var tool = new SkillReadResourceTool(_registry, new NoOpSkillContentScanner());
         var result = await tool.ExecuteAsync(ToolInput.Create("SkillName", "my-skill", "ResourcePath", "../../etc/passwd"), PersonalCtx, TestContext.Current.CancellationToken);
 
-        Assert.Contains("not allowed", result);
+        Assert.Contains("cannot contain", result);
     }
 
     [Fact]
@@ -387,7 +406,7 @@ public class SkillToolTests : IDisposable
         var tool = new SkillReadResourceTool(_registry, new NoOpSkillContentScanner());
         var result = await tool.ExecuteAsync(ToolInput.Create("SkillName", "my-skill", "ResourcePath", "SKILL.md"), PersonalCtx, TestContext.Current.CancellationToken);
 
-        Assert.Contains("must start with", result);
+        Assert.Contains("Use skill_load", result);
     }
 
     [Fact]
@@ -495,7 +514,7 @@ public class SkillToolTests : IDisposable
     }
 
     [Fact]
-    public async Task SkillManage_WriteFile_ValidatesPath()
+    public async Task SkillManage_WriteFile_RejectsTraversalPath()
     {
         WriteSkill("wf-test", """
             ---
@@ -507,9 +526,28 @@ public class SkillToolTests : IDisposable
         ScanSkills();
 
         var tool = CreateManageTool();
-        var result = await tool.ExecuteAsync(ToolInput.Create("Action", "write_file", "Name", "wf-test", "FilePath", "baddir/file.md", "FileContent", "content"), PersonalCtx, TestContext.Current.CancellationToken);
+        var result = await tool.ExecuteAsync(ToolInput.Create("Action", "write_file", "Name", "wf-test", "FilePath", "../file.md", "FileContent", "content"), PersonalCtx, TestContext.Current.CancellationToken);
 
-        Assert.Contains("must start with", result);
+        Assert.Contains("cannot contain", result);
+    }
+
+    [Fact]
+    public async Task SkillManage_WriteFile_AllowsArbitraryAdditionalFilePath()
+    {
+        WriteSkill("wf-test", """
+            ---
+            name: wf-test
+            description: Write file test.
+            ---
+            # WF
+            """);
+        ScanSkills();
+
+        var tool = CreateManageTool();
+        var result = await tool.ExecuteAsync(ToolInput.Create("Action", "write_file", "Name", "wf-test", "FilePath", "tools/check", "FileContent", "#!/bin/bash\necho ok"), PersonalCtx, TestContext.Current.CancellationToken);
+
+        Assert.Contains("File written: tools/check", result);
+        Assert.True(File.Exists(Path.Combine(_paths.SkillsDirectory, "wf-test", "tools", "check")));
     }
 
     [Fact]
@@ -556,6 +594,130 @@ public class SkillToolTests : IDisposable
         Assert.Contains("Content scan rejected", result);
         var content = File.ReadAllText(Path.Combine(_paths.SkillsDirectory, "patch-resource", "references", "guide.md"));
         Assert.DoesNotContain("Ignore previous instructions", content);
+    }
+
+    [Fact]
+    public async Task SkillManage_ServerFeedSkill_BlocksEdit()
+    {
+        WriteServerFeedSkill("my-feed", "feed-skill", """
+            ---
+            name: feed-skill
+            description: Synced from feed.
+            ---
+            # Feed Skill
+            """);
+        ScanFeedSkills("my-feed");
+
+        var tool = CreateManageTool();
+        var result = await tool.ExecuteAsync(ToolInput.Create(
+                "Action", "edit",
+                "Name", "feed-skill",
+                "Content", "---\nname: feed-skill\ndescription: Hacked.\n---\n# Hacked"),
+            PersonalCtx,
+            TestContext.Current.CancellationToken);
+
+        Assert.Contains("Server feed skill directories are read-only", result);
+        var content = File.ReadAllText(Path.Combine(_paths.ServerFeedDirectory("my-feed"), "feed-skill", "SKILL.md"));
+        Assert.DoesNotContain("Hacked", content);
+    }
+
+    [Fact]
+    public async Task SkillManage_ServerFeedSkill_BlocksPatch()
+    {
+        WriteServerFeedSkill("my-feed", "feed-skill", """
+            ---
+            name: feed-skill
+            description: Synced from feed.
+            ---
+            # Feed Skill
+            """);
+        ScanFeedSkills("my-feed");
+
+        var tool = CreateManageTool();
+        var result = await tool.ExecuteAsync(ToolInput.Create(
+                "Action", "patch",
+                "Name", "feed-skill",
+                "OldString", "Feed Skill",
+                "NewString", "Hacked"),
+            PersonalCtx,
+            TestContext.Current.CancellationToken);
+
+        Assert.Contains("Server feed skill directories are read-only", result);
+        var content = File.ReadAllText(Path.Combine(_paths.ServerFeedDirectory("my-feed"), "feed-skill", "SKILL.md"));
+        Assert.DoesNotContain("Hacked", content);
+    }
+
+    [Fact]
+    public async Task SkillManage_ServerFeedSkill_BlocksDelete()
+    {
+        WriteServerFeedSkill("my-feed", "feed-skill", """
+            ---
+            name: feed-skill
+            description: Synced from feed.
+            ---
+            # Feed Skill
+            """);
+        ScanFeedSkills("my-feed");
+
+        var tool = CreateManageTool();
+        var result = await tool.ExecuteAsync(ToolInput.Create(
+                "Action", "delete",
+                "Name", "feed-skill"),
+            PersonalCtx,
+            TestContext.Current.CancellationToken);
+
+        Assert.Contains("Server feed skill directories are read-only", result);
+        Assert.True(Directory.Exists(Path.Combine(_paths.ServerFeedDirectory("my-feed"), "feed-skill")));
+    }
+
+    [Fact]
+    public async Task SkillManage_ServerFeedSkill_BlocksWriteFile()
+    {
+        WriteServerFeedSkill("my-feed", "feed-skill", """
+            ---
+            name: feed-skill
+            description: Synced from feed.
+            ---
+            # Feed Skill
+            """);
+        ScanFeedSkills("my-feed");
+
+        var tool = CreateManageTool();
+        var result = await tool.ExecuteAsync(ToolInput.Create(
+                "Action", "write_file",
+                "Name", "feed-skill",
+                "FilePath", "references/injected.md",
+                "FileContent", "injected"),
+            PersonalCtx,
+            TestContext.Current.CancellationToken);
+
+        Assert.Contains("Server feed skill directories are read-only", result);
+        Assert.False(File.Exists(Path.Combine(_paths.ServerFeedDirectory("my-feed"), "feed-skill", "references", "injected.md")));
+    }
+
+    [Fact]
+    public async Task SkillManage_ServerFeedSkill_BlocksRemoveFile()
+    {
+        WriteServerFeedSkill("my-feed", "feed-skill", """
+            ---
+            name: feed-skill
+            description: Synced from feed.
+            ---
+            # Feed Skill
+            """);
+        WriteNestedFile(Path.Combine(".server-feeds", "my-feed"), "feed-skill", "references/guide.md", "original");
+        ScanFeedSkills("my-feed");
+
+        var tool = CreateManageTool();
+        var result = await tool.ExecuteAsync(ToolInput.Create(
+                "Action", "remove_file",
+                "Name", "feed-skill",
+                "FilePath", "references/guide.md"),
+            PersonalCtx,
+            TestContext.Current.CancellationToken);
+
+        Assert.Contains("Server feed skill directories are read-only", result);
+        Assert.True(File.Exists(Path.Combine(_paths.ServerFeedDirectory("my-feed"), "feed-skill", "references", "guide.md")));
     }
 
     [Fact]
@@ -752,6 +914,20 @@ public class SkillToolTests : IDisposable
         _registry.ReplaceAll(result.AcceptedSkills, result.Issues);
     }
 
+    private void WriteServerFeedSkill(string feedName, string skillName, string content)
+    {
+        var dir = Path.Combine(_paths.ServerFeedDirectory(feedName), skillName);
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "SKILL.md"), content);
+    }
+
+    private void ScanFeedSkills(string feedName)
+    {
+        var result = SkillScanner.Scan(_paths.ServerFeedDirectory(feedName));
+        foreach (var skill in result.AcceptedSkills)
+            _registry.Register(skill);
+    }
+
     [Fact]
     public async Task Edit_rejects_external_skill()
     {
@@ -819,6 +995,108 @@ public class SkillToolTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task RemoveFile_rejects_system_skill()
+    {
+        WriteNestedSkill(".system", "sys-remove", """
+            ---
+            name: sys-remove
+            description: System skill.
+            ---
+            # System
+            """);
+        WriteNestedFile(".system", "sys-remove", "references/old.md", "original");
+        ScanSkills();
+
+        var tool = CreateManageTool();
+        var result = await tool.ExecuteAsync(ToolInput.Create(
+                "Action", "remove_file",
+                "Name", "sys-remove",
+                "FilePath", "references/old.md"),
+            PersonalCtx,
+            TestContext.Current.CancellationToken);
+
+        Assert.Contains("System skills are read-only", result);
+        Assert.True(File.Exists(Path.Combine(_paths.SkillsDirectory, ".system", "sys-remove", "references", "old.md")));
+    }
+
+    [Fact]
+    public async Task WriteFile_rejects_external_skill()
+    {
+        var externalDir = Path.Combine(Path.GetTempPath(), $"netclaw-external-test-{Guid.NewGuid():N}");
+        try
+        {
+            var skillDir = Path.Combine(externalDir, "ext-skill");
+            Directory.CreateDirectory(skillDir);
+            File.WriteAllText(Path.Combine(skillDir, "SKILL.md"), """
+                ---
+                name: ext-skill
+                description: External skill.
+                ---
+                # External
+                """);
+
+            var externalScan = SkillScanner.Scan(externalDir);
+            _registry.ReplaceAll(externalScan.AcceptedSkills, externalScan.Issues);
+
+            var tool = CreateManageTool();
+            var result = await tool.ExecuteAsync(ToolInput.Create(
+                    "Action", "write_file",
+                    "Name", "ext-skill",
+                    "FilePath", "references/injected.md",
+                    "FileContent", "injected"),
+                PersonalCtx,
+                TestContext.Current.CancellationToken);
+
+            Assert.Contains("External skill directories are read-only", result);
+            Assert.False(File.Exists(Path.Combine(skillDir, "references", "injected.md")));
+        }
+        finally
+        {
+            if (Directory.Exists(externalDir))
+                Directory.Delete(externalDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task RemoveFile_rejects_external_skill()
+    {
+        var externalDir = Path.Combine(Path.GetTempPath(), $"netclaw-external-test-{Guid.NewGuid():N}");
+        try
+        {
+            var skillDir = Path.Combine(externalDir, "ext-skill");
+            Directory.CreateDirectory(skillDir);
+            File.WriteAllText(Path.Combine(skillDir, "SKILL.md"), """
+                ---
+                name: ext-skill
+                description: External skill.
+                ---
+                # External
+                """);
+            Directory.CreateDirectory(Path.Combine(skillDir, "references"));
+            File.WriteAllText(Path.Combine(skillDir, "references", "old.md"), "original");
+
+            var externalScan = SkillScanner.Scan(externalDir);
+            _registry.ReplaceAll(externalScan.AcceptedSkills, externalScan.Issues);
+
+            var tool = CreateManageTool();
+            var result = await tool.ExecuteAsync(ToolInput.Create(
+                    "Action", "remove_file",
+                    "Name", "ext-skill",
+                    "FilePath", "references/old.md"),
+                PersonalCtx,
+                TestContext.Current.CancellationToken);
+
+            Assert.Contains("External skill directories are read-only", result);
+            Assert.True(File.Exists(Path.Combine(skillDir, "references", "old.md")));
+        }
+        finally
+        {
+            if (Directory.Exists(externalDir))
+                Directory.Delete(externalDir, recursive: true);
+        }
+    }
+
     private sealed class FakeMetrics : ISessionMetrics
     {
         public List<(string SkillName, SkillLoadMethod Method)> SkillLoadedCalls { get; } = [];
@@ -836,32 +1114,8 @@ public class SkillToolTests : IDisposable
 
     private sealed class NoOpChatClientProvider : IChatClientProvider
     {
-        private readonly IChatClient _client = new NoOpChatClient();
+        private readonly IChatClient _client = new FakeChatClient();
 
         public IChatClient GetClient(ModelRole role) => _client;
-    }
-
-    private sealed class NoOpChatClient : IChatClient
-    {
-        public Task<ChatResponse> GetResponseAsync(
-            IEnumerable<ChatMessage> messages,
-            ChatOptions? options = null,
-            CancellationToken cancellationToken = default)
-            => Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "noop")));
-
-        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
-            IEnumerable<ChatMessage> messages,
-            ChatOptions? options = null,
-            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
-        {
-            await Task.CompletedTask;
-            yield break;
-        }
-
-        public object? GetService(Type serviceType, object? serviceKey = null) => null;
-
-        public void Dispose()
-        {
-        }
     }
 }

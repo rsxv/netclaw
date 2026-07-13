@@ -12,7 +12,20 @@ namespace Netclaw.Configuration;
 public sealed record ProviderProbeResult(
     bool Success,
     string? ErrorMessage,
-    IReadOnlyList<DiscoveredModel> Models);
+    IReadOnlyList<DiscoveredModel> Models)
+{
+    /// <summary>
+    /// When <see cref="Success"/> is false, indicates the failure is a
+    /// reachable-server retryable condition (response/request timeout, 5xx, or
+    /// rate limiting) where a retry may succeed. A connection failure (unreachable
+    /// host) and auth/other 4xx errors are NOT transient — they signal a
+    /// configuration problem that needs operator action. Providers use this to
+    /// decide whether a failed model listing may be masked by a curated fallback
+    /// list or must surface as a hard failure. Defaults to false so an
+    /// unclassified failure is never silently masked.
+    /// </summary>
+    public bool Transient { get; init; }
+}
 
 /// <summary>
 /// Probes a provider's model listing API to validate credentials
@@ -43,4 +56,22 @@ public interface IProviderProbe
     Task<ProviderProbeResult> ProbeAsync(
         string providerType, string? endpoint, string? credential,
         AuthMethod authMethod, CancellationToken ct = default);
+}
+
+/// <summary>
+/// Probes a provider entry that is already persisted under a known config key.
+/// Implementations may use <paramref name="providerName"/> to update persisted
+/// runtime metadata, such as refreshed OAuth credentials.
+/// </summary>
+/// <remarks>
+/// Use this only for configured providers. Pending add/fix flows should keep
+/// using <see cref="IProviderProbe"/> so failed validation cannot overwrite
+/// existing credentials.
+/// </remarks>
+public interface IConfiguredProviderProbe
+{
+    Task<ProviderProbeResult> ProbeConfiguredAsync(
+        string providerName,
+        ProviderEntry entry,
+        CancellationToken ct = default);
 }

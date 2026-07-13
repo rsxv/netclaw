@@ -5,9 +5,12 @@
 // -----------------------------------------------------------------------
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Threading.Channels;
+using Microsoft.Extensions.Logging;
 using Netclaw.Configuration;
 using Netclaw.Tools;
+using static Netclaw.Actors.SubAgents.SubAgentProtocol;
 
 namespace Netclaw.Actors.SubAgents;
 
@@ -29,6 +32,7 @@ public sealed partial class SpawnAgentTool : NetclawTool<SpawnAgentTool.Params>
     private readonly NetclawPaths _paths;
     private readonly SubAgentConfig _subAgentConfig;
     private readonly FileSubAgentDefinitionLoader? _loader;
+    private readonly ILogger<SpawnAgentTool>? _logger;
 
     public record Params(
         [property: Description("Name of the subagent to invoke (see available-subagents in context)")]
@@ -44,13 +48,15 @@ public sealed partial class SpawnAgentTool : NetclawTool<SpawnAgentTool.Params>
 
     public SpawnAgentTool(SubAgentDefinitionRegistry registry, SubAgentSpawner spawner, NetclawPaths paths,
         SubAgentConfig? subAgentConfig = null,
-        FileSubAgentDefinitionLoader? loader = null)
+        FileSubAgentDefinitionLoader? loader = null,
+        ILogger<SpawnAgentTool>? logger = null)
     {
         _registry = registry;
         _spawner = spawner;
         _paths = paths;
         _subAgentConfig = subAgentConfig ?? new SubAgentConfig();
         _loader = loader;
+        _logger = logger;
     }
 
     protected override Task<string> ExecuteAsync(Params args, CancellationToken ct)
@@ -67,9 +73,11 @@ public sealed partial class SpawnAgentTool : NetclawTool<SpawnAgentTool.Params>
     }
 
     /// <summary>
-    /// Streaming entry point: the sub-agent's liveness/progress activity is
-    /// surfaced as the tool call's stream, so the parent's per-call watchdog
-    /// keeps a long-but-healthy delegated run alive.
+    /// Streaming entry point: the sub-agent's liveness/progress activity is surfaced
+    /// as the tool call's stream for visibility. The parent applies NO watchdog to
+    /// this call — spawn_agent is self-monitoring, so the sub-agent owns its own
+    /// liveness and the parent simply drains the stream to its terminal item (see
+    /// <c>SessionToolExecutionPipeline</c>).
     /// </summary>
     public override async IAsyncEnumerable<ToolCallUpdate> ExecuteStreamAsync(
         IDictionary<string, object?>? arguments,
@@ -107,7 +115,23 @@ public sealed partial class SpawnAgentTool : NetclawTool<SpawnAgentTool.Params>
     }
 
     private static string FormatResult(string agent, SubAgentResult result)
-        => result.Success ? result.Output : $"Subagent '{agent}' failed: {result.Output}";
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine("Subagent run finished.");
+        builder.AppendLine($"Agent: {agent}");
+        if (result.RunId is { } runId)
+            builder.AppendLine($"RunId: {runId.Value}");
+        builder.AppendLine($"Outcome: {result.Outcome.ToString().ToLowerInvariant()}");
+        if (result.OutcomeReason is { } reason)
+            builder.AppendLine($"Reason: {reason.Value}");
+        if (result.ScopeId is { } scopeId)
+            builder.AppendLine($"Diagnostics: session log entries include SubSessionId {scopeId.Value}.");
+
+        builder.AppendLine();
+        builder.AppendLine(result.Success ? "Summary:" : "Error:");
+        builder.Append(result.Output);
+        return builder.ToString();
+    }
 
     /// <summary>
     /// Validate the invocation and resolve the requested agent. Returns an error
@@ -116,10 +140,19 @@ public sealed partial class SpawnAgentTool : NetclawTool<SpawnAgentTool.Params>
     /// </summary>
     private (string? Error, SubAgentProfile? Profile) Resolve(Params args, ToolExecutionContext context)
     {
+        // Rejections here return a (sometimes deliberately opaque) error string to
+        // the model. The breadcrumb records the real reason under a SessionId scope (so it
+        // lands in the session.log) so an operator can tell *why* a spawn was refused; the
+        // "This tool is not available." string hides the audience-vs-disabled distinction on
+        // purpose.
+
         // Defense-in-depth: block subagent spawning for Public audience or when
         // the subagent subsystem is disabled.
         if (context.Audience == TrustAudience.Public || !_subAgentConfig.Enabled)
+        {
+            SubAgentSpawnBreadcrumbs.SpawnRefused(_logger, context, args.Agent, context.Audience, _subAgentConfig.Enabled);
             return ("Error: This tool is not available.", null);
+        }
 
         if (string.IsNullOrWhiteSpace(args.Agent))
             return ("Error: 'agent' parameter is required.", null);
@@ -133,6 +166,7 @@ public sealed partial class SpawnAgentTool : NetclawTool<SpawnAgentTool.Params>
         if (profile is null || profile.Visibility != SubAgentVisibility.UserFacing)
         {
             var available = _registry.GetUserFacing();
+            SubAgentSpawnBreadcrumbs.UnknownAgentRefused(_logger, context, args.Agent, available.Count);
             if (available.Count == 0)
                 return ($"Error: No subagents are available. Agent '{args.Agent}' not found. Author one at {_paths.AgentsDirectory}/*.md or define a skill with metadata.subagent once #661 lands.", null);
 

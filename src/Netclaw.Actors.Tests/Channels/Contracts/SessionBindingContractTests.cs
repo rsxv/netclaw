@@ -17,6 +17,8 @@ using Netclaw.Channels;
 using Netclaw.Configuration;
 using Netclaw.Security;
 using Xunit;
+using static Netclaw.Actors.Sessions.SessionProtocol;
+using static Netclaw.Actors.Reminders.ReminderProtocol;
 
 namespace Netclaw.Actors.Tests.Channels.Contracts;
 
@@ -274,7 +276,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("reminder output") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), SourceReminderId = reminderKey }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), SourceReminderId = new ReminderId(reminderKey) }
         ], reactive: true);
 
         var observer = CreateTestProbe();
@@ -284,7 +286,7 @@ public abstract class SessionBindingContractTests : TestKit
 
         var result = await observer.ExpectMsgAsync<ReminderDeliveryResult>(
             TimeSpan.FromSeconds(5), cancellationToken: ct);
-        Assert.Equal(reminderKey, result.ReminderDeliveryKey);
+        Assert.Equal(new ReminderId(reminderKey), result.ReminderDeliveryKey);
         Assert.Equal(ExpectedChannelType, result.ChannelType);
         Assert.True(result.Delivered);
     }
@@ -303,7 +305,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("reminder output") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), SourceReminderId = reminderKey }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), SourceReminderId = new ReminderId(reminderKey) }
         ], reactive: true);
 
         SetReplyClientThrows(new InvalidOperationException("channel API down"));
@@ -314,7 +316,7 @@ public abstract class SessionBindingContractTests : TestKit
 
         var result = await observer.ExpectMsgAsync<ReminderDeliveryResult>(
             TimeSpan.FromSeconds(5), cancellationToken: ct);
-        Assert.Equal(reminderKey, result.ReminderDeliveryKey);
+        Assert.Equal(new ReminderId(reminderKey), result.ReminderDeliveryKey);
         Assert.Equal(ExpectedChannelType, result.ChannelType);
         Assert.False(result.Delivered);
 
@@ -337,9 +339,9 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("reply A") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), SourceReminderId = keyA },
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), SourceReminderId = new ReminderId(keyA) },
             new TextOutput("reply B") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2), SourceReminderId = keyB }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2), SourceReminderId = new ReminderId(keyB) }
         ], reactive: true);
 
         var observerA = CreateTestProbe();
@@ -353,11 +355,11 @@ public abstract class SessionBindingContractTests : TestKit
 
         var resultA = await observerA.ExpectMsgAsync<ReminderDeliveryResult>(
             TimeSpan.FromSeconds(5), cancellationToken: ct);
-        Assert.Equal(keyA, resultA.ReminderDeliveryKey);
+        Assert.Equal(new ReminderId(keyA), resultA.ReminderDeliveryKey);
 
         var resultB = await observerB.ExpectMsgAsync<ReminderDeliveryResult>(
             TimeSpan.FromSeconds(5), cancellationToken: ct);
-        Assert.Equal(keyB, resultB.ReminderDeliveryKey);
+        Assert.Equal(new ReminderId(keyB), resultB.ReminderDeliveryKey);
     }
 
     // Regression for the misleading-fallback bug: when the real content post
@@ -410,7 +412,7 @@ public abstract class SessionBindingContractTests : TestKit
                 SourceKind = new SourceKind("reminder")
             },
             ReceivedAt = DateTimeOffset.UnixEpoch,
-            ReminderId = reminderKey,
+            ReminderId = new ReminderId(reminderKey),
             DeliveryObserver = deliveryObserver
         };
 
@@ -474,6 +476,14 @@ public abstract class SessionBindingContractTests : TestKit
         ]);
 
         var actor = CreateBindingActor(sid, pipeline, detector);
+
+        // Gate on pipeline creation (persistent-actor recovery + init round-trip)
+        // before polling for rendered output. Under CI CPU starvation the cold
+        // start alone can exceed the default 3s AwaitAssert budget — the poll loop
+        // observed only ~2 attempts before the deadline on the Windows runner — so
+        // a linear await on the real readiness signal removes the race. Matches the
+        // Reminder_delivery_* and Stashes_messages_during_init siblings.
+        await pipeline.Created.WaitAsync(ct);
 
         // Wait for approval to be rendered
         await AwaitAssertAsync(() =>
@@ -630,8 +640,8 @@ public abstract class SessionBindingContractTests : TestKit
             ResponseFactory = (feedback, _) =>
             {
                 return feedback is ToolInteractionTextResponse
-                    ? Task.FromResult<ICommandReply>(CommandNack.For(sid, ApprovalNackReasons.NoHistory))
-                    : Task.FromResult<ICommandReply>(CommandAck.For(feedback.SessionId));
+                    ? Task.FromResult<ISessionResponse>(CommandNack.For(sid, ApprovalNackReasons.NoHistory))
+                    : Task.FromResult<ISessionResponse>(CommandAck.For(feedback.SessionId));
             }
         };
 

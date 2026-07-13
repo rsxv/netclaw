@@ -15,6 +15,7 @@ using Netclaw.Actors.Protocol;
 using Netclaw.Channels;
 using Netclaw.Cli.Daemon;
 using R3;
+using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Cli;
 
@@ -305,10 +306,11 @@ public sealed class HeadlessChannel : IChannel
                 }
                 else
                 {
-                    var status = msg.Success ? "success" : "failed";
+                    var status = msg.Outcome.ToString().ToLowerInvariant();
+                    var reason = msg.OutcomeReason is { } outcomeReason ? $", reason={outcomeReason.Value}" : string.Empty;
                     if (!_jsonOutput)
-                        Console.WriteLine($"[subagent:done] {msg.AgentName} ({status}, {msg.Duration.TotalSeconds:F1}s)");
-                    Log(log, $"SUBAGENT_DONE: name={msg.AgentName} success={msg.Success} duration={msg.Duration.TotalSeconds:F1}s");
+                        Console.WriteLine($"[subagent:done] {msg.AgentName} ({status}, {msg.Duration.TotalSeconds:F1}s{reason})");
+                    Log(log, $"SUBAGENT_DONE: name={msg.AgentName} success={msg.Success} outcome={status}{reason} duration={msg.Duration.TotalSeconds:F1}s");
                 }
                 break;
 

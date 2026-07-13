@@ -19,6 +19,8 @@ using Netclaw.Media;
 using Netclaw.Security;
 using Netclaw.Tools;
 using IOPath = System.IO.Path;
+using static Netclaw.Actors.Sessions.SessionProtocol;
+using static Netclaw.Actors.Reminders.ReminderProtocol;
 
 namespace Netclaw.Channels.Mattermost;
 
@@ -72,7 +74,7 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
     // told a ReminderDeliveryResult on its turn's TurnCompleted and removed.
     // Keyed (not a single field) because multiple reminders can target the
     // same session concurrently — a single field would be clobbered.
-    private readonly Dictionary<string, IActorRef> _reminderDeliveryObservers = new(StringComparer.Ordinal);
+    private readonly Dictionary<ReminderId, IActorRef> _reminderDeliveryObservers = new();
     private TurnNumber _turnNumber;
     private string? _cursorPostId;
     private string? _pendingCursorPostId;
@@ -108,7 +110,7 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
 
         _log = Context.GetLogger()
             .WithContext("Adapter", "mattermost")
-            .WithContext("SessionId", _sessionId.Value)
+            .WithContext(NetclawLogProperties.SessionId, _sessionId.Value)
             .WithContext("MattermostChannelId", _channelId.Value)
             .WithContext("MattermostRootPostId", _rootPostId.Value);
 
@@ -745,7 +747,7 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
             return false;
         }
 
-        ICommandReply feedbackResult;
+        ISessionResponse feedbackResult;
         try
         {
             using var feedbackCts = new CancellationTokenSource(OperationTimeout);
@@ -849,7 +851,7 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
             return;
         }
 
-        ICommandReply feedbackResult;
+        ISessionResponse feedbackResult;
         using var feedbackCts = new CancellationTokenSource(OperationTimeout);
         try
         {
@@ -882,7 +884,7 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
                 break;
 
             default:
-                // Unreachable: ICommandReply is implemented only by CommandAck
+                // Unreachable: ISessionResponse is implemented only by CommandAck
                 // and CommandNack. Kept as a defensive guard so an unexpected
                 // future implementer surfaces a structured Nack instead of an
                 // unobservable null reference.
@@ -1041,8 +1043,9 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
         // second concurrent reminder to this session can't overwrite the
         // first's observer before its turn reaches TurnCompleted.
         if (message.Source.DeliveryObserver is { } deliveryObserver
-            && !string.IsNullOrWhiteSpace(message.Source.ReminderId))
-            _reminderDeliveryObservers[message.Source.ReminderId] = deliveryObserver;
+            && message.Source.ReminderId is { } reminderKey
+            && !string.IsNullOrWhiteSpace(reminderKey.Value))
+            _reminderDeliveryObservers[reminderKey] = deliveryObserver;
 
         try
         {
@@ -1163,11 +1166,12 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
                     AdvanceCursor(pendingCursor);
                 _pendingCursorPostId = null;
 
-                if (!string.IsNullOrWhiteSpace(completed.SourceReminderId)
-                    && _reminderDeliveryObservers.Remove(completed.SourceReminderId, out var reminderObserver))
+                if (completed.SourceReminderId is { } sourceReminderKey
+                    && !string.IsNullOrWhiteSpace(sourceReminderKey.Value)
+                    && _reminderDeliveryObservers.Remove(sourceReminderKey, out var reminderObserver))
                 {
                     reminderObserver.Tell(new ReminderDeliveryResult(
-                        completed.SourceReminderId,
+                        sourceReminderKey,
                         ChannelType.Mattermost,
                         Delivered: _deliveredThisTurn,
                         FailureReason: _deliveredThisTurn ? null : "Mattermost post did not succeed",

@@ -125,6 +125,9 @@ public sealed class WizardConfigBuilder
             if (!string.IsNullOrWhiteSpace(Provider.Endpoint))
                 providerEntry["Endpoint"] = Provider.Endpoint;
 
+            if (Provider.VendorOptions is not null && Provider.VendorOptions.Count > 0)
+                providerEntry["VendorOptions"] = Provider.VendorOptions;
+
             providers[Provider.TypeKey] = providerEntry;
         }
 
@@ -132,13 +135,22 @@ public sealed class WizardConfigBuilder
         if (Model is not null)
         {
             var models = ConfigFileHelper.GetOrCreateSection(config, "Models");
-            models["Main"] = ModelEntryWriter.BuildModelEntry(
+            ModelEntryWriter.WriteRole(
+                models,
+                "Main",
                 Model.Provider,
                 Model.ModelId,
                 Model.Provenance,
-                Model.ContextWindow,
-                Model.InputModalities,
-                Model.OutputModalities);
+                Model.ContextWindow is { } contextWindow
+                    ? ValueOverride<int>.Set(contextWindow)
+                    : ValueOverride<int>.Unset,
+                Model.InputModalities is { } input
+                    ? ValueOverride<ModelModality>.Set(input)
+                    : ValueOverride<ModelModality>.Unset,
+                Model.OutputModalities is { } output
+                    ? ValueOverride<ModelModality>.Set(output)
+                    : ValueOverride<ModelModality>.Unset,
+                discovered: null);
         }
 
         // Slack section
@@ -560,6 +572,7 @@ public sealed class ProviderConfigSection
     public required string TypeKey { get; init; }
     public AuthMethod AuthMethod { get; init; } = AuthMethod.None;
     public string? Endpoint { get; init; }
+    public IReadOnlyDictionary<string, object?>? VendorOptions { get; init; }
 }
 
 public sealed class ModelConfigSection

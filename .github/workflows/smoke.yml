@@ -11,6 +11,11 @@ name: smoke
 # surface via GitHub's built-in Actions notifications.
 
 on:
+  # Merge queues test a synthetic merge group rather than the pull request ref.
+  # Required checks must subscribe to this event or queued PRs will never merge.
+  merge_group:
+    types:
+      - checks_requested
   workflow_dispatch:
   schedule:
     # 07:00 UTC daily — catches external-dependency drift during quiet
@@ -20,9 +25,11 @@ on:
   push:
     branches:
       - dev
+      - feature/*
   pull_request:
     branches:
       - dev
+      - feature/*
     types:
       - opened
       - synchronize
@@ -52,7 +59,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install .NET SDK
         uses: actions/setup-dotnet@v5
@@ -98,7 +105,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Download binary artifact
         uses: actions/download-artifact@v8
@@ -140,7 +147,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Download binary artifact
         uses: actions/download-artifact@v8
@@ -184,13 +191,16 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Download binary artifact
         uses: actions/download-artifact@v8
         with:
           name: netclaw-native-binaries-linux-x64-${{ github.run_id }}-${{ github.run_attempt }}
           path: ./publish
+
+      - name: Install ImageMagick
+        run: sudo apt-get install -y --no-install-recommends imagemagick
 
       - name: Mark binaries executable
         run: |

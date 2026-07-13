@@ -1,9 +1,9 @@
 ---
 name: netclaw-memory
-description: "REQUIRED when the user asks what you remember, recall, or know from past conversations, previous sessions, or cross-session memory. Also before using memory tools: find_memories, get_memories, store_memory, update_memory."
+description: "REQUIRED when the user asks what you remember, recall, or know from past conversations, previous sessions, cross-session memory, memory classes, or memory types. Also before using memory tools: find_memories, get_memories, store_memory, update_memory."
 metadata:
   author: netclaw
-  version: "1.4.1"
+  version: "1.7.0"
 ---
 
 # Netclaw Memory
@@ -29,7 +29,12 @@ Both gates must pass for memory to function.
 ## How Memory Works
 
 - **Automatic recall** runs before each user turn and injects relevant
-  `durable_fact` memories into the conversation.
+  `durable_fact` (and occasionally `evidence`) memories into the conversation.
+- Recall is **selective by design**: candidates must clear a relevance floor
+  and a per-turn character budget, so **many turns inject nothing at all**.
+  An absent `[memory-recall]` block means nothing relevant cleared the bar —
+  it is not a malfunction. Use `find_memories` when you believe relevant
+  memories exist that automatic recall did not surface.
 - Recall is **policy-aware**: `audience` and `boundary` still govern what
   can be surfaced for the current turn.
 - Recall resolves once at turn start and the same bundle is reused during
@@ -40,6 +45,9 @@ Both gates must pass for memory to function.
 - **Explicit tools** are a manual-control layer on top of automatic recall.
 - Memory is SQLite-backed and cross-session only within the active
   domain/boundary policy envelope.
+- Memory IDs shown by automatic recall, `find_memories`, and `get_memories`
+  (e.g. `doc-…` / `rec-…`) are stable, opaque handles. Copy them **verbatim**
+  into `get_memories` or `update_memory` — do not rewrite or reformat them.
 
 ## When to Use Explicit Tools
 
@@ -84,12 +92,17 @@ Automatic observation note:
 
 Use only to correct or supersede an existing memory.
 
+Use the memory ID exactly as shown by automatic recall, `find_memories`, or
+`get_memories`. For documents, prefer `new_content` when replacing a full
+hydrated memory. Use `old_text` + `new_text` only when making a precise
+find-and-replace edit. To delete a memory, pass `delete: true`.
+
 ## Memory Classes
 
 | Class | Recall | Expiry |
 |-------|--------|--------|
-| `durable_fact` | Auto-recalled each turn | Never expires |
-| `evidence` | Search only (`find_memories`) | Expires after 30 days |
+| `durable_fact` | Auto-recall when it clears the relevance floor | Never expires |
+| `evidence` | Search (`find_memories`); auto-recall only on very strong matches | Expires after 30 days |
 | `trace` | Not searchable | Expires after 72 hours |
 
 ## Policy Envelope
@@ -109,9 +122,13 @@ context.
 
 ## Identity vs Memory
 
-Do not put project facts, research, or tool findings in identity files.
-`SOUL.md` is only for narrow identity/profile updates. Everything else
-goes through the memory pipeline.
+Identity files (`SOUL.md`, `AGENTS.md`, `TOOLING.md`) define **the agent** —
+persona, tone, operating rules, and the foundational user grounding set at init
+(name, timezone). Do **not** put project facts, research, tool findings, or
+**durable facts and preferences about the user** (favorites, family, history,
+working preferences) in identity files — those go through the **memory pipeline**
+(`store_memory`) and are recalled when relevant. A user asking you to "remember" a
+preference is a memory write, not a `SOUL.md` edit.
 
 If unsure, load `netclaw-operations` for the identity-vs-memory triage guide.
 

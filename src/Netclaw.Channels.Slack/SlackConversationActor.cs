@@ -9,6 +9,7 @@ using Netclaw.Actors.Channels;
 using Netclaw.Actors.Protocol;
 using Netclaw.Channels.Telemetry;
 using Netclaw.Configuration;
+using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Channels.Slack;
 
@@ -116,7 +117,7 @@ public sealed class SlackConversationActor : ReceiveActor
                 : message.EventId.Value;
             var log = _log
                 .WithContext("SlackThreadTs", threadTs.Value)
-                .WithContext("SessionId", sessionId.Value)
+                .WithContext(NetclawLogProperties.SessionId, sessionId.Value)
                 .WithContext("TurnId", turnId)
                 .WithContext("SlackEventId", message.EventId.Value);
 

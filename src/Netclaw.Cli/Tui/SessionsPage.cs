@@ -46,12 +46,15 @@ public sealed class SessionsPage : ReactivePage<SessionsViewModel>
                     else
                     {
                         var items = ViewModel.Sessions.Select(FormatSessionLine).ToList();
+                        var list = Layouts.SelectionList(items)
+                            .WithMode(SelectionMode.Single)
+                            .WithHighlightColors(Color.Black, Color.Cyan)
+                            .WithHighlightedIndex(selectedIndex)
+                            .WithFillHeight();
+                        list.OnFocused();
+
                         content.WithChild(
-                            Layouts.SelectionList(items)
-                                .WithMode(SelectionMode.Single)
-                                .WithHighlightColors(Color.Black, Color.Cyan)
-                                .WithHighlightedIndex(selectedIndex)
-                                .WithFillHeight());
+                            list);
                     }
 
                     return (ILayoutNode)Layouts.Vertical()
@@ -68,6 +71,20 @@ public sealed class SessionsPage : ReactivePage<SessionsViewModel>
                                 .Height(1));
                 })
             .AsLayout();
+    }
+
+    // The scrollable SelectionListNode is focusable (FocusPriority 10), so the page's focus
+    // policy hands it keyboard focus and Termina's focus manager would route the arrows and
+    // Enter straight into it — moving the list's own highlight while the ViewModel's
+    // SelectedIndex (the resume target) never changes. Claim those keys at the page level,
+    // which Termina dispatches BEFORE the focus manager, so the list stays a pure renderer
+    // driven one-way by .WithHighlightedIndex(SelectedIndex).
+    public override bool HandlePageInput(ConsoleKeyInfo keyInfo)
+    {
+        if (base.HandlePageInput(keyInfo))
+            return true;
+
+        return ViewModel.HandleKey(keyInfo);
     }
 
     private string FormatSessionLine(SessionCatalogEntryDto session)

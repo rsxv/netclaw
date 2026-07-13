@@ -19,6 +19,8 @@ using Netclaw.Media;
 using Netclaw.Security;
 using Netclaw.Tools;
 using IOPath = System.IO.Path;
+using static Netclaw.Actors.Sessions.SessionProtocol;
+using static Netclaw.Actors.Reminders.ReminderProtocol;
 
 namespace Netclaw.Channels.Discord;
 
@@ -73,7 +75,7 @@ internal sealed class DiscordSessionBindingActor : ReceivePersistentActor, IWith
     // told a ReminderDeliveryResult on its turn's TurnCompleted and removed.
     // Keyed (not a single field) because multiple reminders can target the
     // same session concurrently — a single field would be clobbered.
-    private readonly Dictionary<string, IActorRef> _reminderDeliveryObservers = new(StringComparer.Ordinal);
+    private readonly Dictionary<ReminderId, IActorRef> _reminderDeliveryObservers = new();
     private Netclaw.Actors.Protocol.TurnNumber _turnNumber;
     private string? _lastSetThreadName;
     private ulong? _cursorSnowflake;
@@ -114,7 +116,7 @@ internal sealed class DiscordSessionBindingActor : ReceivePersistentActor, IWith
 
         _log = Context.GetLogger()
             .WithContext("Adapter", "discord")
-            .WithContext("SessionId", _sessionId.Value)
+            .WithContext(NetclawLogProperties.SessionId, _sessionId.Value)
             .WithContext("DiscordChannelId", _channelId.Value)
             .WithContext("DiscordThreadOrMessageId", _threadOrMessageId.Value);
 
@@ -770,7 +772,7 @@ internal sealed class DiscordSessionBindingActor : ReceivePersistentActor, IWith
             return false;
         }
 
-        ICommandReply feedbackResult;
+        ISessionResponse feedbackResult;
         try
         {
             using var feedbackCts = new CancellationTokenSource(OperationTimeout);
@@ -879,7 +881,7 @@ internal sealed class DiscordSessionBindingActor : ReceivePersistentActor, IWith
         // banner — both surfaced by the #939 code review. The session is the
         // authority on whether the call is still pending and whether the sender is
         // allowed. Only redraw on CommandAck.
-        ICommandReply feedbackResult;
+        ISessionResponse feedbackResult;
         try
         {
             using var feedbackCts = new CancellationTokenSource(OperationTimeout);
@@ -1063,8 +1065,9 @@ internal sealed class DiscordSessionBindingActor : ReceivePersistentActor, IWith
         // second concurrent reminder to this session can't overwrite the
         // first's observer before its turn reaches TurnCompleted.
         if (message.Source.DeliveryObserver is { } deliveryObserver
-            && !string.IsNullOrWhiteSpace(message.Source.ReminderId))
-            _reminderDeliveryObservers[message.Source.ReminderId] = deliveryObserver;
+            && message.Source.ReminderId is { } reminderKey
+            && !string.IsNullOrWhiteSpace(reminderKey.Value))
+            _reminderDeliveryObservers[reminderKey] = deliveryObserver;
 
         try
         {
@@ -1192,11 +1195,12 @@ internal sealed class DiscordSessionBindingActor : ReceivePersistentActor, IWith
                     AdvanceCursor(pendingSnowflake);
                 _pendingCursorSnowflake = null;
 
-                if (!string.IsNullOrWhiteSpace(completed.SourceReminderId)
-                    && _reminderDeliveryObservers.Remove(completed.SourceReminderId, out var reminderObserver))
+                if (completed.SourceReminderId is { } sourceReminderKey
+                    && !string.IsNullOrWhiteSpace(sourceReminderKey.Value)
+                    && _reminderDeliveryObservers.Remove(sourceReminderKey, out var reminderObserver))
                 {
                     reminderObserver.Tell(new ReminderDeliveryResult(
-                        completed.SourceReminderId,
+                        sourceReminderKey,
                         ChannelType.Discord,
                         Delivered: _deliveredThisTurn,
                         FailureReason: _deliveredThisTurn ? null : "Discord post did not succeed",

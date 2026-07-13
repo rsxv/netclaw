@@ -6,6 +6,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Json.Schema;
+using Netclaw.Cli;
 using Netclaw.Configuration;
 
 namespace Netclaw.Cli.Doctor;
@@ -16,10 +17,21 @@ public sealed class ConfigSchemaDoctorCheck(NetclawPaths paths) : IDoctorCheck
     {
         if (!File.Exists(paths.NetclawConfigPath))
         {
+            // Schema validation applies to netclaw.json specifically. An
+            // env-only instance (NETCLAW_ config-binding env vars, no file)
+            // is configured — warning "run netclaw init" would misdiagnose a
+            // healthy deployment.
+            if (DoctorJsonConfigReader.HasEnvironmentConfig())
+            {
+                return Task.FromResult(DoctorCheckResult.Pass(
+                    "Config Schema",
+                    "No netclaw.json; NETCLAW_ environment configuration detected — schema validation applies to the file only."));
+            }
+
             return Task.FromResult(DoctorCheckResult.Warning(
                 "Config Schema",
-                $"Config file not found at {paths.NetclawConfigPath}.",
-                "Run `netclaw init` to scaffold a baseline config."));
+                CliConfigPreflight.MissingConfigMessage,
+                $"Run `netclaw init` to create {paths.NetclawConfigPath}."));
         }
 
         JsonNode? root;

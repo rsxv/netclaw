@@ -149,16 +149,7 @@ static async Task RunAsync(string[] args)
 
             // Provider descriptors (includes IProviderProbe via registry)
             builder.Services.AddProviderDescriptors();
-            builder.Services.AddHttpClient("OAuthDeviceFlow");
-            builder.Services.AddSingleton(sp =>
-                new OAuthDeviceFlowService(
-                    sp.GetRequiredService<IHttpClientFactory>().CreateClient("OAuthDeviceFlow"),
-                    sp.GetService<TimeProvider>()));
-            builder.Services.AddSingleton(sp =>
-                new OpenAiDeviceFlowService(
-                    sp.GetRequiredService<IHttpClientFactory>().CreateClient("OAuthDeviceFlow"),
-                    sp.GetService<TimeProvider>()));
-            builder.Services.AddSingleton<DeviceFlowServiceFactory>();
+            builder.Services.AddProviderOAuthServices();
             builder.Services.AddHttpClient<ISlackProbe, SlackProbe>();
             builder.Services.AddHttpClient<IDiscordProbe, DiscordProbe>();
             builder.Services.AddHttpClient<IMattermostProbe, MattermostProbe>();
@@ -200,19 +191,7 @@ static async Task RunAsync(string[] args)
                     .AddEnvironmentVariables("NETCLAW_");
                 var initConfig = configBuilder.Build();
 
-                var models = initConfig.GetSection("Models")
-                    .Get<ModelSelection>() ?? new ModelSelection();
-
-                var runtime = ContextWindowResolution.ResolveRuntimeAsync(
-                    models.Main,
-                    sp.GetRequiredService<DaemonApi>()).GetAwaiter().GetResult();
-
-                return new ModelCapabilities
-                {
-                    ModelId = runtime.ModelId,
-                    ContextWindowTokens = runtime.ContextWindowTokens,
-                    CompactionModelId = models.Compaction?.ModelId,
-                };
+                return BuildModelCapabilities(initConfig, sp.GetRequiredService<DaemonApi>());
             });
 
             builder.Services.AddSingleton<InitNavigationState>();
@@ -345,6 +324,13 @@ static async Task RunAsync(string[] args)
             Console.WriteLine($"[FAIL] status options: Unknown option '{arg}'.");
             WriteStatusHelp();
             Environment.ExitCode = 1;
+            return;
+        }
+
+        var statusPaths = new NetclawPaths();
+        if (CliConfigPreflight.TryWriteMissingConfig(statusPaths, statusAsJson, Console.Out, out var statusExitCode))
+        {
+            Environment.ExitCode = statusExitCode;
             return;
         }
 
@@ -504,7 +490,7 @@ static async Task RunAsync(string[] args)
                 return;
 
             case "stop":
-                var stopResult = await manager.StopAsync("cli-stop");
+                var stopResult = await manager.StopAsync("cli-stop", CancellationToken.None);
                 WriteDaemonResult(stopResult);
                 return;
 
@@ -726,16 +712,7 @@ static async Task RunAsync(string[] args)
             var builder = Host.CreateApplicationBuilder(args);
             ConfigureConfigServices(builder.Services, builder.Configuration);
             builder.Services.AddProviderDescriptors();
-            builder.Services.AddHttpClient("OAuthDeviceFlow");
-            builder.Services.AddSingleton(sp =>
-                new OAuthDeviceFlowService(
-                    sp.GetRequiredService<IHttpClientFactory>().CreateClient("OAuthDeviceFlow"),
-                    sp.GetService<TimeProvider>()));
-            builder.Services.AddSingleton(sp =>
-                new OpenAiDeviceFlowService(
-                    sp.GetRequiredService<IHttpClientFactory>().CreateClient("OAuthDeviceFlow"),
-                    sp.GetService<TimeProvider>()));
-            builder.Services.AddSingleton<DeviceFlowServiceFactory>();
+            builder.Services.AddProviderOAuthServices();
             builder.Logging.ClearProviders();
             builder.Logging.SetMinimumLevel(LogLevel.Warning);
 
@@ -1041,6 +1018,17 @@ static async Task RunAsync(string[] args)
         }
     }
 
+    if (CliConfigPreflight.TryWriteMissingChatConfig(
+            new NetclawPaths(),
+            mode,
+            chatJsonOutput,
+            Console.Out,
+            out var chatExitCode))
+    {
+        Environment.ExitCode = chatExitCode;
+        return;
+    }
+
     // ── Interactive / headless modes (daemon-backed via SignalR) ──
     var webBuilder = WebApplication.CreateBuilder(args);
     webBuilder.WebHost.UseUrls("http://127.0.0.1:0");
@@ -1137,19 +1125,10 @@ static async Task RunConfigEditorAsync(string[] args)
     builder.Services.AddSingleton<ISkillFeedReachabilityProbe, SkillFeedReachabilityProbe>();
     builder.Services.AddSingleton<TuiNavigation>();
     builder.Services.AddProviderDescriptors();
+    builder.Services.AddProviderOAuthServices();
     builder.Services.AddHttpClient<ISlackProbe, SlackProbe>();
     builder.Services.AddHttpClient<IDiscordProbe, DiscordProbe>();
     builder.Services.AddHttpClient<IMattermostProbe, MattermostProbe>();
-    builder.Services.AddHttpClient("OAuthDeviceFlow");
-    builder.Services.AddSingleton(sp =>
-        new OAuthDeviceFlowService(
-            sp.GetRequiredService<IHttpClientFactory>().CreateClient("OAuthDeviceFlow"),
-            sp.GetService<TimeProvider>()));
-    builder.Services.AddSingleton(sp =>
-        new OpenAiDeviceFlowService(
-            sp.GetRequiredService<IHttpClientFactory>().CreateClient("OAuthDeviceFlow"),
-            sp.GetService<TimeProvider>()));
-    builder.Services.AddSingleton<DeviceFlowServiceFactory>();
     builder.Services
         .AddSectionEditor<SecurityPostureStepViewModel>()
         .AddSectionEditor<FeatureSelectionStepViewModel>()
@@ -1662,9 +1641,19 @@ static void WriteStatusResult(DaemonRuntimeStatus.Response status, string endpoi
 
     if (status.Model is { } model)
     {
-        Console.WriteLine($"model: {model.DisplayName ?? model.ModelId} (provider: {model.Provider}, context: {model.ContextWindow:N0} tokens)");
-        Console.WriteLine($"  input: {model.InputModalities}");
-        Console.WriteLine($"  output: {model.OutputModalities}");
+        if (model.Degraded)
+        {
+            Console.WriteLine("model: (none — No-Op chat client active)");
+            if (!string.IsNullOrWhiteSpace(model.DegradedReason))
+                Console.WriteLine($"  reason: {model.DegradedReason}");
+            Console.WriteLine("  fix: run `netclaw doctor` for details; use `netclaw init` if no provider is configured.");
+        }
+        else
+        {
+            Console.WriteLine($"model: {model.DisplayName ?? model.ModelId} (provider: {model.Provider}, context: {model.ContextWindow:N0} tokens)");
+            Console.WriteLine($"  input: {model.InputModalities}");
+            Console.WriteLine($"  output: {model.OutputModalities}");
+        }
     }
 
     Console.WriteLine("connectors:");
@@ -1990,30 +1979,53 @@ static IConfigurationRoot BuildCliConfig()
 
 static void ConfigureCliChatServices(IServiceCollection services, IConfigurationManager configuration)
 {
-    // Resolve models for session config
-    var models = configuration.GetSection("Models")
-        .Get<ModelSelection>() ?? new ModelSelection();
-
     // Session config: bind operator-facing settings
     var sessionConfig = SessionConfig.BindFromConfiguration(configuration.GetSection("Session"));
     services.AddSingleton(sessionConfig);
-    services.AddSingleton(sp =>
-    {
-        var runtime = ContextWindowResolution.ResolveRuntimeAsync(
-            models.Main,
-            sp.GetRequiredService<DaemonApi>()).GetAwaiter().GetResult();
-
-        return new ModelCapabilities
-        {
-            ModelId = runtime.ModelId,
-            ContextWindowTokens = runtime.ContextWindowTokens,
-            CompactionModelId = models.Compaction?.ModelId,
-        };
-    });
+    services.AddSingleton(sp => BuildModelCapabilities(configuration, sp.GetRequiredService<DaemonApi>()));
 
     // DaemonClient uses the endpoint from DaemonApi. For non-loopback (remote) endpoints,
     // reads DeviceToken from secrets.json and attaches it as a bearer token provider.
     services.AddSingleton(sp => DaemonClientFactory.Create(
         sp.GetRequiredService<DaemonApi>().Endpoint,
         sp.GetRequiredService<NetclawPaths>()));
+}
+
+/// <summary>
+/// Build a <see cref="ModelCapabilities"/> for the CLI's chat surface. When
+/// <see cref="ProviderRuntimeValidation"/> reports the daemon is (or will be)
+/// running in degraded No-Op mode, we substitute a sentinel ModelId so the
+/// chat status bar doesn't display a stale/invalid model name and never
+/// attempt the daemon context-window probe (which would 404 or block).
+/// </summary>
+static ModelCapabilities BuildModelCapabilities(IConfiguration configuration, DaemonApi daemonApi)
+{
+    var providers = ProviderConfigurationLoader.Load(configuration.GetSection("Providers"));
+    var models = ModelConfigurationResolver.Resolve(configuration).Selection;
+    var validation = ProviderRuntimeValidation.Evaluate(
+        providers,
+        models,
+        ProviderRuntimeConfiguration.FromConfiguration(configuration));
+
+    if (validation.Status != ProviderRuntimeStatus.Valid)
+    {
+        return new ModelCapabilities
+        {
+            ModelId = validation.AvailableProviders.Count == 0
+                ? "(no model - run `netclaw init`)"
+                : "(no model - run `netclaw model`)",
+            ContextWindowTokens = 0,
+            CompactionModelId = null,
+        };
+    }
+
+    var runtime = ContextWindowResolution.ResolveRuntimeAsync(models.Main, daemonApi)
+        .GetAwaiter().GetResult();
+
+    return new ModelCapabilities
+    {
+        ModelId = runtime.ModelId,
+        ContextWindowTokens = runtime.ContextWindowTokens,
+        CompactionModelId = runtime.Degraded ? null : models.Compaction?.ModelId,
+    };
 }

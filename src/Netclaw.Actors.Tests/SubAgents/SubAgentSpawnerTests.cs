@@ -8,13 +8,16 @@ using Akka.Hosting;
 using Akka.Hosting.TestKit;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging.Abstractions;
+using Netclaw.Actors.Channels;
 using Netclaw.Actors.SubAgents;
 using Netclaw.Actors.Tests.Memory;
 using Netclaw.Actors.Tools;
 using Netclaw.Configuration;
 using Netclaw.Security;
+using Netclaw.Tests.Utilities;
 using Netclaw.Tools;
 using Xunit;
+using static Netclaw.Actors.SubAgents.SubAgentProtocol;
 
 namespace Netclaw.Actors.Tests.SubAgents;
 
@@ -34,7 +37,7 @@ public sealed class SubAgentSpawnerTests : TestKit
         toolRegistry.Register(new FakeNetclawTool("inspect_context", "ok"));
 
         var spawner = new SubAgentSpawner(
-            new SingleClientProvider(new NoOpChatClient()),
+            new SingleClientProvider(new FakeChatClient()),
             toolRegistry,
             new ToolAccessPolicy(
                 new ToolConfig(),
@@ -88,6 +91,68 @@ public sealed class SubAgentSpawnerTests : TestKit
         Assert.True(result.Success);
     }
 
+    [Theory]
+    [InlineData(ChannelType.Headless)]
+    [InlineData(ChannelType.Reminder)]
+    [InlineData(ChannelType.Webhook)]
+    public async Task Spawn_async_does_not_bridge_approval_for_non_interactive_parent(ChannelType channelType)
+    {
+        var childProbe = CreateTestProbe($"non-interactive-{channelType}-child");
+        var spawner = CreateSpawner();
+        var context = new ToolExecutionContext("automation/subagent-parent", "/tmp/netclaw/sessions/parent")
+        {
+            Audience = TrustAudience.Personal,
+            ChannelType = channelType.ToWireValue(),
+            SupportsInteractiveApproval = false,
+            ApprovalBridge = new RecordingParentApprovalBridge(ParentApprovalDecision.ApprovedOnce),
+            SpawnChildActor = (_, _, _) => Task.FromResult<object>(childProbe.Ref)
+        };
+
+        var spawnTask = spawner.SpawnAsync(
+            CreateProfile(),
+            "Inspect the system.",
+            runtimeContext: null,
+            context,
+            TestContext.Current.CancellationToken);
+
+        var run = await childProbe.ExpectMsgAsync<RunSubAgent>(
+            cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Null(run.ApprovalBridge);
+
+        childProbe.Reply(SuccessfulResult());
+        Assert.True((await spawnTask).Success);
+    }
+
+    [Fact]
+    public async Task Spawn_async_preserves_approval_bridge_for_interactive_parent()
+    {
+        var childProbe = CreateTestProbe("interactive-approval-child");
+        var approvalBridge = new RecordingParentApprovalBridge(ParentApprovalDecision.ApprovedOnce);
+        var spawner = CreateSpawner();
+        var context = new ToolExecutionContext("interactive/subagent-parent", "/tmp/netclaw/sessions/parent")
+        {
+            Audience = TrustAudience.Personal,
+            ChannelType = ChannelType.Tui.ToWireValue(),
+            SupportsInteractiveApproval = true,
+            ApprovalBridge = approvalBridge,
+            SpawnChildActor = (_, _, _) => Task.FromResult<object>(childProbe.Ref)
+        };
+
+        var spawnTask = spawner.SpawnAsync(
+            CreateProfile(),
+            "Inspect the system.",
+            runtimeContext: null,
+            context,
+            TestContext.Current.CancellationToken);
+
+        var run = await childProbe.ExpectMsgAsync<RunSubAgent>(
+            cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Same(approvalBridge, run.ApprovalBridge);
+
+        childProbe.Reply(SuccessfulResult());
+        Assert.True((await spawnTask).Success);
+    }
+
     [Fact]
     public async Task Spawn_async_ignores_definition_tool_metadata_for_runtime_tool_resolution()
     {
@@ -95,7 +160,7 @@ public sealed class SubAgentSpawnerTests : TestKit
         toolRegistry.Register(new FakeNetclawTool("inspect_context", "ok"));
 
         var spawner = new SubAgentSpawner(
-            new SingleClientProvider(new NoOpChatClient()),
+            new SingleClientProvider(new FakeChatClient()),
             toolRegistry,
             new ToolAccessPolicy(
                 new ToolConfig(),
@@ -149,27 +214,103 @@ public sealed class SubAgentSpawnerTests : TestKit
         Assert.Equal(1, started.ToolCount);
     }
 
-    private sealed class NoOpChatClient : IChatClient
+    [Fact]
+    public async Task Spawned_sub_agent_bills_its_llm_calls_to_session_metrics()
     {
-        public Task<ChatResponse> GetResponseAsync(
-            IEnumerable<ChatMessage> messages,
-            ChatOptions? options = null,
-            CancellationToken cancellationToken = default)
-            => Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "noop")));
+        // Full-wiring regression guard for #1597: a sub-agent spawned through the real
+        // SubAgentSpawner must record its LLM-call tokens to the ISessionMetrics handed
+        // to the spawner. Unlike the actor-level tests, this exercises the
+        // spawner -> CreateProps -> actor pass-through, so dropping the metrics argument
+        // anywhere along that chain fails here. The SpawnChildActor factory materializes
+        // the spawner-built Props into a real SubAgentActor (a probe stand-in would
+        // bypass CreateProps entirely and hide a broken pass-through).
+        var toolRegistry = new ToolRegistry();
+        toolRegistry.Register(new FakeNetclawTool("inspect_context", "ok"));
 
-        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
-            IEnumerable<ChatMessage> messages,
-            ChatOptions? options = null,
-            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        var metrics = new RecordingSessionMetrics();
+        var chatClient = new FakeChatClient
         {
-            await Task.CompletedTask;
-            yield break;
-        }
+            UsageOverride = new UsageDetails { InputTokenCount = 175, OutputTokenCount = 60 }
+        };
 
-        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+        var spawner = new SubAgentSpawner(
+            new SingleClientProvider(chatClient),
+            toolRegistry,
+            new ToolAccessPolicy(
+                new ToolConfig(),
+                new EffectivePolicyDefaults(
+                    DeploymentPosture.Personal,
+                    TrustAudience.Personal,
+                    ShellExecutionMode.HostAllowed,
+                    UsedStrictFallback: false),
+                new ShellCommandPolicy()),
+            approvalService: null,
+            new StaticSystemPromptProvider("You are a summarizer."),
+            NullLogger<SubAgentSpawner>.Instance,
+            sessionMetrics: metrics);
 
-        public void Dispose()
+        var context = new ToolExecutionContext("console/subagent-parent", "/tmp/netclaw/sessions/parent")
         {
-        }
+            Audience = TrustAudience.Personal
+        };
+        context.SpawnChildActor = (props, name, _) => Task.FromResult<object>(Sys.ActorOf((Props)props, name));
+
+        var profile = new SubAgentProfile
+        {
+            Name = "summarizer",
+            Description = "Summarize content",
+            SystemPrompt = "You are a summarizer.",
+            ToolNames = ["inspect_context"],
+            Visibility = SubAgentVisibility.UserFacing
+        };
+
+        var result = await spawner.SpawnAsync(
+            profile,
+            "Summarize the repo.",
+            runtimeContext: null,
+            context,
+            TestContext.Current.CancellationToken);
+
+        Assert.True(result.Success, $"Expected success but got: {result.Output}");
+        // One text-only LLM call → exactly one usage record, carrying the fake's tokens.
+        var call = Assert.Single(metrics.TokenUsageCalls);
+        Assert.Equal((175L, 60L), call);
     }
+
+    private static SubAgentSpawner CreateSpawner()
+    {
+        var toolRegistry = new ToolRegistry();
+        toolRegistry.Register(new FakeNetclawTool("inspect_context", "ok"));
+
+        return new SubAgentSpawner(
+            new SingleClientProvider(new FakeChatClient()),
+            toolRegistry,
+            new ToolAccessPolicy(
+                new ToolConfig(),
+                new EffectivePolicyDefaults(
+                    DeploymentPosture.Personal,
+                    TrustAudience.Personal,
+                    ShellExecutionMode.HostAllowed,
+                    UsedStrictFallback: false),
+                new ShellCommandPolicy()),
+            approvalService: null,
+            new StaticSystemPromptProvider("You are an inspector."),
+            NullLogger<SubAgentSpawner>.Instance);
+    }
+
+    private static SubAgentProfile CreateProfile() => new()
+    {
+        Name = "inspector",
+        Description = "Inspect the system",
+        SystemPrompt = "You are an inspector.",
+        ToolNames = ["inspect_context"],
+        Visibility = SubAgentVisibility.UserFacing
+    };
+
+    private static SubAgentResult SuccessfulResult() => new()
+    {
+        Success = true,
+        Output = "ok",
+        AgentName = new AgentName("inspector")
+    };
 }

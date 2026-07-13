@@ -140,6 +140,29 @@ public sealed class ProviderManagerViewModelTests : IDisposable
     }
 
     [Fact]
+    public async Task EagerProbe_UsesConfiguredProviderProbeWithProviderName()
+    {
+        WriteConfig(new Dictionary<string, object>
+        {
+            ["configVersion"] = 1,
+            ["Providers"] = new Dictionary<string, object>
+            {
+                ["my-openrouter"] = new Dictionary<string, object>
+                {
+                    ["Type"] = "openrouter",
+                    ["Endpoint"] = "https://openrouter.ai/api/v1",
+                    ["AuthMethod"] = "ApiKey"
+                }
+            }
+        });
+
+        using var vm = CreateViewModel();
+        await ActivateAndProbeAsync(vm);
+
+        Assert.Equal(["my-openrouter"], _fakeProbe.ConfiguredProviderNames);
+    }
+
+    [Fact]
     public async Task EagerProbe_UsesOAuthAccessTokenWhenApiKeyMissing()
     {
         WriteConfig(new Dictionary<string, object>
@@ -172,6 +195,26 @@ public sealed class ProviderManagerViewModelTests : IDisposable
 
         Assert.Equal("openai", _fakeProbe.LastProviderType);
         Assert.Equal("oauth-access-token", _fakeProbe.LastApiKey);
+    }
+
+    [Fact]
+    public async Task AddValidationProbe_DoesNotUseConfiguredProviderProbeBeforePersist()
+    {
+        using var vm = CreateViewModel();
+        await ActivateAndProbeAsync(vm);
+
+        var idx = vm.DisplayProviders.FindIndex(p => p.ProviderType == "openrouter");
+        vm.SelectedProviderIndex = idx;
+        vm.ActivateSelectedProvider();
+        Assert.True(vm.TrySetNewProviderName("lab-a100", out _));
+        vm.AdvanceAfterName();
+        vm.SelectAuthMethod(AuthMethod.ApiKey);
+        vm.NewApiKey = "sk-test-key";
+
+        vm.SubmitCredentials();
+        await vm.ProbeCompletion!.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.Empty(_fakeProbe.ConfiguredProviderNames);
     }
 
     [Fact]
@@ -447,6 +490,34 @@ public sealed class ProviderManagerViewModelTests : IDisposable
 
         // The cancelled revalidation did not update health (stayed Probing) and did not throw.
         Assert.Equal(ProviderHealthStatus.Probing, item.Health);
+    }
+
+    [Fact]
+    public async Task RevalidateDetailProvider_UsesConfiguredProviderProbeWithProviderName()
+    {
+        WriteConfig(new Dictionary<string, object>
+        {
+            ["configVersion"] = 1,
+            ["Providers"] = new Dictionary<string, object>
+            {
+                ["my-openrouter"] = new Dictionary<string, object>
+                {
+                    ["Type"] = "openrouter",
+                    ["Endpoint"] = "https://openrouter.ai/api/v1",
+                    ["AuthMethod"] = "ApiKey"
+                }
+            }
+        });
+
+        using var vm = CreateViewModel();
+        await ActivateAndProbeAsync(vm);
+        _fakeProbe.ConfiguredProviderNames.Clear();
+
+        vm.DetailProvider = vm.DisplayProviders.Single(p => p.ConfiguredName == "my-openrouter");
+        vm.RevalidateDetailProvider();
+        await vm.RevalidateCompletion!.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.Equal(["my-openrouter"], _fakeProbe.ConfiguredProviderNames);
     }
 
     [Fact]
@@ -762,6 +833,147 @@ public sealed class ProviderManagerViewModelTests : IDisposable
         Assert.StartsWith("ENC:", provider.GetProperty("OAuthAccessToken").GetString());
         Assert.False(provider.TryGetProperty("OAuthRefreshToken", out _));
         Assert.False(provider.TryGetProperty("OAuthAccountId", out _));
+    }
+
+    [Fact]
+    public void SelectAuthMethod_GitHubCopilot_ShowsAuthHostChoiceBeforeOAuth()
+    {
+        using var vm = CreateViewModel();
+        vm.NewProviderName = "my-copilot";
+        vm.NewProviderType = "github-copilot";
+
+        vm.SelectAuthMethod(AuthMethod.OAuthDevice);
+
+        Assert.Equal(ProviderManagerState.AddGitHubCopilotAuthHost, vm.CurrentState.Value);
+        Assert.Null(vm.NewVendorOptions);
+    }
+
+    [Fact]
+    public async Task GitHubCopilotPublicHost_PersistsNoVendorOptionsEvenWithAmbientGitHubHost()
+    {
+        var previous = Environment.GetEnvironmentVariable("GH_HOST");
+        try
+        {
+            Environment.SetEnvironmentVariable("GH_HOST", "enterprise.example.com");
+            using var vm = CreateViewModel();
+            vm.NewProviderName = "my-copilot";
+            vm.NewProviderType = "github-copilot";
+            vm.NewAuthMethod = AuthMethod.OAuthDevice;
+
+            vm.SelectGitHubCopilotAuthHost(GitHubCopilotAuthHostMode.GitHubCom);
+            vm.OAuth.Result = new OAuthDeviceFlowResult(
+                new SensitiveString("oauth-access-token"),
+                null,
+                new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero),
+                null);
+            vm.SubmitCredentials();
+            await vm.ProbeCompletion!.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            var config = JsonDocument.Parse(File.ReadAllText(_paths.NetclawConfigPath));
+            var configProvider = config.RootElement
+                .GetProperty("Providers")
+                .GetProperty("my-copilot");
+            Assert.False(configProvider.TryGetProperty("VendorOptions", out _));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("GH_HOST", previous);
+        }
+    }
+
+    [Fact]
+    public async Task GitHubCopilotEnterpriseHostOnly_PersistsDerivedVendorOptions()
+    {
+        using var vm = CreateViewModel();
+        vm.NewProviderName = "copilot-ghe";
+        vm.NewProviderType = "github-copilot";
+        vm.NewAuthMethod = AuthMethod.OAuthDevice;
+
+        Assert.True(vm.TrySetGitHubCopilotEnterpriseHost("ghe.example.com", out var hostError), hostError);
+        Assert.True(vm.TryStartGitHubCopilotEnterpriseOAuth(null, out var apiError), apiError);
+        vm.OAuth.Result = new OAuthDeviceFlowResult(
+            new SensitiveString("oauth-access-token"),
+            null,
+            new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero),
+            null);
+
+        vm.SubmitCredentials();
+        await vm.ProbeCompletion!.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        var config = JsonDocument.Parse(File.ReadAllText(_paths.NetclawConfigPath));
+        var vendorOptions = config.RootElement
+            .GetProperty("Providers")
+            .GetProperty("copilot-ghe")
+            .GetProperty("VendorOptions");
+
+        Assert.Equal("https://ghe.example.com", vendorOptions.GetProperty("GitHubHost").GetString());
+        Assert.Equal("https://ghe.example.com/api/v3", vendorOptions.GetProperty("GitHubApiBase").GetString());
+    }
+
+    [Fact]
+    public async Task GitHubCopilotEnterpriseExplicitApiBase_PersistsCanonicalVendorOptions()
+    {
+        using var vm = CreateViewModel();
+        vm.NewProviderName = "copilot-ghe";
+        vm.NewProviderType = "github-copilot";
+        vm.NewAuthMethod = AuthMethod.OAuthDevice;
+
+        Assert.True(vm.TrySetGitHubCopilotEnterpriseHost("https://example.ghe.com", out var hostError), hostError);
+        Assert.True(vm.TryStartGitHubCopilotEnterpriseOAuth("https://api.example.ghe.com/", out var apiError), apiError);
+        vm.OAuth.Result = new OAuthDeviceFlowResult(
+            new SensitiveString("oauth-access-token"),
+            null,
+            new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero),
+            null);
+
+        vm.SubmitCredentials();
+        await vm.ProbeCompletion!.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        var config = JsonDocument.Parse(File.ReadAllText(_paths.NetclawConfigPath));
+        var vendorOptions = config.RootElement
+            .GetProperty("Providers")
+            .GetProperty("copilot-ghe")
+            .GetProperty("VendorOptions");
+
+        Assert.Equal("https://example.ghe.com", vendorOptions.GetProperty("GitHubHost").GetString());
+        Assert.Equal("https://api.example.ghe.com", vendorOptions.GetProperty("GitHubApiBase").GetString());
+    }
+
+    [Fact]
+    public void GitHubCopilotEnterpriseHostChange_ClearsStaleExplicitApiBase()
+    {
+        using var vm = CreateViewModel();
+        vm.NewProviderType = "github-copilot";
+        vm.NewGitHubCopilotHost = "https://old.ghe.example.com";
+        vm.NewGitHubCopilotApiBase = "https://api.old.ghe.example.com";
+        vm.NewVendorOptions = new Dictionary<string, object?>
+        {
+            ["GitHubHost"] = "https://old.ghe.example.com",
+            ["GitHubApiBase"] = "https://api.old.ghe.example.com",
+        };
+
+        Assert.True(vm.SubmitGitHubCopilotEnterpriseHost("https://new.ghe.example.com", out var error), error);
+
+        Assert.Equal(ProviderManagerState.AddGitHubCopilotEnterpriseApiBase, vm.CurrentState.Value);
+        Assert.Equal("https://new.ghe.example.com", vm.NewGitHubCopilotHost);
+        Assert.Null(vm.NewGitHubCopilotApiBase);
+        Assert.Null(vm.NewVendorOptions);
+    }
+
+    [Fact]
+    public void GitHubCopilotEnterpriseInputs_RejectInvalidValuesBeforeVendorOptions()
+    {
+        using var vm = CreateViewModel();
+        vm.NewProviderType = "github-copilot";
+
+        Assert.False(vm.TrySetGitHubCopilotEnterpriseHost("http://ghe.example.com", out var hostError));
+        Assert.Contains("HTTPS", hostError);
+        Assert.Null(vm.NewVendorOptions);
+
+        Assert.True(vm.TrySetGitHubCopilotEnterpriseHost("ghe.example.com", out hostError), hostError);
+        Assert.False(vm.TryStartGitHubCopilotEnterpriseOAuth("http://ghe.example.com/api/v3", out var apiError));
+        Assert.Contains("HTTPS", apiError);
+        Assert.Null(vm.NewVendorOptions);
     }
 
     [Fact]

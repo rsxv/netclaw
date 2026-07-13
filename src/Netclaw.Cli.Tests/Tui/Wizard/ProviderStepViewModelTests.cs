@@ -76,6 +76,21 @@ public sealed class ProviderStepViewModelTests : IDisposable
     }
 
     [Fact]
+    public void TryGoBack_FromGitHubCopilotModelSelection_GoesToAuthHostChoice()
+    {
+        using var step = new ProviderStepViewModel(_registry, _fakeProbe)
+        {
+            SelectedProviderType = "github-copilot",
+            SelectedAuthMethod = AuthMethod.OAuthDevice,
+        };
+        step.SetSubStep(4);
+
+        Assert.True(step.TryGoBack());
+
+        Assert.Equal(7, step.CurrentSubStep);
+    }
+
+    [Fact]
     public void TryGoBack_FromOAuthDevice_GoesToAuth()
     {
         using var step = new ProviderStepViewModel(_registry, _fakeProbe);
@@ -99,6 +114,27 @@ public sealed class ProviderStepViewModelTests : IDisposable
         step.SetSubStep(4); // model selection
 
         step.OnEnter(_context, NavigationDirection.Back);
+        Assert.Equal(4, step.CurrentSubStep);
+    }
+
+    [Fact]
+    public void OnEnter_Back_AfterGitHubCopilotEnterpriseFlow_ResumesAtModelSelection()
+    {
+        using var step = new ProviderStepViewModel(_registry, _fakeProbe)
+        {
+            SelectedProviderType = "github-copilot",
+            SelectedAuthMethod = AuthMethod.OAuthDevice,
+        };
+
+        step.SetSubStep(7);
+        step.SetSubStep(8);
+        step.SetSubStep(9);
+        step.SetSubStep(5);
+        step.SetSubStep(3);
+        step.SetSubStep(4);
+
+        step.OnEnter(_context, NavigationDirection.Back);
+
         Assert.Equal(4, step.CurrentSubStep);
     }
 
@@ -229,6 +265,107 @@ public sealed class ProviderStepViewModelTests : IDisposable
     }
 
     [Fact]
+    public void GitHubCopilotPublicHost_ContributeConfig_EmitsNoVendorOptions()
+    {
+        var previous = Environment.GetEnvironmentVariable("GH_HOST");
+        try
+        {
+            Environment.SetEnvironmentVariable("GH_HOST", "enterprise.example.com");
+            using var step = new ProviderStepViewModel(_registry, _fakeProbe);
+            step.SelectedProviderType = "github-copilot";
+            step.SelectedAuthMethod = AuthMethod.OAuthDevice;
+            step.SelectGitHubCopilotAuthHost(GitHubCopilotAuthHostMode.GitHubCom);
+
+            var builder = new WizardConfigBuilder(_context.Paths);
+            step.ContributeConfig(builder);
+
+            Assert.NotNull(builder.Provider);
+            Assert.Equal("github-copilot", builder.Provider!.TypeKey);
+            Assert.Null(builder.Provider.VendorOptions);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("GH_HOST", previous);
+        }
+    }
+
+    [Fact]
+    public void GitHubCopilotEnterpriseHostOnly_ContributeConfig_EmitsDerivedVendorOptions()
+    {
+        using var step = new ProviderStepViewModel(_registry, _fakeProbe);
+        step.SelectedProviderType = "github-copilot";
+        step.SelectedAuthMethod = AuthMethod.OAuthDevice;
+
+        Assert.True(step.TrySetGitHubCopilotEnterpriseHost("ghe.example.com", out var hostError), hostError);
+        Assert.True(step.TryStartGitHubCopilotEnterpriseOAuth(null, out var apiError), apiError);
+
+        var builder = new WizardConfigBuilder(_context.Paths);
+        step.ContributeConfig(builder);
+
+        Assert.NotNull(builder.Provider?.VendorOptions);
+        Assert.Equal("https://ghe.example.com", builder.Provider!.VendorOptions!["GitHubHost"]);
+        Assert.Equal("https://ghe.example.com/api/v3", builder.Provider.VendorOptions["GitHubApiBase"]);
+    }
+
+    [Fact]
+    public void GitHubCopilotEnterpriseExplicitApiBase_ContributeConfig_EmitsCanonicalVendorOptions()
+    {
+        using var step = new ProviderStepViewModel(_registry, _fakeProbe);
+        step.SelectedProviderType = "github-copilot";
+        step.SelectedAuthMethod = AuthMethod.OAuthDevice;
+
+        Assert.True(step.TrySetGitHubCopilotEnterpriseHost("https://example.ghe.com", out var hostError), hostError);
+        Assert.True(step.TryStartGitHubCopilotEnterpriseOAuth("https://api.example.ghe.com/", out var apiError), apiError);
+
+        var builder = new WizardConfigBuilder(_context.Paths);
+        step.ContributeConfig(builder);
+
+        Assert.NotNull(builder.Provider?.VendorOptions);
+        Assert.Equal("https://example.ghe.com", builder.Provider!.VendorOptions!["GitHubHost"]);
+        Assert.Equal("https://api.example.ghe.com", builder.Provider.VendorOptions["GitHubApiBase"]);
+    }
+
+    [Fact]
+    public void GitHubCopilotEnterpriseHostChange_ClearsStaleExplicitApiBase()
+    {
+        using var step = new ProviderStepViewModel(_registry, _fakeProbe)
+        {
+            SelectedProviderType = "github-copilot",
+            SelectedAuthMethod = AuthMethod.OAuthDevice,
+            GitHubCopilotHostInput = "https://old.ghe.example.com",
+            GitHubCopilotApiBaseInput = "https://api.old.ghe.example.com",
+            VendorOptions = new Dictionary<string, object?>
+            {
+                ["GitHubHost"] = "https://old.ghe.example.com",
+                ["GitHubApiBase"] = "https://api.old.ghe.example.com",
+            },
+        };
+
+        Assert.True(step.TrySetGitHubCopilotEnterpriseHost("https://new.ghe.example.com", out var error), error);
+
+        Assert.Equal("https://new.ghe.example.com", step.GitHubCopilotHostInput);
+        Assert.Null(step.GitHubCopilotApiBaseInput);
+        Assert.Null(step.VendorOptions);
+    }
+
+    [Fact]
+    public void GitHubCopilotEnterpriseInputs_RejectInvalidValuesBeforeVendorOptions()
+    {
+        using var step = new ProviderStepViewModel(_registry, _fakeProbe);
+        step.SelectedProviderType = "github-copilot";
+        step.SelectedAuthMethod = AuthMethod.OAuthDevice;
+
+        Assert.False(step.TrySetGitHubCopilotEnterpriseHost("http://ghe.example.com", out var hostError));
+        Assert.Contains("HTTPS", hostError);
+        Assert.Null(step.VendorOptions);
+
+        Assert.True(step.TrySetGitHubCopilotEnterpriseHost("ghe.example.com", out hostError), hostError);
+        Assert.False(step.TryStartGitHubCopilotEnterpriseOAuth("http://ghe.example.com/api/v3", out var apiError));
+        Assert.Contains("HTTPS", apiError);
+        Assert.Null(step.VendorOptions);
+    }
+
+    [Fact]
     public void ContributeConfig_DiscoveredModelWithoutModalities_PersistsNone()
     {
         // An openai-compatible /v1/models listing reports no modalities, so the
@@ -264,6 +401,81 @@ public sealed class ProviderStepViewModelTests : IDisposable
 
         Assert.Null(builder.Provider);
         Assert.Null(builder.Model);
+    }
+
+    [Fact]
+    public async Task ContributeHealthChecks_NoProvider_EmitsWarnItem()
+    {
+        using var step = new ProviderStepViewModel(_registry, _fakeProbe);
+        // SelectedProviderType deliberately left null.
+
+        var items = new List<HealthCheckItem>();
+        var runner = new HealthCheckRunner(items, () => { });
+        await step.ContributeHealthChecksAsync(runner, TestContext.Current.CancellationToken);
+
+        var providerItem = items[0];
+        Assert.True(providerItem.Passed);
+        Assert.True(providerItem.IsWarning);
+        Assert.Contains("No-Op", providerItem.Label);
+        Assert.Contains("netclaw init", providerItem.Label, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void HealthCheckRunner_WarningItemDoesNotCountAsCleanPass()
+    {
+        var items = new List<HealthCheckItem>
+        {
+            new("No provider configured", Passed: true, IsWarning: true),
+        };
+        var runner = new HealthCheckRunner(items, () => { });
+
+        Assert.False(runner.AllPassed);
+    }
+
+    [Fact]
+    public async Task ContributeHealthChecks_ProviderSelected_EmitsPassItem()
+    {
+        using var step = new ProviderStepViewModel(_registry, _fakeProbe)
+        {
+            SelectedProviderType = "ollama",
+        };
+
+        var items = new List<HealthCheckItem>();
+        var runner = new HealthCheckRunner(items, () => { });
+        await step.ContributeHealthChecksAsync(runner, TestContext.Current.CancellationToken);
+
+        var providerItem = items[0];
+        Assert.True(providerItem.Passed);
+        Assert.False(providerItem.IsWarning);
+        Assert.Contains("LLM provider configured", providerItem.Label);
+
+        var modelItem = items[1];
+        Assert.True(modelItem.Passed);
+        Assert.True(modelItem.IsWarning);
+        Assert.Contains("No model selected", modelItem.Label);
+        Assert.Contains("No-Op", modelItem.Label);
+        Assert.False(runner.AllPassed);
+    }
+
+    [Fact]
+    public async Task ContributeHealthChecks_ProviderAndModelSelected_CountsAsCleanPass()
+    {
+        using var step = new ProviderStepViewModel(_registry, _fakeProbe)
+        {
+            SelectedProviderType = "ollama",
+            SelectedModelId = "qwen3:30b",
+        };
+
+        var items = new List<HealthCheckItem>();
+        var runner = new HealthCheckRunner(items, () => { });
+        await step.ContributeHealthChecksAsync(runner, TestContext.Current.CancellationToken);
+
+        Assert.All(items, item =>
+        {
+            Assert.True(item.Passed);
+            Assert.False(item.IsWarning);
+        });
+        Assert.True(runner.AllPassed);
     }
 
     // Reuse the existing FakeProviderProbe from the monolith tests

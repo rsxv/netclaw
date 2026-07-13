@@ -3,6 +3,8 @@
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
 // -----------------------------------------------------------------------
+using static Netclaw.Actors.Sessions.SessionProtocol;
+
 namespace Netclaw.Actors.Protocol;
 
 /// <summary>
@@ -121,6 +123,8 @@ public sealed record SessionOutputDto
     public string? Phase { get; init; }
     public int? ToolCountSub { get; init; }
     public bool? SubAgentSuccess { get; init; }
+    public string? SubAgentOutcome { get; init; }
+    public string? SubAgentOutcomeReason { get; init; }
     public double? DurationMs { get; init; }
     public string? MemoryDecision { get; init; }
     public string? MemoryDecisionReason { get; init; }

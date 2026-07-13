@@ -9,6 +9,7 @@ using Netclaw.Actors.Protocol;
 using Netclaw.Actors.Sessions;
 using Netclaw.Configuration;
 using Xunit;
+using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Actors.Tests.Sessions;
 
@@ -65,13 +66,13 @@ public sealed class BackgroundJobSessionStateTests
             UserMessage = new SerializableChatMessage { Role = ChatRole.User, Content = "result" },
             AssistantReply = new SerializableChatMessage { Role = ChatRole.Assistant, Content = "ok" },
             RecordedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            SourceBackgroundJobId = jobKey
+            SourceBackgroundJobId = new BackgroundJobId(jobKey)
         };
 
         state = state.Apply(evt);
 
         Assert.Empty(state.ActiveBackgroundJobs);
-        Assert.Contains(jobKey, state.ProcessedBackgroundJobIds);
+        Assert.Contains(new BackgroundJobId(jobKey), state.ProcessedBackgroundJobIds);
     }
 
     [Fact]
@@ -208,7 +209,7 @@ public sealed class BackgroundJobSessionStateTests
         var processedKey = "bg-job:already-done";
         state = state with
         {
-            ProcessedBackgroundJobIds = state.ProcessedBackgroundJobIds.Add(processedKey)
+            ProcessedBackgroundJobIds = state.ProcessedBackgroundJobIds.Add(new BackgroundJobId(processedKey))
         };
 
         var compactedEvt = new SessionCompacted
@@ -224,6 +225,6 @@ public sealed class BackgroundJobSessionStateTests
 
         Assert.Single(state.ActiveBackgroundJobs);
         Assert.True(state.ActiveBackgroundJobs.ContainsKey(jobKey));
-        Assert.Contains(processedKey, state.ProcessedBackgroundJobIds);
+        Assert.Contains(new BackgroundJobId(processedKey), state.ProcessedBackgroundJobIds);
     }
 }

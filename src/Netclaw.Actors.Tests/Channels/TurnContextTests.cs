@@ -5,11 +5,14 @@
 // -----------------------------------------------------------------------
 using Akka.Actor;
 using Netclaw.Actors.Channels;
+using Netclaw.Actors.Jobs;
 using Netclaw.Actors.Protocol;
+using Netclaw.Actors.Reminders;
 using Netclaw.Actors.Sessions;
 using Netclaw.Configuration;
 using Netclaw.Tools;
 using Xunit;
+using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Actors.Tests.Channels;
 
@@ -53,8 +56,8 @@ public sealed class TurnContextTests
             AdoptedContextProjection = "quoted context",
             AdoptedContextLowerBound = "1700000000.000000",
             AdoptedContextUpperBound = "1700000000.000001",
-            ReminderId = "reminder:1700000000000",
-            BackgroundJobId = "bg-job:42",
+            ReminderId = new ReminderId("reminder:1700000000000"),
+            BackgroundJobId = new BackgroundJobId("bg-job:42"),
             AckTarget = ActorRefs.Nobody
         };
 

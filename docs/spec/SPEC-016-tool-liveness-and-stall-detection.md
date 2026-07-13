@@ -5,6 +5,17 @@ Source PRDs: `PRD-001`, `PRD-006`
 Status: Planning note for issue #1450. The corresponding OpenSpec artifacts must
 be updated through the OpenSpec workflow before implementation is closed.
 
+> **Superseded in part by #1472 / PR #1481 ("addition through subtraction").** The
+> "parent first-item startup guard for self-monitoring tools" described below was
+> removed. The parent no longer supervises self-monitoring tools at all — they own
+> their liveness end to end and are drained with no parent watchdog, bounded only by
+> their own internal watchdog or caller (turn/user) cancellation; an unanswered human
+> approval blocks the run until it is answered or the turn is cancelled. The
+> authoritative, reconciled spec is the `Per-call liveness by tool class` requirement
+> in the `streaming-tool-call-execution` OpenSpec change
+> (`specs/netclaw-tools/spec.md`). Treat the parent-startup-guard clauses below as
+> historical.
+
 ## Purpose
 
 Define the simplified stall-detection contract for tool calls. The goal is to
@@ -139,8 +150,9 @@ Expected stream shape:
    longer applied to this call.
 4. The child watchdog governs prefill, model deltas, keepalive-only wedges,
    tool-loop progress, approval waits, cancellation, and iteration exhaustion.
-5. The terminal `ToolCompletedUpdate` carries either a successful sub-agent result
-   or a failed sub-agent result produced by the child.
+5. The terminal `ToolCompletedUpdate` carries an explicit sub-agent run envelope
+   produced by the child: run id, outcome, optional reason, diagnostics pointer,
+   and the final summary or error text.
 
 ## Validation Strategy
 
@@ -193,7 +205,7 @@ without the parent killing it, while opaque tools remain bounded.
 ### Diagnostics And Manual Repro
 
 - Logs SHALL correlate parent session id, sub-agent run id, child watchdog
-  reason, and terminal `spawn_agent` result.
+  reason, terminal outcome, and terminal `spawn_agent` result.
 - Manual repro should run parallel `spawn_agent` calls where one child opens a
   quiet window longer than the parent tool timeout. The expected result is no
   parent `produced no activity` failure; either the child completes or the child

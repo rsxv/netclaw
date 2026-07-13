@@ -1,127 +1,73 @@
-#### 0.24.0 2026-06-18 ####
+# NetClaw Release Notes
 
-Netclaw v0.24.0 — Beta release channel, streaming-native chat stack, rebuilt config TUI, Docker reliability, and the full 0.24.0 beta journey
+## 0.25.0-beta.3 (2026-07-12)
 
-**Major Features**
+### Features
+- **Discord DM reminder delivery** — Reminders can now be delivered to Discord DMs via improved `DiscordReminderTargetResolver` ([#1609](https://github.com/netclaw-dev/netclaw/pull/1609))
+- **Named model configuration & provider runtime validation** — New `NamedModelConfiguration` and `ProviderRuntimeValidation` types, config schema updates, and CLI wizard improvements for provider/model setup ([#1610](https://github.com/netclaw-dev/netclaw/pull/1610))
 
-* **Opt-in beta release channel** — Netclaw can now publish and install prereleases without touching a default install. A new `latestPrerelease` pointer (newest of all releases) works alongside `latest` (newest stable); `--channel beta` / `-Channel beta` and the rolling `:beta` Docker tag resolve to it. Stable clients only ever read `latest`. ([#1314](https://github.com/netclaw-dev/netclaw/pull/1314))
+### Bug Fixes
+- **Model set/picker preserves hand-set modalities** — Re-selecting the same model no longer wipes operator-set `InputModalities`/`OutputModalities` and `ContextWindow`. Added `--input-modalities`, `--output-modalities`, `--clear-modalities`, and `--clear-context-window` CLI flags ([#1610](https://github.com/netclaw-dev/netclaw/pull/1610))
+- **Slack processing status serialization** — Slack processing status updates are now serialized to prevent race conditions during concurrent sends ([#1556](https://github.com/netclaw-dev/netclaw/pull/1556))
+- **Sub-agent token usage tracked in daily stats** — Sub-agent LLM calls now record token usage, making them visible in `netclaw stats` ([#1597](https://github.com/netclaw-dev/netclaw/pull/1597))
+- **Subagents fail closed for unattended approvals** — When a subagent requires approval but the session is unattended, it now fails closed instead of proceeding or hanging ([#1616](https://github.com/netclaw-dev/netclaw/pull/1616))
 
-* **Channel-aware, SemVer-correct update check** — the binary update check honors `Daemon.UpdateChannel` (`stable` default, or `beta`) and compares versions by SemVer 2.0.0 precedence. Beta testers are notified of the next prerelease and automatically roll onto stable once it supersedes; stable users are never offered a prerelease. ([#1315](https://github.com/netclaw-dev/netclaw/pull/1315))
+## 0.25.0-beta.2 (2026-07-07)
 
-* **Streaming-native chat-client stack with composable routing** — the `IChatClient` stack has been redesigned so the streaming-vs-non-streaming transport distinction no longer leaks into callers. Netclaw now issues only streaming requests across all 8 providers, eliminating the OpenAI Codex `400 "Stream must be set to true"` error and preventing reasoning content drops. Resilience and observability are compositional via `Microsoft.Extensions.AI.ChatClientBuilder` — each (provider, model) pipeline is assembled as `Logging → Retry → VendorOptions → raw`. A `RoutingChatClient` walks ordered candidate lists for failover, and `LoggingChatClient` is now stateless with session-correlated log tags (`SessionId`). ([#1313](https://github.com/netclaw-dev/netclaw/pull/1313))
+### Bug Fixes
+- **UTF-8 BOM in skill frontmatter** — Fixed: skill scanner now strips UTF-8 BOM (`\uFEFF`) before parsing YAML frontmatter, and populates `SkillName` on all `SkillScanIssue` records so degenerate frontmatter no longer crashes the scan ([#1583](https://github.com/netclaw-dev/netclaw/pull/1583))
+- **Model capability provenance logging** — Fixed: daemon now logs effective model capabilities with their provenance source, improving diagnostic visibility for model configuration issues ([#1584](https://github.com/netclaw-dev/netclaw/pull/1584))
 
-* **Rebuilt config TUI and simplified init wizard** — the configuration TUI has been rebuilt from scratch with a streamlined init wizard, canonical channel-ID resolution for all gateway integrations, scrollable list views, and native text selection via Termina. ([#1368](https://github.com/netclaw-dev/netclaw/pull/1368), [#1359](https://github.com/netclaw-dev/netclaw/pull/1359), [#1363](https://github.com/netclaw-dev/netclaw/pull/1363))
+### Dependency Updates
+- **Bump SkillServer** — `Netclaw.SkillClient` 0.4.0-beta.1 → 0.4.0-beta.3 and adapt to API changes ([#1593](https://github.com/netclaw-dev/netclaw/pull/1593))
 
-* **Background jobs as detached processes** — background jobs now run as detached processes with live log streaming, no default kill timer, and automatic reaping on passivation. ([#1405](https://github.com/netclaw-dev/netclaw/pull/1405))
+## 0.25.0-beta.1 (2026-07-05)
 
-* **Shell streaming support** — `shell_execute` output now streams incrementally instead of waiting for full completion, fixing the hard 90s timeout for long-running commands. ([#1360](https://github.com/netclaw-dev/netclaw/pull/1360))
+### Features
+- **SkillServer native sub-agent sync** — Optional native manifest sidecar sync for server-managed sub-agents, keeping RFC skill sync primary while downloading verified native artifacts when available. Local sub-agent files load before server-feed files so user-authored definitions always win ([#1539](https://github.com/netclaw-dev/netclaw/pull/1539))
 
-* **Standardized channel infrastructure (SPEC-015)** — generic `ChannelLifecycleActor` and `RemoteChatChannelBuilder` reduce new channel implementations to ~80 LOC (down from 1,100+ duplicated LOC across Discord and Mattermost), while enforcing a standardized security pipeline and gateway lifecycle. ([#1375](https://github.com/netclaw-dev/netclaw/pull/1375))
+### Bug Fixes
+- **Systemd shell tool PATH** — Fixed: daemon now captures the operator's full PATH into the systemd EnvironmentFile instead of relying on a hardcoded list, so tools like `~/.dotnet/dotnet` are visible to the shell tool ([#1565](https://github.com/netclaw-dev/netclaw/pull/1565))
 
-* **Bounded tool output with file spill** — large tool outputs are now bounded and spilled to a file instead of flooding the session, keeping context lean while preserving the full output on disk. ([#1305](https://github.com/netclaw-dev/netclaw/pull/1305))
+### Memory
+- **Shared curation evaluator** — Unified curation logic across both memory write pipelines (inline per-session actor and daemon checkpoint-worker) so they can never diverge again ([#1575](https://github.com/netclaw-dev/netclaw/pull/1575))
+- **Memory audit quick wins** — July 2026 audit: revived curation LLM, balanced prompt, and recall precision re-tune ([#1568](https://github.com/netclaw-dev/netclaw/pull/1568))
 
-* **Loud tool-argument validation** — eliminated silent discard/degradation of LLM tool arguments; invalid arguments are now surfaced explicitly instead of being silently dropped. ([#1398](https://github.com/netclaw-dev/netclaw/pull/1398))
+## 0.24.4 (2026-07-03)
 
-* **Channel delivery descriptor registry** — new registration-based system for channel delivery descriptors, improving extensibility of channel integrations. ([#1326](https://github.com/netclaw-dev/netclaw/pull/1326))
+### Bug Fixes
+- **Environment-variable-only configuration** — Fixed doctor misdiagnosis and OAuth config-file side effect that prevented daemon startup when configuration is supplied entirely via environment variables ([#1569](https://github.com/netclaw-dev/netclaw/pull/1569))
+- **Remote daemon CLI** — Fixed: CLI no longer demands a local daemon config file when the daemon is explicitly configured as remote ([#1567](https://github.com/netclaw-dev/netclaw/pull/1567))
 
-* **`lookup_channel_destination` blank-query support** — passing `query: null` or an empty string now returns all available destinations, enabling "Select Destination" TUI steps. ([#1375](https://github.com/netclaw-dev/netclaw/pull/1375))
+### Dependency Updates
+- **Bump Anthropic SDK** — 12.34.1 → 12.35.1 ([#1561](https://github.com/netclaw-dev/netclaw/pull/1561))
+- **Bump Akka group** — Akka.Cluster.Sharding and Akka.Persistence 1.5.69 → 1.5.70 ([#1560](https://github.com/netclaw-dev/netclaw/pull/1560))
 
-**Bug Fixes**
+## 0.24.3 (2026-07-03)
 
-* **Discord gateway no longer enters zombie state after failed auto-retry** — fixed a critical reliability issue where the Discord gateway dropped every inbound message for 30+ minutes and would not recover without a daemon restart. ([#1374](https://github.com/netclaw-dev/netclaw/pull/1374))
+### Features
+- **GitHub Enterprise Copilot support** — Authenticate GitHub Copilot tokens against GHE instances and route requests to the correct data residency endpoint ([#1509](https://github.com/netclaw-dev/netclaw/pull/1509), [#1512](https://github.com/netclaw-dev/netclaw/pull/1512), [#1555](https://github.com/netclaw-dev/netclaw/pull/1555))
+- **Slack native processing status** — Real-time processing indicators in Slack instead of generic "working" messages ([#1524](https://github.com/netclaw-dev/netclaw/pull/1524))
+- **Reminder failure visibility** — Operators can now see when reminders fail or are skipped ([#1503](https://github.com/netclaw-dev/netclaw/pull/1503))
+- **Degraded startup mode** — Daemon starts with a "no valid model" banner when no provider is configured, instead of failing host startup. Removed silent local-ollama default ([#1540](https://github.com/netclaw-dev/netclaw/pull/1540))
+- **Synced skill resources via shell** — Skill resources synced from the cloud can now execute via shell commands ([#1551](https://github.com/netclaw-dev/netclaw/pull/1551))
 
-* **Mattermost auto-retry recovery publishes `ConnectionRestored`** — the same gateway-lifecycle fix applied to the Mattermost actor. ([#1375](https://github.com/netclaw-dev/netclaw/pull/1375))
+### Bug Fixes
+- **Autonomous sessions can write workspace directory** — Fixed: autonomous sessions could not write to the workspace directory ([#1498](https://github.com/netclaw-dev/netclaw/pull/1498))
+- **Reminder duplicate-execution guard** — Fixed: Mode A reminder session wedge prevented the duplicate guard from releasing ([#1500](https://github.com/netclaw-dev/netclaw/pull/1500))
+- **Reset stops daemon first** — Fixed: `netclaw reset` now stops the daemon before proceeding and shows a progress screen ([#1494](https://github.com/netclaw-dev/netclaw/pull/1494))
+- **MCP tool errors display cleanly** — Fixed: MCP errors now show as attributed messages instead of raw JSON dumps ([#1510](https://github.com/netclaw-dev/netclaw/pull/1510))
+- **TUI identity redo timezone loop** — Fixed: identity redo would loop on timezone; also fixed session browser regression ([#1518](https://github.com/netclaw-dev/netclaw/pull/1518))
+- **Subagent terminal result summaries** — Fixed: subagent terminal results not displaying properly ([#1519](https://github.com/netclaw-dev/netclaw/pull/1519))
+- **Flaky host crash during install reset** — Fixed: thread-unsafe ReactiveProperty access during reset caused crashes ([#1525](https://github.com/netclaw-dev/netclaw/pull/1525))
+- **Session browser selection highlight** — Fixed: session browser didn't show selection highlight in TUI ([#1531](https://github.com/netclaw-dev/netclaw/pull/1531))
+- **Slack active thread status refresh** — Fixed: thread status not refreshing during tool loops and buffered messages ([#1534](https://github.com/netclaw-dev/netclaw/pull/1534))
+- **Stable memory handles** — Fixed: memory handles were unstable, affecting cross-session memory ([#1538](https://github.com/netclaw-dev/netclaw/pull/1538))
+- **GHE Copilot routing** — Fixed: GHE Copilot chat now routes to the token's `endpoints.api` host instead of hardcoded `api.githubcopilot.com` ([#1555](https://github.com/netclaw-dev/netclaw/pull/1555))
+- **Security: Microsoft.OpenApi CVE-2026-49451** — Pinned to 2.7.5 to address vulnerability ([#1543](https://github.com/netclaw-dev/netclaw/pull/1543))
 
-* **Scheduler race in BackgroundJobManagerActor startup eliminated** — fixed a race condition in the scheduler's startup reconciliation logic that could cause jobs to be missed or duplicated during daemon initialization. ([#1417](https://github.com/netclaw-dev/netclaw/pull/1417))
+### Breaking Changes
+- **Removed silent local-ollama fallback** — Users without any provider configured will now see a "no valid model" banner instead of an automatic fallback to local Ollama. Explicit provider configuration is now required for full functionality ([#1540](https://github.com/netclaw-dev/netclaw/pull/1540))
 
-* **In-session reminder delivery now confirms successfully** — fixed current-session reminders that were incorrectly reporting delivery failures. ([#1387](https://github.com/netclaw-dev/netclaw/pull/1387))
-
-* **Reminder list includes disabled reminders** — the reminder list endpoint now correctly returns disabled reminders alongside active ones. ([#1386](https://github.com/netclaw-dev/netclaw/pull/1386))
-
-* **Shell approval no longer matches bare integers or version/value arguments** — fixed false-positive pattern matches on numeric arguments and normalized version/value handling in approval verb chains. ([#1331](https://github.com/netclaw-dev/netclaw/pull/1331), [#1388](https://github.com/netclaw-dev/netclaw/pull/1388))
-
-* **Bound per-turn empty/thinking-only response loops** — prevents agents from getting stuck in infinite loops of empty or thinking-only responses. ([#1358](https://github.com/netclaw-dev/netclaw/pull/1358))
-
-* **Sub-agent logs are now session-correlated** — sub-agent log output is properly tagged with session context, making it easier to trace sub-agent activity. ([#1428](https://github.com/netclaw-dev/netclaw/pull/1428))
-
-* **MCP fixes** — permission render clipping resolved; OAuth discovery skipped when static Authorization header is configured. ([#1424](https://github.com/netclaw-dev/netclaw/pull/1424), [#1357](https://github.com/netclaw-dev/netclaw/pull/1357))
-
-* **Bounded image egress with dynamic resizing and caching** — SkiaSharp-backed `IImageNormalizer` downscales images to bounded dimensions (~1568px long-edge cap) and a base64 byte budget (~5MB) with two seams: normalize-at-ingestion for chat attachments and downscale-at-egress with content-hash cache for `file_read` images. Fails loud (drop-with-note, never raw passthrough), preventing OOM on large images. Configurable caps with schema sync. ([#1345](https://github.com/netclaw-dev/netclaw/pull/1345))
-
-* **Secret placeholder writeback prevented** — file read/write tools no longer write back secret placeholders. ([#1343](https://github.com/netclaw-dev/netclaw/pull/1343))
-
-* **Model manager manual entry state reset** — fixed stale manual entry state during model selection. ([#1344](https://github.com/netclaw-dev/netclaw/pull/1344))
-
-* **Provider modality probing fixed** — Netclaw no longer persists guessed modalities; model-probe timeout and visibility issues resolved. ([#1311](https://github.com/netclaw-dev/netclaw/pull/1311))
-
-* **OpenAI Codex calls no longer hang** — non-streaming Codex calls are served via streaming under the hood. ([#1289](https://github.com/netclaw-dev/netclaw/pull/1289))
-
-* **Zero context-window models ignored** — models reporting zero context window are now ignored instead of breaking model selection. ([#1285](https://github.com/netclaw-dev/netclaw/pull/1285))
-
-* **Init wizard readiness race fixed** — init readiness is gated on a daemon restart generation and a re-resolved endpoint. ([#1307](https://github.com/netclaw-dev/netclaw/pull/1307))
-
-* **Standardized self-animating spinner across probe surfaces** — replaced five hand-rolled spinners with Termina's shared `SpinnerNode`; fixes frozen and slow spinners. ([#1312](https://github.com/netclaw-dev/netclaw/pull/1312), [#1327](https://github.com/netclaw-dev/netclaw/pull/1327))
-
-* **TUI approval detail toggle remapped** — `Ctrl+V` → `Ctrl+O`, freeing up `Ctrl+V` for its expected use. ([#1362](https://github.com/netclaw-dev/netclaw/pull/1362))
-
-* **DaemonApi threaded into init wizard's provider step** — init wizard's provider step now properly uses the DaemonApi. ([#1369](https://github.com/netclaw-dev/netclaw/pull/1369))
-
-* **Flaky actor-startup tests fixed** — deterministic readiness barriers replace timing assumptions. ([#1410](https://github.com/netclaw-dev/netclaw/pull/1410), [#1378](https://github.com/netclaw-dev/netclaw/pull/1378))
-
-* **Removed skills pruned from server feeds** — deleted skills no longer appear in the server's skill feed. ([#1408](https://github.com/netclaw-dev/netclaw/pull/1408))
-
-* **Approval patterns terminate at multi-line arguments** — multi-line shell arguments are properly terminated with a summary in the display text. ([#1407](https://github.com/netclaw-dev/netclaw/pull/1407))
-
-* **Install scripts persist `--channel` preference** — `Daemon.UpdateChannel` is now written to `netclaw.json` during `--channel beta` installs, so the daemon no longer silently defaults to stable. ([#1377](https://github.com/netclaw-dev/netclaw/pull/1377))
-
-* **Lighter daemon memory footprint** — `netclawd` now uses Workstation GC. ([#1295](https://github.com/netclaw-dev/netclaw/pull/1295))
-
-* **Windows installer uses User-scope PATH** — `netclaw` is found in new shells. ([#1274](https://github.com/netclaw-dev/netclaw/pull/1274))
-
-* **Corrected version split in Directory.Build.props** — version parsing handles all version strings correctly. ([#1339](https://github.com/netclaw-dev/netclaw/pull/1339))
-
-**Docker Improvements**
-
-* **Self-dropping CLI launcher for root exec** — `/usr/local/bin/netclaw` transparently re-execs as the `netclaw` user when invoked as root, so `docker exec`/`kubectl exec` works without `gosu`/`-u`. ([#1322](https://github.com/netclaw-dev/netclaw/pull/1322))
-
-* **Non-root agent can install tools at runtime in Docker** — user-writable, on-`PATH` install locations shipped so runtime-installed tools resolve as bare commands. ([#1321](https://github.com/netclaw-dev/netclaw/pull/1321))
-
-* **Docker no longer crash-loops on read-only `/tools` mount** — treats `/tools` as best-effort. ([#1321](https://github.com/netclaw-dev/netclaw/pull/1321))
-
-* **Docker reaps orphaned subprocesses** — uses `tini` to reap zombies. ([#1306](https://github.com/netclaw-dev/netclaw/pull/1306))
-
-* **Docker owns the daemon lifecycle** — fixes conflicting restart behavior. ([#1282](https://github.com/netclaw-dev/netclaw/pull/1282))
-
-* **Docker bind-mount ownership repaired** — mounted data is writable on startup. ([#1281](https://github.com/netclaw-dev/netclaw/pull/1281))
-
-* **Docker root-drop log cleanup** — removed noisy log output when running as root. ([#1342](https://github.com/netclaw-dev/netclaw/pull/1342))
-
-**Shell Reliability**
-
-* **Shell pipe reads bounded** — bounded to `MaxOutputChars` before truncating, preventing runaway memory. ([#1298](https://github.com/netclaw-dev/netclaw/pull/1298))
-
-* **Shell verifies the working directory** — confirms the working directory exists before launching, surfacing a clear error. ([#1299](https://github.com/netclaw-dev/netclaw/pull/1299))
-
-**Dependency Updates**
-
-* **Anthropic** 12.24.1 → 12.29.1 (#1352, #1412)
-* **Termina** 0.10.2 → 0.12.1 (#1354, #1393)
-* **Discord.Net** 3.19.1 → 3.20.1 (#1353)
-* **Aspire.Hosting.AppHost** 13.4.2 → 13.4.4 (#1318, #1366, #1413)
-* **Aspire.Hosting.Testing** 13.4.2 → 13.4.3 (#1366)
-* **ModelContextProtocol.Core & ModelContextProtocol.AspNetCore** 1.4.0 (#1329, #1330)
-* **CommunityToolkit.Aspire.Hosting.Ollama** 13.4.0 (#1320)
-* **Grpc.Tools** 2.81.0 → 2.81.1 (#1269, #1400)
-* **Verify.XunitV3** 31.19.0 → 31.19.1 (#1270, #1367)
-* **Microsoft.AspNetCore.DataProtection** 10.0.8 → 10.0.9 (#1404)
-* **Google.Protobuf** 3.35.0 → 3.35.1 (#1399)
-* **OpenTelemetry** 1.15.3 → 1.16.0 (#1392)
-* **slopwatch.cmd** 0.4.1 → 0.4.2 (#1421)
-* **Akka group** 2 updates (#1411)
-
-**Documentation & Internal**
-
-* Documented beta/stable release process (#1323)
-* Cited #648 at the chat-client routing seam (#1335)
-* Archived completed OpenSpec changes (#1325, #1380, #1389)
-* Added `.claude/worktrees` to `.gitignore` (#1336)
+### Performance
+- **Log stream partitioned by session** — Each session now gets its own `session.log` while `daemon.log` remains sparse. Cleaner logs and better observability with OTEL union support ([#1499](https://github.com/netclaw-dev/netclaw/pull/1499))

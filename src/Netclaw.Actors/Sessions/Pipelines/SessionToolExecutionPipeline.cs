@@ -16,6 +16,8 @@ using Netclaw.Configuration;
 using Netclaw.Media;
 using Netclaw.Security;
 using Netclaw.Tools;
+using static Netclaw.Actors.Sessions.SessionProtocol;
+using static Netclaw.Actors.Jobs.BackgroundJobProtocol;
 
 namespace Netclaw.Actors.Sessions.Pipelines;
 
@@ -167,6 +169,9 @@ internal static class SessionToolExecutionPipeline
         }
         catch (OperationCanceledException ex)
         {
+            // The tool-execution token is cancelled both by caller (turn/user) supersede
+            // and by the session's own timeout watchdog; surface either as a failed
+            // batch (the watchdog message is the authoritative one).
             self.Tell(new ToolExecutionFailed
             {
                 Cause = new TimeoutException(
@@ -206,14 +211,14 @@ internal static class SessionToolExecutionPipeline
         TurnContext? turnContext = null,
         ModelInputBatchBudget? modelInputBudget = null)
     {
-        // Pre-dispatch validation, on the ORIGINAL (pre-extraction) arguments:
-        // provider args-parse sentinel, present-but-invalid meta values, and
-        // unrecognized argument keys. Shared with the executor (and thus the
-        // sub-agent path) via IToolExecutor.ValidateToolCall so the rules live
-        // in one place. Rejecting here — rather than letting the executor return
-        // the rejection string from ExecuteAsync — is what lets the denial be
-        // audited as Allowed=false instead of being misreported as executed.
-        if (executor.ValidateToolCall(tc) is { } rejection)
+        // Single execution-preflight seam, shared with the sub-agent path via
+        // IToolExecutor.InterpretToolCall: validate the ORIGINAL arguments (parse
+        // sentinel, invalid/ambiguous meta values, unrecognized keys) and, on
+        // success, extract meta + strip meta keys. Rejecting here — rather than
+        // letting ExecuteAsync return the rejection string — is what lets the denial
+        // be audited as Allowed=false instead of being misreported as executed.
+        var interpretation = executor.InterpretToolCall(tc);
+        if (interpretation.Rejection is { } rejection)
         {
             auditLogger?.Log(BuildAuditEntry(sessionId, tc, timeProvider, TimeSpan.Zero, meta: null) with
             {
@@ -230,8 +235,8 @@ internal static class SessionToolExecutionPipeline
             }, [], [], [], []);
         }
 
-        var (meta, cleanedTc) = ToolCallMetaExtractor.Extract(tc);
-        tc = cleanedTc;
+        var meta = interpretation.Meta;
+        tc = interpretation.Cleaned;
 
         // The agent's per-call timeout hint is honored as requested; when absent
         // the inherited default (SessionConfig.ToolExecutionTimeout) applies.
@@ -265,7 +270,9 @@ internal static class SessionToolExecutionPipeline
             context.OneTimeApprovedToolName = tc.Name;
             context.SetOneTimeApprovedPatterns(oneTimeApprovalPreSeed);
         }
-        if (approvalChannel is not null && emitApprovalRequest is not null)
+        if (approvalChannel is not null
+            && emitApprovalRequest is not null
+            && CanRequestInteractiveApproval(source, turnContext))
         {
             context.ApprovalBridge = new ParentSessionApprovalBridge(
                 approvalChannel,
@@ -313,6 +320,8 @@ internal static class SessionToolExecutionPipeline
                     RunId = info.RunId,
                     AgentName = new SubAgents.AgentName(info.AgentName),
                     Success = info.Success,
+                    Outcome = info.Outcome ?? (info.Success ? SubAgentRunOutcome.Completed : SubAgentRunOutcome.Failed),
+                    OutcomeReason = info.OutcomeReason,
                     Duration = info.Duration,
                     FindingsCount = info.Findings.Count,
                     MemoryDecision = decision,
@@ -581,6 +590,14 @@ internal static class SessionToolExecutionPipeline
                 DenyReason = ex.DenyReason
             });
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Caller (turn/user) cancellation is not a tool failure. Self-monitoring
+            // tools are bounded only by ct, so this is the normal cancel path; let it
+            // propagate so the turn aborts cleanly instead of feeding the model an
+            // "Error executing tool: The operation was canceled." result.
+            throw;
+        }
         catch (Exception ex)
         {
             sw.Stop();
@@ -633,22 +650,37 @@ internal static class SessionToolExecutionPipeline
 
         try
         {
-            // Opaque tools are bounded by one wall-clock budget. Self-monitoring
-            // tools (spawn_agent) are only bounded until their first stream item;
-            // after that, their own internal watchdogs must return terminal
-            // success or failure.
-            var livenessMode = executor.GetLivenessMode(toolCall);
-            var budget = livenessMode == ToolLivenessMode.SelfMonitoring
-                ? ToolWatchdogBudget.FirstItemOnly(timeout)
-                : ToolWatchdogBudget.WallClock(timeout);
+            var stream = executor.ExecuteStreamAsync(toolCall, context, cancellationToken);
 
-            return await StreamingToolWatchdog.ConsumeAsync(
-                executor.ExecuteStreamAsync(toolCall, context, cancellationToken),
-                toolCall.Name,
-                budget,
-                timeProvider,
-                onActivity: null,
-                cancellationToken);
+            // Self-monitoring tools (spawn_agent) own their liveness end to end and
+            // always drive their stream to a terminal item, so the parent does not
+            // supervise them at all — it drains to that terminal item under caller
+            // (turn/user) cancellation only. For spawn_agent the terminal item is
+            // produced by SpawnAgentTool's stream, which completes when SpawnAsync
+            // returns; SpawnAsync's finally unconditionally completes the activity
+            // channel, and SubAgentActor.PostStop guarantees the reply that lets
+            // SpawnAsync return even on a crash. (Note: PostStop alone only unblocks
+            // the spawner Ask — the terminal stream item depends on that finally
+            // running.)
+            if (executor.GetLivenessMode(toolCall) == ToolLivenessMode.SelfMonitoring)
+                return await DrainToCompletionAsync(stream, toolCall.Name, cancellationToken);
+
+            // Opaque tools are bounded by one wall-clock budget. A TimeProvider-driven
+            // timeout token (no hand-rolled timer, no volatile) cancels the drain when the
+            // budget elapses; it is per call, so a slow tool times out without affecting
+            // its siblings.
+            using var budgetCts = new CancellationTokenSource(timeout, timeProvider);
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, budgetCts.Token);
+            try
+            {
+                return await DrainToCompletionAsync(stream, toolCall.Name, linkedCts.Token);
+            }
+            catch (OperationCanceledException)
+                when (budgetCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException(
+                    $"Tool '{toolCall.Name}' exceeded execution budget of {timeout.TotalSeconds:F0}s and was stopped.");
+            }
         }
         finally
         {
@@ -665,6 +697,26 @@ internal static class SessionToolExecutionPipeline
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Drains a tool's stream to its terminal completion item under the supplied
+    /// cancellation token. Self-monitoring tools pass the caller (turn/user) token
+    /// directly — they own their liveness; opaque tools pass a token also linked to a
+    /// wall-clock budget. A stream that ends without a completion item violates the
+    /// tool-call contract and fails loudly.
+    /// </summary>
+    private static async Task<string> DrainToCompletionAsync(
+        IAsyncEnumerable<ToolCallUpdate> stream, string toolName, CancellationToken cancellationToken)
+    {
+        await foreach (var update in stream.WithCancellation(cancellationToken))
+        {
+            if (update is ToolCompletedUpdate completed)
+                return completed.Result;
+        }
+
+        throw new InvalidOperationException(
+            $"Tool '{toolName}' stream ended without a completion item.");
     }
 
     private static bool SetsEqual(IReadOnlySet<string> left, IReadOnlySet<string> right)

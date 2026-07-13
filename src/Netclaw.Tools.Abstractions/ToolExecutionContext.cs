@@ -25,11 +25,13 @@ public sealed record FileAttachmentInfo(string FilePath, string FileName, MimeTy
 /// </summary>
 public sealed record SubAgentNotificationInfo
 {
-    public required string RunId { get; init; }
+    public required SubAgentRunId RunId { get; init; }
     public required string AgentName { get; init; }
     public required bool IsStarted { get; init; }
     public int ToolCount { get; init; }
     public bool Success { get; init; }
+    public SubAgentRunOutcome? Outcome { get; init; }
+    public SubAgentOutcomeReason? OutcomeReason { get; init; }
     public TimeSpan Duration { get; init; }
     public IReadOnlyList<SubAgentFinding> Findings { get; init; } = [];
 }
@@ -91,6 +93,19 @@ public sealed class ToolExecutionContext
     /// Tools that have their own internal timeout should honor this when set.
     /// </summary>
     public int? RequestedTimeoutSeconds { get; set; }
+
+    /// <summary>
+    /// Applies a per-call <see cref="ToolCallMeta"/> hint to this context — the one
+    /// definition of "meta hint → context" shared by the pipeline and sub-agent so the
+    /// timeout hint can't be dropped by a path that forgets to apply it. Currently
+    /// only the timeout hint maps onto the context; an absent hint leaves the
+    /// inherited default in place.
+    /// </summary>
+    public void ApplyMeta(ToolCallMeta? meta)
+    {
+        if (meta?.TimeoutHintSeconds is { } timeoutSeconds)
+            RequestedTimeoutSeconds = timeoutSeconds;
+    }
 
 
     public string? ChannelType { get; set; }
