@@ -1,4 +1,4 @@
-﻿// -----------------------------------------------------------------------
+// -----------------------------------------------------------------------
 // <copyright file="Program.cs" company="Petabridge, LLC">
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
@@ -693,21 +693,6 @@ static void ConfigureDaemonServices(
         .Get<SkillFeedsConfig>() ?? new SkillFeedsConfig();
     services.AddSingleton(skillFeedsConfig);
 
-    var resolvedServerFeedSources = new List<ResolvedExternalSource>();
-    foreach (var feed in skillFeedsConfig.Feeds.Where(f => f.Enabled))
-    {
-        var feedDir = paths.ServerFeedDirectory(feed.Name);
-        if (Directory.Exists(feedDir))
-            resolvedServerFeedSources.Add(new ResolvedExternalSource(
-                $"server-feed:{feed.Name}", [feedDir], AllowSymlinks: false));
-    }
-    IReadOnlyList<ResolvedExternalSource> serverFeeds = resolvedServerFeedSources;
-    services.AddKeyedSingleton("server-feeds", serverFeeds);
-
-    // Scan native skills first (highest precedence), then server feeds, then external sources
-    var initialSkillScan = SkillScanner.ScanAndMerge(
-        paths.SkillsDirectory, serverFeeds, resolvedExternalSources);
-    skillRegistry.ReplaceAll(initialSkillScan.AcceptedSkills, initialSkillScan.Issues);
     services.AddSingleton(skillRegistry);
 
     // Subagent definition registry and file loader
@@ -754,7 +739,6 @@ static void ConfigureDaemonServices(
             toolAccessPolicy,
             sp.GetService<IToolApprovalService>(),
             sp.GetRequiredService<ILogger<DispatchingToolExecutor>>()));
-
     // Operational notification webhooks
     var notificationsConfig = configuration.GetSection("Notifications")
         .Get<NotificationsConfig>() ?? new NotificationsConfig();
@@ -817,11 +801,14 @@ static void ConfigureDaemonServices(
     services.AddSingleton<ToolIndexContextLayer>();
     services.AddSingleton<IContextLayerProvider>(sp => sp.GetRequiredService<ToolIndexContextLayer>());
 
-    // Skill index context layer — compressed format pointing at files on disk, rebuilt by sync service
+    // Skill index context layer — origin-free logical catalog rebuilt with the complete inventory.
     var skillIndexLayer = new SkillIndexContextLayer(skillSyncConfig);
-    skillIndexLayer.Update(skillRegistry.GenerateIndex(paths.SkillsDirectory, resolvedExternalSources));
     services.AddSingleton(skillIndexLayer);
     services.AddSingleton<IContextLayerProvider>(skillIndexLayer);
+    var skillInventoryRefresher = new SkillInventoryRefresher(
+        paths, skillFeedsConfig, resolvedExternalSources, skillRegistry, skillIndexLayer);
+    var initialSkillScan = skillInventoryRefresher.Refresh();
+    services.AddSingleton(skillInventoryRefresher);
 
     // Skill tools are registered post-build so ISkillContentScanner resolves from DI.
     // See SkillToolRegistration call after app.Build().
@@ -862,6 +849,8 @@ static void ConfigureDaemonServices(
 
     // Current time context layer — transient per-turn grounding for date/time-sensitive prompts
     services.AddSingleton<IContextLayerProvider, CurrentTimeContextLayer>();
+    services.AddSingleton<IGitWorkingContextInspector, GitWorkingContextInspector>();
+    services.AddSingleton<IWorkingContextSnapshotProvider, WorkingContextSnapshotProvider>();
 
     // Expose all context layers as IReadOnlyList for actor DI resolution
     services.AddSingleton<IReadOnlyList<IContextLayerProvider>>(sp =>
@@ -970,12 +959,12 @@ static void ConfigureDaemonServices(
         sp.GetRequiredService<IChatClientProvider>(),
         sp.GetRequiredService<ISystemPromptProvider>(),
         sp.GetRequiredService<IReadOnlyList<IContextLayerProvider>>(),
+        sp.GetRequiredService<IWorkingContextSnapshotProvider>(),
         sp.GetRequiredService<TimeProvider>(),
         sp.GetRequiredService<NetclawPaths>()));
 
     services.AddSingleton(sp => new SessionToolServices(
         sp.GetRequiredService<IToolExecutor>(),
-        sp.GetService<IToolAuditLogger>(),
         sp.GetRequiredService<ToolRegistry>(),
         sp.GetService<ToolAccessPolicy>(),
         sp.GetService<TrustContextDeriver>(),
@@ -1085,7 +1074,11 @@ static void ConfigureDaemonServices(
                 try
                 {
                     var drainResult = await SessionDrainHelper.DrainAsync(
-                        sessionManager, "daemon-stop", drainLogger, CancellationToken.None);
+                        sessionManager,
+                        "daemon-stop",
+                        drainLogger,
+                        CancellationToken.None,
+                        CancellationToken.None);
 
                     lifecycleNotifier.NotifyShutdown("daemon-stop", drainResult.ToNotificationContext());
                 }

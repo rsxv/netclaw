@@ -193,6 +193,8 @@ manifest or installer feed.
   to the primitive defeats the purpose. Use `.Value` for explicit access and
   explicit casts where truly needed. If a value object can silently become a
   string, it provides no more safety than a raw string.
+- **Never use the `global::` namespace qualifier in C# source.** Resolve name
+  collisions with an ordinary `using` directive or type alias instead.
 - **Optional/nullable parameters are rare by default — make dependencies
   required.** A constructor or method parameter should be optional (nullable or
   defaulted) only when its absence is a genuine, intended runtime state the
@@ -306,6 +308,11 @@ giving the model the right information). Only after ruling out both should you
 consider model capability as the cause.
 
 ## System Skills Sync Rule
+
+Runtime skill use is logical: call `skill_load` by canonical name and
+`skill_read_resource` for bundled files. Do not expose physical skill roots in
+prompt indexes or teach agents to derive `SKILL.md` paths. Direct filesystem
+inspection is reserved for explicit operator diagnostics.
 
 System skills in `feeds/skills/.system/files/` are the agent's operational
 guidance — they tell the running agent how to use features. When you change a

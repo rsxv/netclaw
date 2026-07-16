@@ -1,5 +1,41 @@
 # NetClaw Release Notes
 
+## 0.25.0-beta.5 (2026-07-16)
+
+### Features
+- **Timestamped HMAC verification for webhooks** — Webhook routes now verify request timestamps alongside HMAC signatures to prevent replay attacks, with configurable HMAC algorithm support ([#1660](https://github.com/netclaw-dev/netclaw/pull/1660))
+- **TSV support in content scanner** — Added `text/tab-separated-values` as a recognized MIME type, allowing TSV files to be scanned and processed by the content pipeline ([#1645](https://github.com/netclaw-dev/netclaw/pull/1645))
+
+### Bug Fixes
+- **Reminders rescan definitions before startup alerts** — Fixed: startup alerts could fire before reminder definitions were fully loaded, causing missed or duplicate reminders on restart ([#1653](https://github.com/netclaw-dev/netclaw/pull/1653))
+- **OpenAI client 2.12 compatibility** — Updated OpenAI provider plugin to work with the breaking API change in OpenAI SDK 2.12 (`OpenAIClientOptions` → `ResponsesClientOptions`) ([#1654](https://github.com/netclaw-dev/netclaw/pull/1654))
+
+### Improvements
+- **Tool execution pipeline refactoring** — Restructured the session tool execution pipeline with isolated invocation scope, composed execution pipeline, typed subagent context isolation, and proper lifecycle cleanup. Fixes subagent fatal spawn failures ([#1641](https://github.com/netclaw-dev/netclaw/pull/1641), [#1643](https://github.com/netclaw-dev/netclaw/pull/1643), [#1644](https://github.com/netclaw-dev/netclaw/pull/1644), [#1646](https://github.com/netclaw-dev/netclaw/pull/1646))
+
+### Dependency Updates
+- **Bump OpenAI client to 2.12** — Required for compatibility with the updated SDK API ([#1654](https://github.com/netclaw-dev/netclaw/pull/1654))
+- **Bump Microsoft.Extensions.AI** — 10.6.0 → 10.8.0 ([#1650](https://github.com/netclaw-dev/netclaw/pull/1650))
+- **Bump Microsoft.AspNetCore.DataProtection** — 10.0.9 → 10.0.10 ([#1657](https://github.com/netclaw-dev/netclaw/pull/1657))
+- **Bump Microsoft.NET.Test.Sdk** — 18.7.0 → 18.8.1 ([#1651](https://github.com/netclaw-dev/netclaw/pull/1651))
+- **Bump Mattermost.NET** — 5.0.0 → 5.0.3 ([#1626](https://github.com/netclaw-dev/netclaw/pull/1626))
+
+## 0.25.0-beta.4 (2026-07-14)
+
+### Features
+- **Preserve Git working context across sessions and subagents** — A bounded, audience-aware Git working-context snapshot (branch, worktree, repository, upstream, changed files) now stays current in the system prompt, and coding subagents inherit recent-file/project context so parent sessions merge back only confirmed successful child edits. Measured 20% → 100% success rate on a linked-worktree coding eval ([#1630](https://github.com/netclaw-dev/netclaw/pull/1630))
+- **User-written `AGENTS.md` for application-specific agent guidance** — Operators can now author `~/.netclaw/identity/AGENTS.md`, layered after Netclaw's embedded operating core and inherited by sub-agents, to give the running agent deployment-specific mission and workflow guidance. Seeded with a minimal scaffold during init without overwriting existing guidance ([#1622](https://github.com/netclaw-dev/netclaw/pull/1622))
+
+### Bug Fixes
+- **Memory curation no longer overwrites existing documents on collision** — Fixed: when a curation Create decision targeted an anchor that already had a document, the write silently overwrote the existing title, body, and classification with no history — observed 88 times in 14 days in production, including one case that destroyed an LLM-merged document. Collisions now append the new content under a dated separator instead of overwriting; a verbatim duplicate is skipped as a no-op ([#1637](https://github.com/netclaw-dev/netclaw/pull/1637))
+- **STDIO MCP server arguments no longer rewritten** — Fixed: configured STDIO MCP server arguments were being rewritten by the daemon; the daemon now preserves them as configured. Also simplified to one daemon-owned client per configured MCP server, removing Playwright-specific session-scoped process handling ([#1636](https://github.com/netclaw-dev/netclaw/pull/1636))
+
+### Improvements
+- **Logical skill access and authoritative inventory refresh** — Skill loading now resolves through logical `skill_load`/`skill_read_resource` access instead of physical skill-root paths, with native > managed-feed > external precedence. Startup, sync, watcher, and `skill_manage` inventory rebuilds are now centralized through one live-source refresher publishing atomic registry snapshots ([#1634](https://github.com/netclaw-dev/netclaw/pull/1634))
+
+### Dependency Updates
+- **Bump SkillServer to stable** — `Netclaw.SkillClient` 0.4.0-beta.4 → 0.4.0 (stable release) ([#1638](https://github.com/netclaw-dev/netclaw/pull/1638))
+
 ## 0.25.0-beta.3 (2026-07-12)
 
 ### Features
