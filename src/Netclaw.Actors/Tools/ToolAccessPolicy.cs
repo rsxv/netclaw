@@ -289,7 +289,7 @@ public sealed class ToolAccessPolicy
             return ToolAccessDecision.Deny("tool_denied_by_approval_policy");
 
         if (mode == ToolApprovalMode.Auto)
-            return ToolAccessDecision.Allow();
+            return ToolAccessDecision.Allow(ToolAllowReason.PolicyAuto);
 
         // The approval policy is authoritative for every channel — there is no
         // safe-list auto-grant for non-interactive callers. A non-interactive
@@ -301,9 +301,9 @@ public sealed class ToolAccessPolicy
         // - `patterns`: the exact blocked units shown to the user and reused by
         //   approve-once retries.
         // - `candidates`: the (verb, directory) pairs evaluated against
-        //   persisted ApprovalEntry records by the gate. The directory half is
-        //   the path argument extracted from each clause when present, falling
-        //   back to ToolExecutionContext.Cwd at evaluation time.
+        //   persisted ApprovalEntry records by the gate. Candidates include
+        //   path operands, redirect targets, and each pipeline clause.
+        //   A null directory uses ToolExecutionContext.Cwd.
         // - `candidateVerbs`: the verb-only projection of `candidates`, kept
         //   for renderers (Slack/Discord builders) that bullet-list verbs in
         //   the prompt body. Button labels stay fixed; runtime values like
@@ -333,14 +333,14 @@ public sealed class ToolAccessPolicy
         // when the matcher could extract candidate verbs cleanly — messy
         // commands always prompt regardless of verb membership. Auto-allows
         // demonstrably read-only verbs (cat/ls/grep/find/git status/...)
-        // when the cwd is inside session_dir or project_dir.
+        // when every effective directory is inside session_dir or project_dir.
         if (_safeVerbPolicy is not null
             && isShell
             && !isMessy
             && candidateVerbs.Count > 0
-            && _safeVerbPolicy.AllShortCircuit(candidateVerbs, context.Approval.Cwd, context.Invocation))
+            && _safeVerbPolicy.AllShortCircuit(candidates, context.Approval.Cwd, context.Invocation))
         {
-            return ToolAccessDecision.Allow();
+            return ToolAccessDecision.Allow(ToolAllowReason.SafeVerbInTrustedScope);
         }
 
         var options = BuildApprovalOptions(
@@ -605,10 +605,17 @@ public sealed record FeatureGates(
 
 public sealed record ToolAccessDecision(bool Allowed, string? DenyReason = null, ToolApprovalContext? ApprovalContext = null)
 {
+    /// <summary>
+    /// Gets the reason for an allowed access decision.
+    /// </summary>
+    internal ToolAllowReason? AllowReason { get; private init; }
+
     /// <summary>True when the decision is <see cref="RequiresApproval"/>.</summary>
     public bool NeedsApproval => ApprovalContext is not null && Allowed;
 
     public static ToolAccessDecision Allow() => new(true);
+
+    internal static ToolAccessDecision Allow(ToolAllowReason reason) => new(true) { AllowReason = reason };
 
     public static ToolAccessDecision Deny(string reason) => new(false, reason);
 
@@ -639,12 +646,9 @@ public sealed record ToolApprovalContext(
     // Channel adapters use this to omit the persistent-grant buttons and
     // surface the "complex command" hint.
     bool IsMessy = false,
-    // Per-clause (verb, directory) pairs evaluated against the persisted
-    // ApprovalEntry store. The directory half is the path argument
-    // extracted from the clause when present, falling back to Cwd at
-    // match time. The persistence path reads this on ApprovedAlways so
-    // "Always here" stores per-clause folder-scoped grants from the
-    // actual paths the agent touched.
+    // Per-clause (verb, directory) pairs for the persisted ApprovalEntry store.
+    // The list includes path operands, redirect targets, and pipeline clauses.
+    // A null directory uses Cwd. ApprovedAlways stores these effective scopes.
     IReadOnlyList<ApprovalCandidate>? Candidates = null);
 
 public sealed record ToolApprovalOption(ApprovalOptionKey Key, string Label);
