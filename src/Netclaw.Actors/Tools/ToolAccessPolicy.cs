@@ -18,8 +18,8 @@ public sealed class ToolAccessPolicy
     private readonly ToolConfig _toolConfig;
     private readonly EffectivePolicyDefaults _defaults;
     private readonly ToolAudienceProfileResolver _profileResolver;
-    private readonly ShellCommandPolicy? _shellCommandPolicy;
-    private readonly ToolPathPolicy? _toolPathPolicy;
+    private readonly ShellCommandPolicy _shellCommandPolicy;
+    private readonly ToolPathPolicy _toolPathPolicy;
     private readonly IShellTrustZonePolicy? _shellTrustZonePolicy;
     private readonly IToolApprovalMatcher _fileApprovalMatcher;
     private readonly FeatureGates _featureGates;
@@ -28,13 +28,17 @@ public sealed class ToolAccessPolicy
     public ToolAccessPolicy(
         ToolConfig toolConfig,
         EffectivePolicyDefaults defaults,
-        ShellCommandPolicy? shellCommandPolicy = null,
+        ShellCommandPolicy shellCommandPolicy,
+        ToolPathPolicy toolPathPolicy,
         IToolApprovalMatcher? fileApprovalMatcher = null,
-        ToolPathPolicy? toolPathPolicy = null,
         FeatureGates? featureGates = null,
         IShellTrustZonePolicy? shellTrustZonePolicy = null,
         SafeVerbList? safeVerbs = null)
     {
+        // shellCommandPolicy (deny-list) and toolPathPolicy (protected paths) are
+        // required security controls — non-nullable so a caller cannot omit them.
+        // The shell gate below dereferences them directly, so a stray null fails
+        // loudly at the point of use rather than silently skipping a check.
         _toolConfig = toolConfig;
         _defaults = defaults;
         _profileResolver = new ToolAudienceProfileResolver(toolConfig);
@@ -135,7 +139,7 @@ public sealed class ToolAccessPolicy
             return ToolAccessDecision.Deny("shell_requires_personal_context");
 
         var shellCommand = ExtractShellCommand(arguments);
-        if (_shellCommandPolicy is not null && shellCommand is not null)
+        if (shellCommand is not null)
         {
             var hardDenyDecision = _shellCommandPolicy.Evaluate(shellCommand);
             if (!hardDenyDecision.Allowed)
@@ -143,9 +147,12 @@ public sealed class ToolAccessPolicy
                     $"hard_deny_{hardDenyDecision.DenyCategory?.ToWireName() ?? "unknown"}");
         }
 
-        var workingDirectory = ExtractWorkingDirectory(arguments);
+        // All shell policy checks must use the directory that ShellTool uses.
+        // The explicit tool argument can be absent while the context supplies
+        // an active project, session, or inherited directory.
+        var workingDirectory = context.ResolveShellCwd(ExtractWorkingDirectory(arguments));
         if (shellCommand is not null
-            && _toolPathPolicy?.CommandReferencesDeniedPath(shellCommand, workingDirectory) == true)
+            && _toolPathPolicy.CommandReferencesDeniedPath(shellCommand, workingDirectory))
             return ToolAccessDecision.Deny("shell_references_protected_path");
 
         // Non-interactive channels: sandbox shell commands to trust zone paths.
@@ -267,6 +274,27 @@ public sealed class ToolAccessPolicy
         return ToolArgumentHelper.GetString(arguments, "WorkingDirectory");
     }
 
+    private static IDictionary<string, object?>? WithResolvedShellWorkingDirectory(
+        IDictionary<string, object?>? arguments,
+        string? resolvedWorkingDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(resolvedWorkingDirectory)
+            || !string.IsNullOrWhiteSpace(ExtractWorkingDirectory(arguments)))
+        {
+            return arguments;
+        }
+
+        var analysisArguments = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        if (arguments is not null)
+        {
+            foreach (var (key, value) in arguments)
+                analysisArguments[key] = value;
+        }
+
+        analysisArguments["WorkingDirectory"] = resolvedWorkingDirectory;
+        return analysisArguments;
+    }
+
     private ToolAccessDecision CheckApprovalGate(
         ToolName toolName,
         ToolExecutionContext context,
@@ -309,25 +337,27 @@ public sealed class ToolAccessPolicy
         //   the prompt body. Button labels stay fixed; runtime values like
         //   paths never enter button text because Slack caps button text at
         //   76 chars and Discord at 80.
-        var patterns = matcher.ExtractPatterns(toolName, arguments);
-        var candidates = matcher.ExtractCandidates(toolName, arguments);
+        // The shell process and the approval parser must use one cwd. The tool
+        // argument can omit it because the context supplies the project or
+        // session directory. Give that resolved value to the parser too.
+        var isShell = string.Equals(toolName.Value, ShellTool.ToolName, StringComparison.Ordinal);
+        var resolvedShellCwd = isShell
+            ? context.ResolveShellCwd(ExtractWorkingDirectory(arguments))
+            : null;
+        if (isShell)
+            context.Approval.SetCwd(resolvedShellCwd);
+
+        var analysisArguments = isShell
+            ? WithResolvedShellWorkingDirectory(arguments, resolvedShellCwd)
+            : arguments;
+        var patterns = matcher.ExtractPatterns(toolName, analysisArguments);
+        var candidates = matcher.ExtractCandidates(toolName, analysisArguments);
         var candidateVerbs = candidates
             .Select(static c => c.Verb)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
         var displayText = matcher.FormatForDisplay(toolName, arguments);
-        var isMessy = matcher.IsMessy(toolName, arguments);
-
-        // Resolve cwd up-front for shell so it's available to the safe-verb
-        // short-circuit, the shallow-cwd guard, AND the approval context that
-        // gets persisted on "Always here". Doing this only inside the
-        // short-circuit branch (as the original v2 layout did) drops cwd from
-        // ToolApprovalContext when conditions don't match — silently turning
-        // every "Always here" click into "Always anywhere" because the
-        // persistence path reads PendingToolInteraction.Cwd.
-        var isShell = string.Equals(toolName.Value, ShellTool.ToolName, StringComparison.Ordinal);
-        if (isShell)
-            context.Approval.SetCwd(context.ResolveShellCwd(ExtractWorkingDirectory(arguments)));
+        var isMessy = matcher.IsMessy(toolName, analysisArguments);
 
         // Safe-verb ∩ safe-space short-circuit. Runs only for shell and only
         // when the matcher could extract candidate verbs cleanly — messy
