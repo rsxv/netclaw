@@ -77,6 +77,9 @@ public sealed class ToolAccessPolicy
     public bool IsToolExposed(INetclawTool tool, ToolInvocationContext context)
         => IsToolExposed(tool, ResolveAudience(context));
 
+    public bool IsMcpServerExposed(McpServerName serverName, TrustAudience audience)
+        => _profileResolver.IsMcpServerAllowed(serverName, audience);
+
     internal bool IsToolExposed(INetclawTool tool, TrustAudience audience)
     {
         // Feature-disabled tools are hidden for ALL audiences
@@ -137,6 +140,12 @@ public sealed class ToolAccessPolicy
         var shellAudience = ResolveAudience(context.Invocation);
         if (shellAudience != TrustAudience.Personal)
             return ToolAccessDecision.Deny("shell_requires_personal_context");
+
+        // shell_execute authorizes the process before the job starts. This tool
+        // can only control a job with the same session, audience, and boundary.
+        // It does not create a new shell invocation or require another approval.
+        if (string.Equals(tool.Name, CheckBackgroundJobTool.ToolName, StringComparison.Ordinal))
+            return ToolAccessDecision.Allow(ToolAllowReason.BackgroundJobLifecycle);
 
         var shellCommand = ExtractShellCommand(arguments);
         if (shellCommand is not null)
@@ -352,32 +361,41 @@ public sealed class ToolAccessPolicy
             : arguments;
         var patterns = matcher.ExtractPatterns(toolName, analysisArguments);
         var candidates = matcher.ExtractCandidates(toolName, analysisArguments);
-        var candidateVerbs = candidates
-            .Select(static c => c.Verb)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
         var displayText = matcher.FormatForDisplay(toolName, arguments);
         var isMessy = matcher.IsMessy(toolName, analysisArguments);
 
-        // Safe-verb ∩ safe-space short-circuit. Runs only for shell and only
-        // when the matcher could extract candidate verbs cleanly — messy
-        // commands always prompt regardless of verb membership. Auto-allows
-        // demonstrably read-only verbs (cat/ls/grep/find/git status/...)
-        // when every effective directory is inside session_dir or project_dir.
+        IReadOnlyList<ApprovalCandidate> approvalCandidates = candidates;
+
+        // A clean shell command can combine safe candidates with candidates
+        // that need a stored grant. Remove only candidates that independently
+        // satisfy both the safe-verb and safe-space rules. The approval store
+        // must still cover every remaining candidate.
         if (_safeVerbPolicy is not null
             && isShell
             && !isMessy
-            && candidateVerbs.Count > 0
-            && _safeVerbPolicy.AllShortCircuit(candidates, context.Approval.Cwd, context.Invocation))
+            && candidates.Count > 0)
         {
-            return ToolAccessDecision.Allow(ToolAllowReason.SafeVerbInTrustedScope);
+            approvalCandidates = candidates
+                .Where(candidate => !_safeVerbPolicy.AllShortCircuit(
+                    [candidate],
+                    context.Approval.Cwd,
+                    context.Invocation))
+                .ToList();
+
+            if (approvalCandidates.Count == 0)
+                return ToolAccessDecision.Allow(ToolAllowReason.SafeVerbInTrustedScope);
         }
+
+        var candidateVerbs = approvalCandidates
+            .Select(static candidate => candidate.Verb)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
         var options = BuildApprovalOptions(
             isMessy,
             isCwdShallow: IsCwdTooShallow(context.Approval.Cwd),
             allEffectiveDirsAreSessionScratch: AllCandidatesResolveToSessionScratch(
-                candidates, context.Approval.Cwd, context.SessionDirectory),
+                approvalCandidates, context.Approval.Cwd, context.SessionDirectory),
             supportsDirectoryScope: matcher is ShellApprovalMatcher,
             isMcpTool: toolName.IsMcp);
 
@@ -389,9 +407,35 @@ public sealed class ToolAccessPolicy
             options,
             Cwd: context.Approval.Cwd,
             IsMessy: isMessy,
-            Candidates: candidates);
+            Candidates: approvalCandidates);
 
         return ToolAccessDecision.RequiresApproval(approvalContext);
+    }
+
+    internal static ToolApprovalContext NarrowShellApprovalContext(
+        ToolApprovalContext context,
+        IReadOnlyList<ApprovalCandidate> unapprovedCandidates,
+        string? sessionDirectory)
+    {
+        var candidateVerbs = unapprovedCandidates
+            .Select(static candidate => candidate.Verb)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var options = BuildApprovalOptions(
+            isMessy: false,
+            isCwdShallow: IsCwdTooShallow(context.Cwd),
+            allEffectiveDirsAreSessionScratch: AllCandidatesResolveToSessionScratch(
+                unapprovedCandidates, context.Cwd, sessionDirectory),
+            supportsDirectoryScope: true,
+            isMcpTool: false);
+
+        return context with
+        {
+            Patterns = candidateVerbs,
+            CandidateVerbs = candidateVerbs,
+            Candidates = unapprovedCandidates,
+            Options = options
+        };
     }
 
     /// <summary>

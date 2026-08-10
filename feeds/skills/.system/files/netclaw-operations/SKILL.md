@@ -3,7 +3,7 @@ name: netclaw-operations
 description: "REQUIRED when the user asks about scheduling, reminders, cron jobs, timers, background jobs, diagnostics, troubleshooting, MCP tools, daemon health, identity updates, or Netclaw capabilities and self-maintenance."
 metadata:
   author: netclaw
-  version: "2.40.0"
+  version: "2.45.0"
 ---
 
 # Netclaw Operations
@@ -104,6 +104,7 @@ view inline plus a pointer to the full output — not the whole thing:
   `shell_execute` to get around it — that just spills again.
 - **`background_job`** output goes to `~/.netclaw/jobs/{id}/output.log` (bounded);
   `check_background_job` returns a tail, and you can `file_read`/`grep` the log for the rest.
+  Netclaw deletes a terminal job's definition and logs 24 hours after completion.
 
 Reading a targeted range or grepping is always cheaper than re-running a command or
 re-reading a whole file. Secret-bearing values are redacted from all tool output.
@@ -113,6 +114,15 @@ re-reading a whole file. Secret-bearing values are redacted from all tool output
 Only a core toolset is always loaded. Use `search_tools(query)` to find additional
 or MCP tools by capability before concluding a tool doesn't exist. Full guidance:
 `skill_read_resource('netclaw-operations', 'references/tools.md')`.
+
+MCP servers can also supply workflow skills. These skills use names such as
+`mcp__gigatron__month_over_month`. Review the normal skill index first. Use
+`skill_load(name, arguments)` when one of these workflows matches the request.
+
+The argument hint marks values that the MCP server requires. Supply those
+values exactly. Do not invent a missing value. A loaded prompt can name MCP
+tools, but it does not grant them. Use the normal `search_tools` and
+`load_tool` flow for each required tool.
 
 ## MCP OAuth
 

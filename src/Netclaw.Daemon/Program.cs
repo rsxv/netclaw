@@ -540,10 +540,8 @@ static void ConfigureDaemonServices(
     services.AddSingleton(effectivePolicyDefaults);
     services.AddSingleton<TrustContextDeriver>();
 
-    // Reminders — no config surface exposed. Settings live as private
-    // consts on ReminderManagerActor / ReminderExecutionActor /
-    // ReminderScheduleParser / ReminderHistoryStore. Library defaults
-    // cover AckTimeout, MaxRetryBackoff, and MaxDeliveryAttempts.
+    // Reminder limits stay private. Netclaw sets the library acknowledgement
+    // lease in WithReminderManager because an LLM attempt can take one hour.
     services.AddSingleton<ReminderDefinitionStore>();
     services.AddSingleton<ReminderHistoryStore>();
 
@@ -814,6 +812,7 @@ static void ConfigureDaemonServices(
         sp.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping));
     services.AddSingleton<IMcpClientRuntime, McpClientRuntime>();
     services.AddSingleton<McpClientManager>();
+    services.AddSingleton<IMcpPromptSkillLoader>(sp => sp.GetRequiredService<McpClientManager>());
     services.AddHostedService(sp => sp.GetRequiredService<McpClientManager>());
     services.AddSingleton<IMcpReconnectable>(sp => sp.GetRequiredService<McpClientManager>());
     services.AddHostedService<McpReconnectionService>();
@@ -830,8 +829,10 @@ static void ConfigureDaemonServices(
     var skillIndexLayer = new SkillIndexContextLayer(skillSyncConfig);
     services.AddSingleton(skillIndexLayer);
     services.AddSingleton<IContextLayerProvider>(skillIndexLayer);
+    var skillIndexPublisher = new SkillIndexPublisher(skillRegistry, skillIndexLayer, toolAccessPolicy);
+    services.AddSingleton(skillIndexPublisher);
     var skillInventoryRefresher = new SkillInventoryRefresher(
-        paths, skillFeedsConfig, resolvedExternalSources, skillRegistry, skillIndexLayer);
+        paths, skillFeedsConfig, resolvedExternalSources, skillRegistry, skillIndexPublisher);
     var initialSkillScan = skillInventoryRefresher.Refresh();
     services.AddSingleton(skillInventoryRefresher);
 
