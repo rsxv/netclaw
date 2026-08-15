@@ -45,6 +45,7 @@ using Netclaw.Daemon.Security;
 using Netclaw.Daemon.Services;
 using Netclaw.Daemon.Lifecycle;
 using Netclaw.Daemon.Reminders;
+using Netclaw.Daemon.Skills;
 using Netclaw.Daemon.Webhooks;
 using Netclaw.Search;
 using Netclaw.Tools;
@@ -320,6 +321,8 @@ static async Task RunDaemonAsync(
     app.MapPairingEndpoints();
 
     app.MapMcpEndpoints();
+
+    app.MapSkillEndpoints();
 
     app.MapProviderOAuthEndpoints();
 
@@ -729,7 +732,16 @@ static void ConfigureDaemonServices(
         safeVerbs);
     services.AddSingleton(toolAccessPolicy);
 
-    var toolApprovalStore = new ToolApprovalStore(paths.ToolApprovalsPath, TimeProvider.System);
+    var approvalShell = shellEnvironment.Grammar switch
+    {
+        ShellGrammar.Bash => ApprovalShell.Bash,
+        ShellGrammar.PowerShell => ApprovalShell.PowerShell,
+        _ => throw new InvalidOperationException("The native shell grammar is invalid.")
+    };
+    var toolApprovalStore = new ToolApprovalStore(
+        paths.ToolApprovalsPath,
+        TimeProvider.System,
+        new ApprovalStoreMigrationContext(approvalShell));
     services.AddSingleton(toolApprovalStore);
     services.AddSingleton<IToolApprovalService, AkkaToolApprovalService>();
 

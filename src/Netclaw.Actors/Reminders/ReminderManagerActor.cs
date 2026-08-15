@@ -583,7 +583,12 @@ public sealed partial class ReminderManagerActor : ReceiveActor
             var scheduleResult = await ScheduleDefinitionAsync(definition, rescheduleFromNow: true);
             if (!scheduleResult.IsSuccess)
             {
-                _log.Warning("Failed to reschedule cron reminder '{0}': {1}", reminderId.Value, scheduleResult.ErrorMessage);
+                // Surface the failure through the shared failure path instead of only
+                // logging. The current occurrence still executes below; only the next
+                // occurrence is lost, and that loss is now alerted and counted.
+                await ReportScheduleFailureAsync(
+                    definition,
+                    scheduleResult.ErrorMessage ?? "Failed to reschedule cron reminder.");
             }
         }
 
@@ -657,7 +662,10 @@ public sealed partial class ReminderManagerActor : ReceiveActor
             if (nack)
             {
                 var response = await _client!.NackAsync(envelope, reason);
-                if (response.ResponseCode is ReminderNackResponseCode.Error or ReminderNackResponseCode.NotFound)
+                // NotFound means the occurrence is no longer awaiting ack (already
+                // settled by another client or a timeout). That is an idempotent
+                // no-op, not a settlement failure — only Error is a real failure.
+                if (response.ResponseCode is ReminderNackResponseCode.Error)
                 {
                     EmitSettlementFailure(
                         definition,
@@ -668,7 +676,9 @@ public sealed partial class ReminderManagerActor : ReceiveActor
             }
 
             var ack = await _client!.AckAsync(envelope);
-            if (ack.ResponseCode != ReminderAckResponseCode.Success)
+            // NotFound is a duplicate ack of an already-settled occurrence —
+            // idempotent no-op, not a failure.
+            if (ack.ResponseCode is ReminderAckResponseCode.Error)
             {
                 EmitSettlementFailure(
                     definition,
@@ -842,7 +852,7 @@ public sealed partial class ReminderManagerActor : ReceiveActor
             return;
         }
 
-        if (ack.ResponseCode != ReminderAckResponseCode.Success)
+        if (ack.ResponseCode is ReminderAckResponseCode.Error)
         {
             if (definition is not null)
             {
@@ -904,7 +914,7 @@ public sealed partial class ReminderManagerActor : ReceiveActor
 
         var occurrenceTerminal = nack?.ResponseCode is ReminderNackResponseCode.Failed
             or ReminderNackResponseCode.Expired;
-        if (nack?.ResponseCode is ReminderNackResponseCode.Error or ReminderNackResponseCode.NotFound)
+        if (nack?.ResponseCode is ReminderNackResponseCode.Error)
         {
             if (definition is not null)
             {
@@ -995,6 +1005,83 @@ public sealed partial class ReminderManagerActor : ReceiveActor
             $"Reminder \"{title}\" was automatically disabled after {count} consecutive failures or a terminal occurrence. Last error: {reason}");
     }
 
+    /// <summary>
+    /// Surfaces a scheduling failure — a reminder that could not compute or install
+    /// its next occurrence at an unattended reschedule site (the post-fire reschedule
+    /// or the startup reconcile). It mirrors the execution-failure path: it bumps the
+    /// shared <c>ConsecutiveFailures</c> count, auto-disables at
+    /// <see cref="FailurePauseThreshold"/>, and emits an operational alert. The channel
+    /// notice is posted only on auto-disable; the Warning alert deduplicates per reminder
+    /// in the sink, so a persistent fault does not storm the channel on every restart.
+    /// A scheduling failure never falls back to UTC — a wrong-time fire is worse than a
+    /// missed one, so an unresolvable zone fails loud instead.
+    /// </summary>
+    private async Task ReportScheduleFailureAsync(ReminderDefinition definition, string reason)
+    {
+        var count = definition.ConsecutiveFailures + 1;
+        var thresholdReached = count >= FailurePauseThreshold;
+        var title = definition.Title;
+
+        try
+        {
+            definition = definition with
+            {
+                ConsecutiveFailures = count,
+                Enabled = thresholdReached ? false : definition.Enabled,
+                TerminalOutcome = thresholdReached ? ReminderTerminalOutcome.Failed : definition.TerminalOutcome,
+                UpdatedAtMs = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds()
+            };
+            _definitionStore.Save(definition);
+        }
+        catch (Exception ex)
+        {
+            EmitSettlementFailure(definition, ex.Message, ex);
+            return;
+        }
+
+        // On disable, drop any lingering schedule (there usually is none — that is the failure).
+        if (thresholdReached)
+            await CancelScheduleOnlyAsync(definition.Id);
+
+        _log.Warning("Reminder '{0}' failed to schedule ({1}/{2}): {3}",
+            definition.Id.Value, count, FailurePauseThreshold, reason);
+
+        _notificationSink.Emit(OperationalAlert.Create(
+            _timeProvider,
+            "reminder.schedule.failed",
+            AlertType.ReminderScheduleFailed,
+            $"Reminder '{title}' failed to schedule: {reason}",
+            AlertSeverity.Warning,
+            source: definition.Id.Value,
+            context: new Dictionary<string, string>
+            {
+                ["reminderId"] = definition.Id.Value,
+                ["title"] = title,
+                ["error"] = reason
+            }));
+
+        if (!thresholdReached)
+            return;
+
+        _notificationSink.Emit(OperationalAlert.Create(
+            _timeProvider,
+            "reminder.auto_disabled",
+            AlertType.ReminderAutoDisabled,
+            $"Reminder '{title}' disabled after {count} consecutive scheduling failures",
+            AlertSeverity.Critical,
+            source: definition.Id.Value,
+            context: new Dictionary<string, string>
+            {
+                ["reminderId"] = definition.Id.Value,
+                ["title"] = title,
+                ["failureCount"] = count.ToString()
+            }));
+
+        PostFailureNoticeToChannel(
+            definition,
+            $"Reminder \"{title}\" was automatically disabled after {count} consecutive scheduling failures. Last error: {reason}");
+    }
+
     private void EmitSettlementFailure(ReminderDefinition definition, string reason, Exception? exception = null)
     {
         if (exception is null)
@@ -1061,7 +1148,18 @@ public sealed partial class ReminderManagerActor : ReceiveActor
 
                 var result = await ScheduleDefinitionAsync(definition, rescheduleFromNow: true);
                 if (result.IsSuccess)
+                {
                     restoredSchedules++;
+                }
+                else
+                {
+                    // Do not silently skip a reminder that failed to reschedule. Surface it
+                    // and keep going so one bad reminder does not abort reconcile. A single
+                    // bad startup only bumps each count by one, so it cannot mass-disable.
+                    await ReportScheduleFailureAsync(
+                        definition,
+                        result.ErrorMessage ?? "Failed to restore reminder schedule at startup.");
+                }
             }
 
             // Issue #1803: a past due time and the absence of a schedule do not prove success.

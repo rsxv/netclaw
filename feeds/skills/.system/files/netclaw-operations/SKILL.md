@@ -3,7 +3,7 @@ name: netclaw-operations
 description: "REQUIRED when the user asks about scheduling, reminders, cron jobs, timers, background jobs, diagnostics, troubleshooting, MCP tools, daemon health, identity updates, or Netclaw capabilities and self-maintenance."
 metadata:
   author: netclaw
-  version: "2.47.0"
+  version: "2.52.0"
 ---
 
 # Netclaw Operations
@@ -37,6 +37,15 @@ a reference file — load the one matching the user's intent with
 | Pair remote devices, manage access | `skill_read_resource('netclaw-operations', 'references/devices.md')` |
 | Kick the tires on Netclaw end-to-end locally | `skill_read_resource('netclaw-operations', 'references/demo-apphost.md')` |
 
+## File and Shell Selection
+
+Prefer file tools for known file reads, directory listings, and edits.
+Do not use shell for those operations unless shell behavior is requested.
+Never use `cat`, `sed`, or `ls` when a file tool can perform the requested operation.
+Use `shell_execute` for local repository search, builds, tests, VCS, or process semantics.
+Use built-in `web_search` for external discovery and `web_fetch` for page retrieval.
+Do not use shell HTTP clients for external search or retrieval.
+
 ## Project Directory
 
 `set_working_directory(path)` sets the session's project root (absolute path within
@@ -45,10 +54,14 @@ allowed roots); the project's identity file (`.netclaw/AGENTS.md`, `CLAUDE.md`,
 `skill_read_resource('netclaw-operations', 'references/projects.md')`.
 
 Use the `shell_execute` `WorkingDirectory` argument for one command in another
-directory. Do not add an inline `cd` unless changing directory is itself the
-behavior the user asked you to run or test. Use
-`set_working_directory` when later commands and subagents need the same project
-root. Do not repeat it when `[working-context]` already names that project. If
+directory. This argument and an absolute path operand provide exact scope, but
+they do not add a safe-space root. Do not add an inline `cd` unless directory
+change is the requested behavior.
+
+When available, use `set_working_directory` before shell work if several
+commands target another user-named project.
+This rule also applies to subagents and commands with absolute path operands.
+Do not repeat the call when `[working-context]` already names that project. If
 the tool rejects a path, correct the path and retry it before work continues.
 
 For Team and Personal sessions, `[working-context]` is refreshed at the start
@@ -265,6 +278,11 @@ extracted path is under the entry's directory. You don't have to call
 declares scope implicitly.
 
 The approval gate runs three layers in order:
+
+Use the announced `session_dir` as private scratch for disposable command
+output. Preserve `/tmp` or the Windows temporary root when the task explicitly
+requires that platform path. Netclaw does not automatically clean session
+scratch yet.
 
 1. **Hard-deny list** — system-protected paths. Always blocks.
 2. **Safe-verb ∩ safe-space short-circuit** — when the verb is on the curated

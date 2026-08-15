@@ -77,11 +77,38 @@ public sealed class FileSystemPromptProviderAudienceTests : IDisposable
 
         Assert.Contains("`WorkingDirectory` argument", prompt);
         Assert.Contains("Do not prefix the command with an inline `cd`", prompt);
+        Assert.Contains("Path arguments give the approval gate an exact candidate scope", prompt);
+        Assert.Contains("safe-space root", prompt);
+        Assert.DoesNotContain("path argument IS the declaration", prompt);
         Assert.Contains("before the first shell", prompt);
-        Assert.Contains("Do not repeat it when", prompt);
+        Assert.Contains("Do not repeat", prompt);
+        Assert.Contains("`project_dir` already names the correct project", prompt);
         Assert.Contains("changing directory is itself behavior", prompt);
         Assert.Contains("correct the path and retry the tool", prompt);
         Assert.Contains("Do not continue with a stale directory", prompt);
+    }
+
+    [Theory]
+    [InlineData(TrustAudience.Team)]
+    [InlineData(TrustAudience.Personal)]
+    public void Trusted_audiences_prefer_file_tools_for_known_content(TrustAudience audience)
+    {
+        var prompt = _provider.GetSystemPrompt(audience);
+
+        Assert.Contains("Prefer file tools for known file reads", prompt);
+        Assert.Contains("Do not use shell for those operations", prompt);
+        Assert.Contains("Never use `cat`, `sed`, or `ls`", prompt);
+        Assert.Contains("Use `shell_execute` for local repository search", prompt);
+        Assert.Contains("Use built-in `web_search` for external discovery", prompt);
+        Assert.Contains("Do not use shell HTTP clients", prompt);
+    }
+
+    [Fact]
+    public void Public_audience_omits_shell_selection_guidance()
+    {
+        var prompt = _provider.GetSystemPrompt(TrustAudience.Public);
+
+        Assert.DoesNotContain("Use `shell_execute` for local repository search", prompt);
     }
 
     [Fact]
