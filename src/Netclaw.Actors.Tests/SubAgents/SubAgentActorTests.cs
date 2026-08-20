@@ -32,6 +32,21 @@ public class SubAgentActorTests : TestKit
     private static readonly TimeSpan ApprovalAskTimeout = TimeSpan.FromSeconds(30);
     public static bool IsPosix => !OperatingSystem.IsWindows();
 
+    private static FunctionCallContent CreateToolCall(string callId, string name)
+        => CreateToolCall(callId, name, new Dictionary<string, object?>());
+
+    private static FunctionCallContent CreateToolCall(
+        string callId,
+        string name,
+        IDictionary<string, object?> arguments)
+    {
+        var callArguments = new Dictionary<string, object?>(arguments, StringComparer.Ordinal)
+        {
+            ["_rationale"] = "Verify the sub-agent behavior."
+        };
+        return new FunctionCallContent(callId, name, callArguments);
+    }
+
     public SubAgentActorTests(ITestOutputHelper output) : base(output: output) { }
 
     protected override void ConfigureAkka(AkkaConfigurationBuilder builder, IServiceProvider provider)
@@ -194,7 +209,8 @@ public class SubAgentActorTests : TestKit
         Assert.Contains("safety, security, trust-boundary, approval, and tool-policy rules remain mandatory", fakeClient.LastReceivedMessages[0].Text);
         Assert.Contains("Do not ask the user clarifying questions", fakeClient.LastReceivedMessages[0].Text);
         Assert.Contains("Parent-mediated tool approval", fakeClient.LastReceivedMessages[0].Text);
-        Assert.Contains("call set_working_directory once, even with absolute paths", fakeClient.LastReceivedMessages[0].Text);
+        Assert.Contains("Before tool work in another task-named project", fakeClient.LastReceivedMessages[0].Text);
+        Assert.Contains("Declare the task's first project path exactly", fakeClient.LastReceivedMessages[0].Text);
     }
 
     [Fact]
@@ -290,7 +306,7 @@ public class SubAgentActorTests : TestKit
         {
             ToolCallsOnFirstCall =
             [
-                new FunctionCallContent("call-1", "greet",
+                CreateToolCall("call-1", "greet",
                     new Dictionary<string, object?> { ["name"] = "World" })
             ]
         };
@@ -321,7 +337,7 @@ public class SubAgentActorTests : TestKit
             onExecute: context => context.AddModelInputFile(imagePath, "diagram.png", "image/png"));
         var fakeClient = new FakeChatClient
         {
-            ToolCallsOnFirstCall = [new FunctionCallContent("call-image", "load_image")]
+            ToolCallsOnFirstCall = [CreateToolCall("call-image", "load_image")]
         };
         var definition = CreateDefinition([fakeTool]);
         var agent = Sys.ActorOf(SubAgentActor.CreateProps(definition, fakeClient, PermissivePolicy()));
@@ -356,7 +372,7 @@ public class SubAgentActorTests : TestKit
         {
             ToolCallsOnFirstCall =
             [
-                new FunctionCallContent("call-context", "inspect_context")
+                CreateToolCall("call-context", "inspect_context")
             ]
         };
 
@@ -388,7 +404,7 @@ public class SubAgentActorTests : TestKit
         var fakeTool = new FakeNetclawTool("inspect_context", "ok");
         var fakeClient = new FakeChatClient
         {
-            ToolCallsOnFirstCall = [new FunctionCallContent("call-no-project", "inspect_context")]
+            ToolCallsOnFirstCall = [CreateToolCall("call-no-project", "inspect_context")]
         };
 
         var definition = CreateDefinition([fakeTool]);
@@ -415,7 +431,7 @@ public class SubAgentActorTests : TestKit
         var fakeTool = new FakeNetclawTool("inspect_context", "ok");
         var fakeClient = new FakeChatClient
         {
-            ToolCallsOnFirstCall = [new FunctionCallContent("call-cwd", "inspect_context")]
+            ToolCallsOnFirstCall = [CreateToolCall("call-cwd", "inspect_context")]
         };
 
         var agent = Sys.ActorOf(SubAgentActor.CreateProps(CreateDefinition([fakeTool]), fakeClient, PermissivePolicy()));
@@ -446,7 +462,7 @@ public class SubAgentActorTests : TestKit
         var fakeTool = new FakeNetclawTool("inspect_context", "ok");
         var fakeClient = new FakeChatClient
         {
-            ToolCallsOnFirstCall = [new FunctionCallContent("call-null-cwd", "inspect_context")]
+            ToolCallsOnFirstCall = [CreateToolCall("call-null-cwd", "inspect_context")]
         };
 
         var agent = Sys.ActorOf(SubAgentActor.CreateProps(CreateDefinition([fakeTool]), fakeClient, PermissivePolicy()));
@@ -477,7 +493,7 @@ public class SubAgentActorTests : TestKit
         var fakeTool = new FakeNetclawTool("inspect_context", "ok");
         var fakeClient = new FakeChatClient
         {
-            ToolCallsOnFirstCall = [new FunctionCallContent("call-inherit-only", "inspect_context")]
+            ToolCallsOnFirstCall = [CreateToolCall("call-inherit-only", "inspect_context")]
         };
 
         var agent = Sys.ActorOf(SubAgentActor.CreateProps(CreateDefinition([fakeTool]), fakeClient, PermissivePolicy()));
@@ -504,7 +520,7 @@ public class SubAgentActorTests : TestKit
         var firstTool = new FakeNetclawTool("inspect_context", "ok");
         var firstClient = new FakeChatClient
         {
-            ToolCallsOnFirstCall = [new FunctionCallContent("call-1", "inspect_context")]
+            ToolCallsOnFirstCall = [CreateToolCall("call-1", "inspect_context")]
         };
         var firstAgent = Sys.ActorOf(SubAgentActor.CreateProps(CreateDefinition([firstTool]), firstClient, PermissivePolicy()));
 
@@ -522,7 +538,7 @@ public class SubAgentActorTests : TestKit
         var secondTool = new FakeNetclawTool("inspect_context", "ok");
         var secondClient = new FakeChatClient
         {
-            ToolCallsOnFirstCall = [new FunctionCallContent("call-2", "inspect_context")]
+            ToolCallsOnFirstCall = [CreateToolCall("call-2", "inspect_context")]
         };
         var secondAgent = Sys.ActorOf(SubAgentActor.CreateProps(CreateDefinition([secondTool]), secondClient, PermissivePolicy()));
 
@@ -586,7 +602,7 @@ public class SubAgentActorTests : TestKit
         {
             ToolCallsOnFirstCall =
             [
-                new FunctionCallContent("call-approval", "shell_execute",
+                CreateToolCall("call-approval", "shell_execute",
                     new Dictionary<string, object?> { ["Command"] = "git push origin main" })
             ]
         };
@@ -624,7 +640,7 @@ public class SubAgentActorTests : TestKit
         {
             ToolCallsOnFirstCall =
             [
-                new FunctionCallContent("call-cwd-prompt", "shell_execute",
+                CreateToolCall("call-cwd-prompt", "shell_execute",
                     new Dictionary<string, object?> { ["Command"] = "git push origin main" })
             ]
         };
@@ -769,7 +785,11 @@ public class SubAgentActorTests : TestKit
             new FunctionCallContent(
                 declarationCallId,
                 SetWorkingDirectoryTool.ToolName,
-                new Dictionary<string, object?> { ["Path"] = worktree }),
+                new Dictionary<string, object?>
+                {
+                    ["Path"] = worktree,
+                    ["_rationale"] = "Declare the project directory before the next inspection."
+                }),
             ProjectScopeCall(retryCallId, worktree)
         ]);
         var approvalBridge = supportsApproval
@@ -803,6 +823,15 @@ public class SubAgentActorTests : TestKit
         Assert.Single(
             client.LastReceivedMessages!,
             message => message.Text.Contains($"session_dir: {sessionDirectory}", StringComparison.Ordinal));
+        Assert.Single(
+            client.LastReceivedMessages!,
+            message => message.Text.Contains(ToolChoiceGuidance.StructuredWorkspaceSelection, StringComparison.Ordinal));
+        Assert.Single(
+            client.LastReceivedMessages!,
+            message => message.Text.Contains(ToolChoiceGuidance.DirectorySelectionOrder, StringComparison.Ordinal));
+        Assert.Single(
+            client.LastReceivedMessages!,
+            message => message.Text.Contains(ToolChoiceGuidance.ShellCompositionOrder, StringComparison.Ordinal));
         Assert.DoesNotContain(
             sessionDirectory,
             client.LastReceivedMessages!.Single(message => message.Role == ChatRole.System).Text,
@@ -834,7 +863,11 @@ public class SubAgentActorTests : TestKit
             new FunctionCallContent(
                 "call-control-project",
                 SetWorkingDirectoryTool.ToolName,
-                new Dictionary<string, object?> { ["Path"] = controlledDirectory })
+                new Dictionary<string, object?>
+                {
+                    ["Path"] = controlledDirectory,
+                    ["_rationale"] = "Verify that the project scope rejects control characters."
+                })
         ]);
         var promptProvider = new ProjectPromptProvider(controlledDirectory, projectGuidance);
         var actor = Sys.ActorOf(SubAgentActor.CreatePropsWithProjectInstructionProvider(
@@ -846,7 +879,7 @@ public class SubAgentActorTests : TestKit
         var result = await actor.Ask<SubAgentResult>(
             new RunSubAgent
             {
-                Scope = SubAgentTestScope.Create(),
+                Scope = SubAgentTestScope.Create(projectDirectory: worktree),
                 Task = "Try to declare the project.",
                 Timeout = TimeSpan.FromSeconds(5)
             },
@@ -854,7 +887,7 @@ public class SubAgentActorTests : TestKit
             TestContext.Current.CancellationToken);
 
         Assert.True(result.Success, result.Output);
-        Assert.Null(result.WorkingContext!.ProjectDirectory);
+        Assert.Equal(worktree, result.WorkingContext!.ProjectDirectory);
         Assert.Equal(
             "Error: path contains an invalid control character.",
             GetLastToolResult(client.LastReceivedMessages, "call-control-project"));
@@ -863,6 +896,14 @@ public class SubAgentActorTests : TestKit
         Assert.DoesNotContain(
             projectGuidance,
             client.LastReceivedMessages!.Single(message => message.Role == ChatRole.System).Text,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            $"project_dir: {worktree}",
+            client.LastReceivedMessages!.Single(message => message.Role == ChatRole.User).Text,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            controlledDirectory,
+            client.LastReceivedMessages!.Single(message => message.Role == ChatRole.User).Text,
             StringComparison.Ordinal);
     }
 
@@ -953,11 +994,11 @@ public class SubAgentActorTests : TestKit
         var policy = CreateApprovalRequiredPolicy();
         var fakeClient = new SequencedToolCallChatClient(
             [
-                new FunctionCallContent(
+                CreateToolCall(
                     "call-approval-1",
                     "shell_execute",
                     new Dictionary<string, object?> { ["Command"] = "git push origin main" }),
-                new FunctionCallContent(
+                CreateToolCall(
                     "call-approval-2",
                     "shell_execute",
                     new Dictionary<string, object?> { ["Command"] = "git push origin main" })
@@ -974,7 +1015,7 @@ public class SubAgentActorTests : TestKit
                 Task = "Run the same approval-gated tool twice",
                 Timeout = TimeSpan.FromSeconds(5)
             },
-            TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            ApprovalAskTimeout, TestContext.Current.CancellationToken);
 
         Assert.True(result.Success);
         Assert.Equal(2, approvalBridge.RequestCount);
@@ -994,7 +1035,7 @@ public class SubAgentActorTests : TestKit
         {
             ToolCallsOnFirstCall =
             [
-                new FunctionCallContent("call-slow-approval", "shell_execute",
+                CreateToolCall("call-slow-approval", "shell_execute",
                     new Dictionary<string, object?> { ["Command"] = "git push origin main" })
             ]
         };
@@ -1038,7 +1079,7 @@ public class SubAgentActorTests : TestKit
         {
             ToolCallsOnFirstCall =
             [
-                new FunctionCallContent("call-activity-approval", "shell_execute",
+                CreateToolCall("call-activity-approval", "shell_execute",
                     new Dictionary<string, object?> { ["Command"] = "git push origin main" })
             ]
         };
@@ -1092,7 +1133,7 @@ public class SubAgentActorTests : TestKit
         {
             ToolCallsOnFirstCall =
             [
-                new FunctionCallContent("call-cancel", "shell_execute",
+                CreateToolCall("call-cancel", "shell_execute",
                     new Dictionary<string, object?> { ["Command"] = "git push origin main" })
             ]
         };
@@ -1144,9 +1185,9 @@ public class SubAgentActorTests : TestKit
         {
             ToolCallsOnFirstCall =
             [
-                new FunctionCallContent("call-par-1", "shell_execute",
+                CreateToolCall("call-par-1", "shell_execute",
                     new Dictionary<string, object?> { ["Command"] = "git push origin main" }),
-                new FunctionCallContent("call-par-2", "shell_execute",
+                CreateToolCall("call-par-2", "shell_execute",
                     new Dictionary<string, object?> { ["Command"] = "git push origin main" })
             ]
         };
@@ -1192,7 +1233,7 @@ public class SubAgentActorTests : TestKit
         {
             ToolCallsOnFirstCall =
             [
-                new FunctionCallContent("call-rejected", "shell_execute",
+                CreateToolCall("call-rejected", "shell_execute",
                     new Dictionary<string, object?> { ["Command"] = "git push origin main" })
             ]
         };
@@ -1224,7 +1265,7 @@ public class SubAgentActorTests : TestKit
         {
             ToolCallsOnFirstCall =
             [
-                new FunctionCallContent("call-stop", "shell_execute",
+                CreateToolCall("call-stop", "shell_execute",
                     new Dictionary<string, object?> { ["Command"] = "git push origin main" })
             ]
         };
@@ -1416,14 +1457,16 @@ public class SubAgentActorTests : TestKit
         => new(callId, ShellTool.ToolName, new Dictionary<string, object?>
         {
             ["Command"] = "gh api repos/example/project",
-            ["WorkingDirectory"] = "/tmp"
+            ["WorkingDirectory"] = "/tmp",
+            ["_rationale"] = "Inspect a disposable diagnostic artifact."
         });
 
     private static FunctionCallContent ProjectScopeCall(string callId, string workingDirectory)
         => new(callId, ShellTool.ToolName, new Dictionary<string, object?>
         {
             ["Command"] = ProjectScopeCommand,
-            ["WorkingDirectory"] = workingDirectory
+            ["WorkingDirectory"] = workingDirectory,
+            ["_rationale"] = "Inspect the project metric sources."
         });
 
     private static string ProjectScopeCommand =>
@@ -1514,7 +1557,7 @@ public class SubAgentActorTests : TestKit
         {
             ToolCallsOnFirstCall =
             [
-                new FunctionCallContent("call-loop", "looper")
+                CreateToolCall("call-loop", "looper")
             ],
             AlwaysReturnToolCalls = true
         };
@@ -1651,7 +1694,7 @@ public class SubAgentActorTests : TestKit
 
         // Tool-call content is substantive.
         var toolCall = StreamingResponseReader.Classify(
-            new ChatResponseUpdate { Role = ChatRole.Assistant, Contents = [new FunctionCallContent("call-1", "inspect_context")] },
+            new ChatResponseUpdate { Role = ChatRole.Assistant, Contents = [CreateToolCall("call-1", "inspect_context")] },
             anySubstantiveSeen: false);
         Assert.True(toolCall.HasSubstantiveContent);
 
@@ -1726,7 +1769,7 @@ public class SubAgentActorTests : TestKit
         {
             ToolCallsOnFirstCall =
             [
-                new FunctionCallContent(
+                CreateToolCall(
                     "call-1",
                     "browser_playwright/navigate_page",
                     new Dictionary<string, object?> { ["url"] = "https://example.com" })
@@ -1873,8 +1916,10 @@ public class SubAgentActorTests : TestKit
         var userMessage = fakeClient.LastReceivedMessages![1].Text;
         Assert.Contains("[session]", userMessage);
         Assert.Contains($"session_dir: {sessionDirectory}", userMessage);
-        Assert.Contains("For disposable shell work, always set WorkingDirectory to session_dir", userMessage);
-        Assert.Contains("explicitly requires another directory", userMessage);
+        Assert.Contains(ToolChoiceGuidance.StructuredWorkspaceSelection, userMessage, StringComparison.Ordinal);
+        Assert.Contains(ToolChoiceGuidance.DirectorySelectionOrder, userMessage, StringComparison.Ordinal);
+        Assert.Contains(ToolChoiceGuidance.ShellCompositionOrder, userMessage, StringComparison.Ordinal);
+        Assert.DoesNotContain("always set WorkingDirectory to session_dir", userMessage, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(sessionDirectory, fakeClient.LastReceivedMessages[0].Text);
     }
 
@@ -1989,12 +2034,18 @@ public class SubAgentActorTests : TestKit
     [Fact]
     public async Task Successful_first_party_edit_is_returned_as_confirmed_child_activity()
     {
-        var editTool = new FakeNetclawTool("file_edit", "Successfully edited src/Calculator.cs: replaced 1 occurrence(s)");
+        var changedPath = Path.GetFullPath(Path.Join(MissingProjectDirectory, "src", "Calculator.cs"));
+        var editTool = new FakeNetclawTool(
+            "file_edit",
+            "Successfully edited src/Calculator.cs: replaced 1 occurrence(s)",
+            onExecute: context => context.TryComplete(new ToolInvocationReceipt(
+                ToolInvocationOutcomeCategory.Success,
+                [new ToolFileActivity(changedPath, ToolFileActivityKind.Changed)])));
         var fakeClient = new FakeChatClient
         {
             ToolCallsOnFirstCall =
             [
-                new FunctionCallContent("call-edit", "file_edit",
+                CreateToolCall("call-edit", "file_edit",
                     new Dictionary<string, object?> { ["Path"] = "src/Calculator.cs" })
             ]
         };
@@ -2011,21 +2062,23 @@ public class SubAgentActorTests : TestKit
 
         Assert.True(result.Success);
         Assert.NotNull(result.WorkingContext);
-        Assert.Equal(
-            Path.GetFullPath(Path.Join(MissingProjectDirectory, "src", "Calculator.cs")),
-            Assert.Single(result.WorkingContext.ConfirmedChangedFiles));
+        Assert.Equal(changedPath, Assert.Single(result.WorkingContext.ConfirmedChangedFiles));
         Assert.Empty(result.WorkingContext.ObservedChangedFiles);
     }
 
     [Fact]
     public async Task Denied_first_party_edit_is_not_returned_as_confirmed_child_activity()
     {
-        var editTool = new FakeNetclawTool("file_edit", "Error: Permission denied: src/Calculator.cs");
+        var editTool = new FakeNetclawTool(
+            "file_edit",
+            "Error: Permission denied: src/Calculator.cs",
+            onExecute: context => context.TryComplete(
+                new ToolInvocationReceipt(ToolInvocationOutcomeCategory.AccessDenied)));
         var fakeClient = new FakeChatClient
         {
             ToolCallsOnFirstCall =
             [
-                new FunctionCallContent("call-edit", "file_edit",
+                CreateToolCall("call-edit", "file_edit",
                     new Dictionary<string, object?> { ["Path"] = "src/Calculator.cs" })
             ]
         };

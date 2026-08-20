@@ -18,6 +18,15 @@ NETCLAW_EVAL_MODEL_ID=qwen3:30b \
   ./evals/run-evals.sh
 ```
 
+Set `NETCLAW_EVAL_PROVIDER_API_KEY` when the selected provider requires an API
+key. The harness passes it only to the ephemeral provider configuration and
+does not write it into run metadata.
+
+If the value uses Netclaw's `ENC:` form, set
+`NETCLAW_EVAL_DATA_PROTECTION_KEYS` to its key-ring directory. The harness
+copies those keys only into the throwaway eval home and excludes them from
+archived results.
+
 If any of `NETCLAW_EVAL_PROVIDER_TYPE`, `NETCLAW_EVAL_PROVIDER_ENDPOINT`, or
 `NETCLAW_EVAL_MODEL_ID` is unset, the script prompts for the missing values
 on stdin (requires a terminal). In non-interactive contexts (CI, piped
@@ -71,7 +80,7 @@ log patterns** (skill loading, memory recall, checkpoint formation).
 | Identity & Self-Awareness | 5 | Bot knows its name, version, repo, session ID, and routes all identity-file concerns without a skill dependency |
 | Skill Discovery and Activation | 20 | Models load relevant file, feed, and MCP prompt skills while they skip unrelated skills |
 | Memory Pipeline | 4 | Memory recall is active, identity-vs-memory routing is correct, explicit saves use memory tools, and automatic checkpointing still fires |
-| Tool Discovery & Use | 13 | Progressive discovery, file-vs-shell selection, web-vs-local search, and timestamped webhook configuration |
+| Tool Discovery & Use | 16 | Progressive discovery, structured workspace selection, web search, and timestamped webhook configuration |
 | Grounding & Alignment | 4 | Uses tools to verify facts, admits uncertainty, and resolves announced attachment paths from the authoritative session root |
 | Autonomy & Execution | 2 | Executes tasks rather than describing them |
 | Deployment Mission | 1 | Applies the disk mission playbook, loads its required skill, and returns reviewed sales email |
@@ -120,6 +129,8 @@ formation regressions, while `memory_identity_preference_routing` and
 | `NETCLAW_EVAL_PROVIDER_TYPE` | Provider type (`ollama`, `openai`, `openai-compatible`, `openrouter`, `anthropic`) |
 | `NETCLAW_EVAL_PROVIDER_ENDPOINT` | Provider URL the container should call |
 | `NETCLAW_EVAL_MODEL_ID` | Main model id |
+| `NETCLAW_EVAL_PROVIDER_API_KEY` | Optional API key for the eval provider |
+| `NETCLAW_EVAL_DATA_PROTECTION_KEYS` | Optional key ring for an encrypted API key |
 
 If any of these is unset and stdin is a terminal, the script prompts for
 the missing values. In non-interactive contexts it fails loudly.

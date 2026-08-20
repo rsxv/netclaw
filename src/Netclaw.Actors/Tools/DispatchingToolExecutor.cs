@@ -86,6 +86,9 @@ public sealed class DispatchingToolExecutor : IToolExecutor, ISessionScratchRetr
         if (ValidateArguments(toolCall.Arguments, resolveMeta) is { } rejection)
             return rejection;
 
+        if (ToolCallMetaExtractor.ValidateRequiredRationale(toolCall.Arguments, resolveMeta) is { } rationaleError)
+            return new ToolArgumentRejection(rationaleError, "invalid_rationale");
+
         if (registered is not McpToolAdapter
             && ToolArgumentValidator.ValidateArgumentKeys(registered, toolCall.Arguments) is { } keyError)
             return new ToolArgumentRejection(keyError, "unrecognized_argument");
@@ -138,21 +141,23 @@ public sealed class DispatchingToolExecutor : IToolExecutor, ISessionScratchRetr
         if (_registry.GetByName(toolCall.Name) is null)
         {
             _logger.LogWarning("Unknown tool requested: {ToolName}", toolCall.Name);
+            context.Outputs.TryComplete(new ToolInvocationReceipt(ToolInvocationOutcomeCategory.NotFound));
             return $"Unknown tool: {toolCall.Name}";
         }
 
-        // Pre-dispatch validation runs before authorization so a doomed call
-        // never raises an approval prompt. This is the shared seam: callers that
-        // bypass the session pipeline (sub-agents, direct callers) get the same
-        // protection here. The pipeline preflights via ValidateToolCall too, so
-        // for that path this is a cheap idempotent re-check.
-        if (ValidateToolCall(toolCall) is { } rejection)
+        // Interpret the original call before authorization. This keeps required
+        // metadata available for validation and removes it before tool dispatch.
+        var interpretation = InterpretToolCall(toolCall);
+        if (interpretation.Rejection is { } rejection)
         {
             _logger.LogWarning(
                 "Rejected tool call ({Reason}): {ToolName} — {Error}",
                 rejection.DenyReason, toolCall.Name, rejection.Message);
+            context.Outputs.TryComplete(new ToolInvocationReceipt(ToolInvocationOutcomeCategory.InvalidInput));
             return rejection.Message;
         }
+
+        toolCall = interpretation.Cleaned;
 
         var authorized = await GetAuthorizedToolAsync(toolCall, context, ct);
         var tool = authorized.Tool;
@@ -168,6 +173,8 @@ public sealed class DispatchingToolExecutor : IToolExecutor, ISessionScratchRetr
                     shellAnalysis,
                     ct)
                 : await tool.ExecuteAsync(toolCall.Arguments, context.Invocation, ct);
+
+            context.Outputs.TryComplete(new ToolInvocationReceipt(ToolInvocationOutcomeCategory.Success));
 
             var redacted = SecretOutputRedactor.Redact(result);
 
@@ -194,6 +201,7 @@ public sealed class DispatchingToolExecutor : IToolExecutor, ISessionScratchRetr
         }
         catch (Exception ex)
         {
+            CompleteExceptionOutcome(context, ex, ct);
             sw.Stop();
             _logger.LogError(ex,
                 "Tool execution failed: {ToolName} ({Duration}ms)",
@@ -224,19 +232,24 @@ public sealed class DispatchingToolExecutor : IToolExecutor, ISessionScratchRetr
         if (_registry.GetByName(toolCall.Name) is null)
         {
             _logger.LogWarning("Unknown tool requested: {ToolName}", toolCall.Name);
+            context.Outputs.TryComplete(new ToolInvocationReceipt(ToolInvocationOutcomeCategory.NotFound));
             yield return new ToolCompletedUpdate($"Unknown tool: {toolCall.Name}");
             yield break;
         }
 
-        // Same pre-authorization validation as the non-streaming path.
-        if (ValidateToolCall(toolCall) is { } rejection)
+        // Use the same atomic validation and extraction as the non-streaming path.
+        var interpretation = InterpretToolCall(toolCall);
+        if (interpretation.Rejection is { } rejection)
         {
             _logger.LogWarning(
                 "Rejected tool call ({Reason}): {ToolName} — {Error}",
                 rejection.DenyReason, toolCall.Name, rejection.Message);
+            context.Outputs.TryComplete(new ToolInvocationReceipt(ToolInvocationOutcomeCategory.InvalidInput));
             yield return new ToolCompletedUpdate(rejection.Message);
             yield break;
         }
+
+        toolCall = interpretation.Cleaned;
 
         // Authorization throws (ToolApprovalRequiredException / ToolAccessDeniedException)
         // before the first item is produced; the tool-execution pipeline handles
@@ -258,6 +271,7 @@ public sealed class DispatchingToolExecutor : IToolExecutor, ISessionScratchRetr
             {
                 case ToolCompletedUpdate completed:
                     sw.Stop();
+                    context.Outputs.TryComplete(new ToolInvocationReceipt(ToolInvocationOutcomeCategory.Success));
                     var redacted = SecretOutputRedactor.Redact(completed.Result);
                     var modelResult = tool.SuppressOutputRedaction ? completed.Result : redacted;
                     modelResult = await ToolOutputSpill.BoundAndSpillAsync(
@@ -275,6 +289,24 @@ public sealed class DispatchingToolExecutor : IToolExecutor, ISessionScratchRetr
                     break;
             }
         }
+    }
+
+    private static void CompleteExceptionOutcome(
+        ToolExecutionContext context,
+        Exception exception,
+        CancellationToken callerToken)
+    {
+        if (exception is OperationCanceledException && callerToken.IsCancellationRequested)
+            return;
+
+        var category = exception switch
+        {
+            UnauthorizedAccessException => ToolInvocationOutcomeCategory.AccessDenied,
+            FileNotFoundException or DirectoryNotFoundException => ToolInvocationOutcomeCategory.NotFound,
+            IOException or TimeoutException => ToolInvocationOutcomeCategory.TransientFailure,
+            _ => ToolInvocationOutcomeCategory.TransientFailure
+        };
+        context.Outputs.TryComplete(new ToolInvocationReceipt(category));
     }
 
     /// <summary>

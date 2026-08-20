@@ -142,10 +142,21 @@ public sealed class ToolAccessPolicy
 
         if (tool is McpToolAdapter mcp)
             return _profileResolver.IsMcpServerAllowed(new McpServerName(mcp.ServerName), audience)
-                && _profileResolver.IsMcpToolAllowed(new McpServerName(mcp.ServerName), new ToolName(mcp.BareToolName), audience);
+                && _profileResolver.IsMcpToolAllowed(
+                    new McpServerName(mcp.ServerName),
+                    new ToolName(mcp.BareToolName),
+                    audience)
+                && _profileResolver.ResolveProfile(audience).ApprovalPolicy?.GetEffectiveMode(mcp.Name)
+                    != ToolApprovalMode.Deny;
 
         if (!_profileResolver.IsToolAllowed(new ToolName(tool.Name), audience))
             return false;
+
+        if (_profileResolver.ResolveProfile(audience).ApprovalPolicy?.GetEffectiveMode(tool.Name)
+            == ToolApprovalMode.Deny)
+        {
+            return false;
+        }
 
         if (IsShellCoupledTool(tool))
             return ResolveShellMode() == ShellExecutionMode.HostAllowed && audience == TrustAudience.Personal;
