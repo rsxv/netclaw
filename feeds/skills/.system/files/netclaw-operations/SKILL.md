@@ -3,7 +3,7 @@ name: netclaw-operations
 description: "REQUIRED when the user asks about scheduling, reminders, cron jobs, timers, background jobs, diagnostics, troubleshooting, MCP tools, daemon health, identity updates, or Netclaw capabilities and self-maintenance."
 metadata:
   author: netclaw
-  version: "2.74.4"
+  version: "2.75.3"
 ---
 
 # Netclaw Operations
@@ -90,6 +90,11 @@ Choose directories in this order:
 
 Typed `WorkingDirectory` and absolute operands give exact scope but add no safe-space root.
 Program-specific directory options do not replace `WorkingDirectory`.
+If shell advice names `use_shell_working_directory`, remove the leading `cd` from a new call.
+Set `WorkingDirectory` to the suggested child directory. The original call did not run.
+The new call passes normal approval policy.
+If the task needs the original shell directory behavior, keep the command and set `WorkingDirectory` to `project_dir`.
+That explicit project scope skips repeated advice. The original command still passes normal approval policy.
 
 When available, call `set_working_directory` before the first tool call for
 another user-named project.
@@ -225,6 +230,22 @@ values exactly. Do not invent a missing value. A loaded prompt can name MCP
 tools, but it does not grant them. Use the normal `search_tools` and
 `load_tool` flow for each required tool.
 
+### MCP Result Artifacts
+
+An MCP tool can return a file artifact with its text result. Netclaw applies the
+same supported file types, magic-byte checks, and size limit as other content.
+
+A verified artifact reaches the user through the normal file-output path. It
+also reaches the active model when the media catalog and model modality permit
+that input.
+
+A text-only model does not receive image bytes. The result keeps the file for
+the user and states the modality limit.
+
+Netclaw rejects invalid, unsupported, or oversized artifact data. The result
+keeps readable text and includes a rejection note. Do not decode Base64 from the
+tool text or use shell to bypass that rejection.
+
 ## MCP OAuth
 
 For HTTP/SSE MCP servers, the Model Context Protocol .NET SDK owns PKCE,
@@ -267,6 +288,19 @@ The SDK redirect URI is
 a pre-registered redirect URI, use the configured `Daemon.Port`, not a fixed
 default port.
 
+Some providers require a pre-registered confidential client.
+Caution: command arguments can appear in process inspection and shell history.
+Run the next command only on a trusted host.
+
+```bash
+netclaw mcp add --transport http --client-id <id> --client-secret <secret> <name> <url>
+```
+
+Netclaw stores the secret in encrypted configuration.
+Do not put the secret in `netclaw.json`.
+A client ID without a secret remains valid for public clients.
+The configured identity stays authoritative during token exchange, refresh, and daemon restart.
+
 A configured `Authorization` header takes precedence over SDK OAuth. Netclaw
 sends that header unchanged, does not start SDK OAuth after a challenge, and
 rejects `netclaw mcp auth <name>` until the header is removed. Check or rotate the
@@ -302,6 +336,11 @@ with that provider and set it with `netclaw mcp add --client-id <id> ...`.
 | `AwaitingAuth` | No usable OAuth credential is bound to this resource, or an access token expired without a refresh token. Run `netclaw mcp auth <name>`. Startup and background reconnects never open a browser or block. |
 | `AuthFailed` | The server rejected credentials that were supplied. Reauthorize SDK-managed OAuth, or check the configured `Authorization` header if it owns auth. |
 | `Unreachable` | A non-auth transport, network, timeout, or initialization failure prevented connection. Check the endpoint and daemon logs. |
+
+At startup, the daemon connects enabled MCP servers concurrently. It waits
+for each initial attempt before it reports ready. A failed server has its own
+status; other server tools remain available. Use `netclaw mcp list` to inspect
+each result.
 
 ### Diagnose failures
 
@@ -344,11 +383,11 @@ label the persistent choice `Always allow this tool` rather than the
 shell-oriented `Always anywhere`. Other non-shell tools also omit `Always here`
 because their approval matchers do not consume directory scope.
 
-Approvals are typed `(verb, directory)` pairs in `tool-approvals.json`:
+Shell approvals store a typed phrase and a scope in `tool-approvals.json`:
 
 - **verb** — the command head plus subcommand chain only (e.g. `git push`,
   `grep`, `freshdesk`). No flags, no path arguments.
-- **directory** — the directory the grant applies to. Sourced two ways:
+- **directory** — the path field for folder and global grants. Netclaw sets it from:
   - **Path argument** in the original command (`find /repo`, `ls /var/log`,
     `cat ~/.bashrc`). The path argument is the directory; for file targets
     the parent directory is used so `cat ~/.bashrc` scopes to `~`.
@@ -356,11 +395,33 @@ Approvals are typed `(verb, directory)` pairs in `tool-approvals.json`:
   - **`null`** for the global wildcard ("approve this verb in any
     directory") — only set by `Always anywhere`.
 
+`This repository` stores a distinct Git repository scope. It applies to
+registered worktrees of one repository. Netclaw derives this scope from each
+grant-bearing command candidate. The request directory supplies scope only
+when a candidate has no directory. Netclaw checks Git registration for each
+use. A folder grant keeps its path scope. An unapproved verb or a path outside
+the repository still needs approval.
+The scope supports an ordinary `.git` directory and registered linked worktrees.
+A main checkout with `--separate-git-dir` does not receive this choice.
+
 **Folder-scoped trust compounds.** An entry on `(find, /home/user/repo)`
 auto-allows `find /home/user/repo/.netclaw -name X` because the candidate's
 extracted path is under the entry's directory. You don't have to call
 `set_working_directory` for this — running a command with a path argument
 declares scope implicitly.
+
+For a complete static Bash list with an exact directory change, Netclaw checks
+each command in each reachable exact directory. A failed `cd` can leave a later
+command in the original directory. Each unapproved verb still needs approval.
+Dynamic effects and linked directories retain exact approval.
+
+Netclaw can reuse an approval for a bounded shell assignment.
+The grant stores a digest of the exact assignment facts.
+It does not store the assignment name or value.
+A changed assignment needs a separate approval.
+An unqualified grant cannot cover an assignment-qualified command.
+The reviewed-safe list does not cover an assignment-qualified command.
+An incomplete assignment gets only `Once` and `Deny`.
 
 The approval gate runs three layers in order:
 
@@ -380,12 +441,14 @@ Netclaw does not automatically clean managed temporary storage yet.
    network-writing verbs (`gh api`, `curl`), and environment/process-inspection
    verbs (`printenv`, `ps`) are never on the list — the safe-space gate
    cannot scope a verb that dumps the environment or the process table.
-3. **Interactive prompt** — everything else. Five buttons:
+3. **Interactive prompt** — everything else. A registered worktree can show six choices:
    - **Once** — run this one time, persist nothing.
    - **This chat** — allow the verbs in this directory for the rest of the
      session.
    - **Always here** — persist `(verb, effective directory)`. The
      "directory" is the command's path argument when present, else cwd.
+   - **This repository** — persist a grant for this Git repository.
+     Registered sibling worktrees can use it for the same phrase.
    - **Always anywhere** — persist `(verb, null)` global wildcard.
      Danger style.
    - **Deny** — refuse this call only.
@@ -406,6 +469,19 @@ failed or was superseded); the session then posts a visible "approval prompt has
 expired" notice rather than silently dropping the click. If a user reports a
 stale button, ask them to re-issue the request.
 
+During a graceful stop, the session can stop a tool task that waits only for
+journaled approval prompts. The session waits for that task to stop before it
+acknowledges drain. The daemon keeps the existing approval prompt. The original
+requester can approve it after restart. They can use its button or a text response. The UI
+can temporarily lag the session state. Shutdown cancellation does not mean
+the approval expired.
+An active tool with a possible external effect keeps the bounded drain path.
+
+An interrupted model call can create a short-lived restart reminder. The
+session restores accepted input and its original authority from the journal.
+The reminder expires ten minutes after the interruption. A completed turn,
+partial reply, or possible tool effect does not create this reminder.
+
 **Why you may not see a prompt at all.** If the user invokes a read-only verb
 (say `grep`) with a path argument under a tree the operator has previously
 trusted, the safe-verb short-circuit applies and there is no prompt. This
@@ -414,9 +490,9 @@ implicit. Mutating verbs in the same directory still prompt.
 
 **When the prompt offers fewer buttons.** Two cases:
 
-- **Complex commands** (bash control-flow like `for/while/done`, unbalanced
-  quotes/brackets) get only `Once` and `Deny`. The matcher cannot extract a
-  clean verb chain to remember, so persistence is structurally impossible.
+- **Unresolved commands** get only `Once` and `Deny`.
+  These commands include dynamic assignments and unknown path facts.
+  The matcher cannot extract a complete reusable identity.
 - **Shallow cwd** (e.g. `/etc/`, `/`) hides `Always here` only. Persisting a
   too-shallow root would grant the verb across most of the filesystem;
   `This chat` and `Always anywhere` remain available.

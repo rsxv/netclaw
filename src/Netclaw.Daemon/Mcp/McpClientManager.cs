@@ -44,6 +44,7 @@ internal sealed class McpClientManager : IHostedService, IDisposable, IMcpToolIn
     private readonly IOperationalNotificationSink _notificationSink;
     private readonly TimeProvider _timeProvider;
     private readonly IMcpClientRuntime _clientRuntime;
+    private readonly McpArtifactMaterializer _artifactMaterializer;
     private readonly ILogger<McpClientManager> _logger;
     private readonly int _maxToolDescriptionChars;
     private readonly int _maxToolSchemaWarnChars;
@@ -89,6 +90,7 @@ internal sealed class McpClientManager : IHostedService, IDisposable, IMcpToolIn
         IOperationalNotificationSink notificationSink,
         TimeProvider timeProvider,
         IMcpClientRuntime clientRuntime,
+        McpArtifactMaterializer artifactMaterializer,
         ILogger<McpClientManager> logger,
         SessionConfig sessionConfig)
     {
@@ -105,6 +107,7 @@ internal sealed class McpClientManager : IHostedService, IDisposable, IMcpToolIn
         _notificationSink = notificationSink;
         _timeProvider = timeProvider;
         _clientRuntime = clientRuntime;
+        _artifactMaterializer = artifactMaterializer;
         _logger = logger;
         _maxToolDescriptionChars = sessionConfig.Tuning.MaxToolDescriptionChars;
         _maxToolSchemaWarnChars = sessionConfig.Tuning.MaxToolSchemaWarnChars;
@@ -130,6 +133,7 @@ internal sealed class McpClientManager : IHostedService, IDisposable, IMcpToolIn
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
+        var connections = new List<Task<bool>>(_serverEntries.Count);
         foreach (var (name, entry) in _serverEntries)
         {
             var serverName = new McpServerName(name);
@@ -142,8 +146,10 @@ internal sealed class McpClientManager : IHostedService, IDisposable, IMcpToolIn
 
             var observed = lifecycle.Snapshot;
             if (observed is not null)
-                await ReconnectAsync(lifecycle, entry, observed, cancellationToken, null);
+                connections.Add(ReconnectAsync(lifecycle, entry, observed, cancellationToken, null));
         }
+
+        await Task.WhenAll(connections);
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
@@ -1112,13 +1118,36 @@ internal sealed class McpClientManager : IHostedService, IDisposable, IMcpToolIn
             ? new AIFunctionArguments(arguments)
             : null;
         var result = await _clientRuntime.InvokeAsync(function, aiArgs, ct);
+        var projection = McpToolResultFormatter.Project(result, qualifiedToolName);
 
-        if (McpToolResultFormatter.TryGetErrorDetail(result, out var detail))
+        if (projection.IsError)
         {
-            ReportToolFailure(serverName, qualifiedToolName, detail);
+            ReportToolFailure(serverName, qualifiedToolName, projection.ErrorDetail);
+            return McpToolResultFormatter.FormatWithReceipt(projection, context);
         }
 
-        return McpToolResultFormatter.FormatWithReceipt(result, qualifiedToolName, context);
+        var materializationNotes = await _artifactMaterializer.MaterializeAsync(
+            projection.Artifacts,
+            qualifiedToolName,
+            context,
+            ct);
+        return AppendArtifactNotes(projection.Text, projection.ArtifactNotes, materializationNotes);
+    }
+
+    private static string AppendArtifactNotes(
+        string text,
+        IReadOnlyList<string> projectionNotes,
+        IReadOnlyList<string> materializationNotes)
+    {
+        if (projectionNotes.Count == 0 && materializationNotes.Count == 0)
+            return text;
+
+        return string.Join(
+            "\n",
+            new[] { text }
+                .Concat(projectionNotes)
+                .Concat(materializationNotes)
+                .Where(static part => !string.IsNullOrWhiteSpace(part)));
     }
 
     /// <summary>
@@ -1251,7 +1280,7 @@ internal sealed class McpClientManager : IHostedService, IDisposable, IMcpToolIn
             oauthCache = _credentialStore.CreateTokenCache(
                 name,
                 entry.Url!,
-                entry.OAuthClientId,
+                CreateConfiguredOAuthIdentity(name, entry),
                 authorizationFlow is not null);
         }
 
@@ -1263,7 +1292,7 @@ internal sealed class McpClientManager : IHostedService, IDisposable, IMcpToolIn
             // client records for servers the operator never opted into.
             if (oauthCache is not null
                 && authorizationFlow is not null
-                && _credentialStore.GetIdentity(oauthCache).ClientId is null)
+                && _credentialStore.GetIdentity(oauthCache) is null)
             {
                 var registered = await _registrar.TryRegisterAsync(
                     name,
@@ -1416,8 +1445,8 @@ internal sealed class McpClientManager : IHostedService, IDisposable, IMcpToolIn
         return new ClientOAuthOptions
         {
             RedirectUri = BuildRedirectUri(),
-            ClientId = entry.OAuthClientId ?? identity.ClientId,
-            ClientSecret = entry.OAuthClientId is null ? identity.ClientSecret : null,
+            ClientId = identity?.ClientId,
+            ClientSecret = identity?.ClientSecret?.Value,
             Scopes = ParseScopes(entry.OAuthScope),
             TokenCache = cache,
 
@@ -1428,6 +1457,27 @@ internal sealed class McpClientManager : IHostedService, IDisposable, IMcpToolIn
             // register against public-client-only servers (csharp-sdk#1611). A non-null
             // ClientId here short-circuits the SDK's registration path entirely.
         };
+    }
+
+    private static McpOAuthClientIdentity? CreateConfiguredOAuthIdentity(
+        McpServerName serverName,
+        McpServerEntry entry)
+    {
+        if (entry.OAuthClientId is { } clientId)
+        {
+            return new McpOAuthClientIdentity(
+                clientId,
+                entry.OAuthClientSecret,
+                dynamicClientRegistration: false);
+        }
+
+        if (entry.OAuthClientSecret is not null)
+        {
+            throw new InvalidOperationException(
+                $"MCP server '{serverName.Value}' has an OAuth client secret without a client ID.");
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -1705,12 +1755,15 @@ internal sealed class McpClientManager : IHostedService, IDisposable, IMcpToolIn
                 return;
             }
 
+            var hasConfiguredClientSecret = _serverEntries.TryGetValue(serverName, out var entry)
+                                            && !string.IsNullOrWhiteSpace(entry.OAuthClientId)
+                                            && !entry.OAuthClientSecret.IsNullOrEmpty();
             var missing = new List<string>();
             if (string.IsNullOrWhiteSpace(record.AuthorizationServer))
                 missing.Add("AuthorizationServer");
             if (string.IsNullOrWhiteSpace(record.ClientId))
                 missing.Add("ClientId");
-            if (record.ClientSecret is null)
+            if (record.ClientSecret is null && !hasConfiguredClientSecret)
                 missing.Add("ClientSecret");
             if (string.IsNullOrWhiteSpace(record.TokenEndpointAuthMethod))
                 missing.Add("TokenEndpointAuthMethod");
@@ -1722,7 +1775,8 @@ internal sealed class McpClientManager : IHostedService, IDisposable, IMcpToolIn
             _logger.LogWarning(
                 "OAuth refresh failure diagnostics for MCP server '{Name}': stored record has refreshToken={HasRefresh}, " +
                 "accessToken={HasAccess}, expiresAt={ExpiresAt:o}, dynamicClientRegistration={Dcr}, " +
-                "bindingFieldsMissing=[{Missing}], authorizationServer={AuthServer}. " +
+                "configuredClientSecret={HasConfiguredClientSecret}, bindingFieldsMissing=[{Missing}], " +
+                "authorizationServer={AuthServer}. " +
                 "The SDK 2.0 refresh gate requires AuthorizationServer, ClientId, ClientSecret, and " +
                 "TokenEndpointAuthMethod to all match the live provider; missing fields mean refresh is " +
                 "never attempted and every expiration falls through to interactive auth (the 'null " +
@@ -1732,6 +1786,7 @@ internal sealed class McpClientManager : IHostedService, IDisposable, IMcpToolIn
                 hasAccessToken,
                 expiresAt,
                 record.DynamicClientRegistration,
+                hasConfiguredClientSecret,
                 string.Join(", ", missing),
                 record.AuthorizationServer ?? "<null>");
         }

@@ -6,6 +6,7 @@
 using Akka.Actor;
 using Akka.Hosting;
 using Akka.Pattern;
+using System.Globalization;
 using Microsoft.Extensions.AI;
 using Netclaw.Actors.Hosting;
 using Netclaw.Actors.Tools;
@@ -17,19 +18,56 @@ using Xunit;
 
 namespace Netclaw.Actors.Tests.Tools;
 
-internal sealed record ObservedApproval(
-    ToolAuthorizationOutcome Outcome,
-    ToolAllowReason? AllowReason,
-    string? DenyReason,
+internal enum ApprovalOutcome
+{
+    Allowed,
+    RequiresApproval,
+    RequiresAgentCorrection,
+    Denied
+}
+
+internal enum ApprovalAllowReason
+{
+    PolicyAuto,
+    BackgroundJobLifecycle,
+    ReviewedSafePolicy,
+    ApprovalExemptShellCandidates,
+    StoredApproval,
+    OneTimeApproval
+}
+
+internal enum ApprovalCorrection
+{
+    ManagedTemporaryDirectory,
+    NativeTool,
+    ProjectDirectory,
+    ShellWorkingDirectory
+}
+
+internal sealed record ApprovalPromptObservation(
     IReadOnlyList<string> CandidateVerbs,
-    bool? IsMessy,
-    IReadOnlyList<string> ApprovalMatches);
+    bool IsMessy,
+    IReadOnlyList<string> OptionKeys);
+
+internal sealed record ApprovalObservation(
+    ApprovalOutcome Outcome,
+    ApprovalAllowReason? AllowReason,
+    string? DenyReason,
+    ApprovalCorrection? AgentCorrection,
+    ApprovalPromptObservation? Prompt,
+    int ApprovalChecks,
+    IReadOnlyList<string> ApprovalMatches,
+    IReadOnlyList<string> TraceRows,
+    IReadOnlyList<(int CandidateId, string Coverage)> CandidateCoverage);
 
 internal sealed record ShellApprovalHarnessScope(
     string ProjectDirectory,
     string SessionDirectory,
     string InvocationSessionId,
-    IReadOnlyList<string> OneTimeApprovalKeys);
+    IReadOnlyList<string> OneTimeApprovalKeys)
+{
+    internal string? RepositoryGrantWorktree { get; init; }
+}
 
 internal sealed class ShellApprovalHarness : IAsyncDisposable
 {
@@ -126,53 +164,42 @@ internal sealed class ShellApprovalHarness : IAsyncDisposable
             timeProvider,
             migrationContext: new ApprovalStoreMigrationContext(approvalShell),
             lockTimeout: TimeSpan.Zero);
-        var approvalActor = CreateApprovalActor(actorSystem, store);
-        var approvalService = CreateApprovalService(approvalActor);
 
         var persistentSeeds = approvals.Seeds
             .Where(seed => seed.Source == ApprovalSeedSource.Persistent)
             .ToList();
-        // Seed all persistent grants in ONE Ask per audience instead of one Ask
-        // per grant. The actor's RecordStructuredToolApproval handler persists a
-        // whole grant list in a single locked, atomic write (ToolApprovalStore.AddApprovals
-        // -> one SaveLocked), so the resulting store state is equivalent to N sequential seed
-        // messages (the only divergence is per-entry CreatedAt stamping under a real clock,
-        // which is unobservable here: fixture tests run on a frozen FakeTimeProvider and no
-        // harness test asserts seed timestamps). It removes N-1 synchronous WriteThrough +
-        // Flush(flushToDisk: true) file
-        // rewrites from the test's critical path: the Ask deadline is a hard 5s wall clock,
-        // and under full-suite parallel load on Windows CI (Defender scanning each new
-        // tool-approvals.json in a fresh %TEMP% tree) per-write latency of the heaviest case
-        // (D10, 5 seeds) occasionally exceeded it. Grouping by audience preserves the
-        // per-seed audience semantics for every harness caller.
+        // Seed persistent grants SYNCHRONOUSLY into the store, before the actor
+        // exists. The actor re-loads the store fresh on each read, so a direct
+        // write is behaviorally identical to routing through the actor's
+        // RecordStructuredToolApproval handler. Critically, this moves the
+        // blocking WriteThrough + Flush(flushToDisk: true) fsync OFF the actor's
+        // 5s Ask deadline: it now runs on this test thread with no wall-clock
+        // budget, so disk latency (Windows CI Defender scanning each new
+        // tool-approvals.json in a fresh %TEMP% tree, full-suite parallel load)
+        // can no longer expire the Ask and surface as an AskTimeoutException on
+        // whichever test's seed lands in the contended window.
         foreach (var audienceGroup in persistentSeeds.GroupBy(seed => seed.Audience))
         {
-            await approvalService.RecordApprovalCandidatesAsync(
-                (ToolApprovalSessionId)"seed/persistent",
+            store.TryAddApprovals(
                 audienceGroup.Key,
-                new ToolName(ShellTool.ToolName),
+                ShellTool.ToolName,
                 audienceGroup
-                    .Select(seed => CreateGrant(seed.Pattern, approvalShell, ResolveDirectory(
-                        seed.Directory,
-                        approvalProjectDirectory,
-                        approvalSessionDirectory,
-                        approvalExternalDirectory)))
-                    .ToList(),
-                persistent: true,
-                ct);
+                    .Select(seed => CreatePersistentEntry(
+                        seed.Directory == ApprovalDirectoryShape.Repository
+                            ? CreateRepositoryGrant(
+                                seed.Pattern,
+                                approvalShell,
+                                scope?.RepositoryGrantWorktree ?? approvalProjectDirectory)
+                            : CreateGrant(seed.Pattern, approvalShell, ResolveDirectory(
+                                seed.Directory,
+                                approvalProjectDirectory,
+                                approvalSessionDirectory,
+                                approvalExternalDirectory))))
+                    .ToList());
         }
 
-        if (persistentSeeds.Count > 0)
-        {
-            // The stop waits for a persistence flush and the actor teardown.
-            // The budget bounds a multi-hop shutdown under a starved CI
-            // scheduler. It does not measure correctness. Every shell-approval
-            // test goes through this shared harness, so a short budget makes a
-            // whole suite flake at once.
-            await approvalActor.GracefulStop(TimeSpan.FromSeconds(15));
-            approvalActor = CreateApprovalActor(actorSystem, store);
-            approvalService = CreateApprovalService(approvalActor);
-        }
+        var approvalActor = CreateApprovalActor(actorSystem, store);
+        var approvalService = CreateApprovalService(approvalActor);
 
         foreach (var seed in approvals.Seeds.Where(seed => seed.Source == ApprovalSeedSource.Session))
         {
@@ -266,26 +293,156 @@ internal sealed class ShellApprovalHarness : IAsyncDisposable
             directory);
     }
 
-    public async Task<ObservedApproval> EvaluateAsync(CancellationToken ct)
+    private static ToolApprovalGrant CreateRepositoryGrant(
+        string pattern,
+        ApprovalShell shell,
+        string worktree)
+    {
+        if (!GitRepositoryApprovalScope.TryResolve(worktree, out var scope))
+            throw new InvalidOperationException("The test repository worktree is not registered.");
+
+        return CreateGrant(pattern, shell, directory: null) with
+        {
+            Repository = scope!.CommonDirectory,
+            RepositoryWorktree = worktree,
+        };
+    }
+
+    // Mirrors ToolApprovalActor.TryCreateEntries for the persistent-shell path.
+    // Replicating this small slice lets the harness seed the store directly in
+    // CreateAsync without routing through the actor's 5s-Ask persistence write
+    // (the Windows CI flake). Only the shell cases the harness seeds are handled;
+    // the actor's non-shell and session-entry branches are not reachable here.
+    private static ApprovalEntry CreatePersistentEntry(ToolApprovalGrant grant)
+    {
+        if (grant.Candidate.Shell is not { } shell ||
+            grant.Candidate.VerbTokens is not { } tokens)
+        {
+            throw new InvalidOperationException("Persistent shell seed lacks shell/verb tokens.");
+        }
+
+        if (grant.Repository is not null)
+        {
+            if (grant.RepositoryWorktree is null
+                || !GitRepositoryApprovalScope.TryResolveCandidate(
+                    grant.Candidate.Directory,
+                    grant.RepositoryWorktree,
+                    out var scope)
+                || !ToolApprovalEntryComparer.Equals(scope!.CommonDirectory, grant.Repository)
+                || !PathUtility.AreEquivalentPaths(scope.WorktreeRoot, grant.RepositoryWorktree))
+            {
+                throw new InvalidOperationException("Repository grant scope is invalid.");
+            }
+
+            return ApprovalEntry.CreateRepositoryTokenPrefix(shell, tokens, grant.Repository);
+        }
+
+        return ApprovalEntry.CreateTokenPrefix(shell, tokens, grant.Directory);
+    }
+
+    public async Task<ApprovalObservation> EvaluateAsync(CancellationToken ct)
     {
         var decision = await _executor.EvaluateAuthorizationAsync(_toolCall, _context, ct);
+        return Observe(decision, ApprovalService.CheckCount);
+    }
+
+    private static ApprovalObservation Observe(
+        ToolAuthorizationDecision decision,
+        int approvalChecks)
+    {
         var approvalContext = decision.ApprovalContext;
 
-        return new ObservedApproval(
-            decision.Outcome,
-            decision.AllowReason,
+        return new ApprovalObservation(
+            MapOutcome(decision.Outcome),
+            decision.AllowReason is { } reason ? MapAllowReason(reason) : null,
             decision.DenyReason,
-            approvalContext?.CandidateVerbs ?? [],
-            approvalContext?.IsMessy,
+            MapCorrection(decision.AgentCorrection),
+            approvalContext is null
+                ? null
+                : new ApprovalPromptObservation(
+                    approvalContext.CandidateVerbs,
+                    approvalContext.IsMessy,
+                    approvalContext.Options.Select(option => option.Key.Value).ToList()),
+            approvalChecks,
             decision.ApprovalMatches
                 .Select(match => $"{match.Source}:{match.Pattern}")
+                .ToList(),
+            decision.ShellPolicyTrace.Rows.Select(FormatTraceRow).ToList(),
+            decision.ShellPolicyTrace.Rows
+                .Where(row => row.CandidateId is not null && row.Coverage is not null)
+                .Select(row => (
+                    row.CandidateId!.Value.Value,
+                    row.Coverage!.Value.ToString()))
                 .ToList());
     }
+
+    internal static ApprovalOutcome ObserveOutcome(
+        ToolAuthorizationDecision decision)
+        => MapOutcome(decision.Outcome);
+
+    private static ApprovalOutcome MapOutcome(ToolAuthorizationOutcome outcome)
+        => outcome switch
+        {
+            ToolAuthorizationOutcome.Allowed => ApprovalOutcome.Allowed,
+            ToolAuthorizationOutcome.RequiresApproval => ApprovalOutcome.RequiresApproval,
+            ToolAuthorizationOutcome.RequiresAgentCorrection => ApprovalOutcome.RequiresAgentCorrection,
+            ToolAuthorizationOutcome.Denied => ApprovalOutcome.Denied,
+            _ => throw new ArgumentOutOfRangeException(nameof(outcome), outcome, "Unknown authorization outcome.")
+        };
+
+    private static ApprovalAllowReason MapAllowReason(ToolAllowReason reason)
+        => reason switch
+        {
+            ToolAllowReason.PolicyAuto => ApprovalAllowReason.PolicyAuto,
+            ToolAllowReason.BackgroundJobLifecycle => ApprovalAllowReason.BackgroundJobLifecycle,
+            ToolAllowReason.ReviewedSafePolicy => ApprovalAllowReason.ReviewedSafePolicy,
+            ToolAllowReason.ApprovalExemptShellCandidates => ApprovalAllowReason.ApprovalExemptShellCandidates,
+            ToolAllowReason.StoredApproval => ApprovalAllowReason.StoredApproval,
+            ToolAllowReason.OneTimeApproval => ApprovalAllowReason.OneTimeApproval,
+            _ => throw new ArgumentOutOfRangeException(nameof(reason), reason, "Unknown allow reason.")
+        };
+
+    private static ApprovalCorrection? MapCorrection(ToolCorrection? correction)
+        => correction switch
+        {
+            null => null,
+            ToolCorrection.ManagedTemporaryDirectorySuggested => ApprovalCorrection.ManagedTemporaryDirectory,
+            ToolCorrection.NativeToolSuggested => ApprovalCorrection.NativeTool,
+            ToolCorrection.ProjectDirectorySuggested => ApprovalCorrection.ProjectDirectory,
+            ToolCorrection.ShellWorkingDirectorySuggested => ApprovalCorrection.ShellWorkingDirectory,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(correction), correction, "Unknown approval correction.")
+        };
+
+    private static string FormatTraceRow(ShellPolicyTraceRow row)
+        => string.Join(
+            '|',
+            row.Stage,
+            row.CandidateId?.Value.ToString(CultureInfo.InvariantCulture) ?? string.Empty,
+            row.ExecutableBasename ?? string.Empty,
+            row.Outcome,
+            row.Reason,
+            row.Coverage?.ToString() ?? string.Empty,
+            row.ScopeRelation,
+            row.GrantTimestamp?.ToString("O", CultureInfo.InvariantCulture) ?? string.Empty);
 
     public Task<ToolAuthorizationDecision> EvaluateDecisionAsync(CancellationToken ct)
         => _executor.EvaluateAuthorizationAsync(_toolCall, _context, ct);
 
-    internal Task<ShellAuthorizationResult> EvaluateCoordinatorAsync(CancellationToken ct)
+    public Task<string> ExecuteAsync(CancellationToken ct)
+    {
+        var arguments = new Dictionary<string, object?>(
+            _toolCall.Arguments ?? new Dictionary<string, object?>())
+        {
+            ["_rationale"] = "Verify that directory advice stops this shell call."
+        };
+        return _executor.ExecuteAsync(
+            new FunctionCallContent(_toolCall.CallId, _toolCall.Name, arguments),
+            _context,
+            ct);
+    }
+
+    internal Task<ToolAuthorizationResult> EvaluateCoordinatorAsync(CancellationToken ct)
         => new ShellPolicyCoordinator(_registry, _policy, ApprovalService).EvaluateAsync(
             _registry.GetByName(_toolCall.Name)
                 ?? throw new InvalidOperationException("The shell tool is not registered."),
@@ -395,6 +552,7 @@ internal sealed class ShellApprovalHarness : IAsyncDisposable
         {
             ApprovalDirectoryShape.None => null,
             ApprovalDirectoryShape.Project => projectDirectory,
+            ApprovalDirectoryShape.ProjectChild => Path.Combine(projectDirectory, "sub"),
             ApprovalDirectoryShape.Session => sessionDirectory,
             ApprovalDirectoryShape.External => externalDirectory,
             _ => throw new ArgumentOutOfRangeException(nameof(directory), directory, "Unknown approval directory shape.")

@@ -71,12 +71,27 @@ public sealed record ApprovalEntry([property: JsonPropertyName("verb")] string V
     public IReadOnlyList<string>? VerbTokens { get; private init; }
 
     /// <summary>
+    /// The exact shell-assignment constraint, or <c>null</c> when the grant
+    /// covers a command with no bounded assignment facts.
+    /// </summary>
+    [JsonIgnore]
+    public ApprovalAssignmentDigest? AssignmentDigest { get; init; }
+
+    /// <summary>
     /// Absolute directory path the grant is scoped to, or <c>null</c> for
     /// the global wildcard. Trailing slashes are normalized away by the
     /// matcher so <c>/path/</c> and <c>/path</c> compare equal.
     /// </summary>
     [JsonPropertyName("directory")]
     public string? Directory { get; init; }
+
+    /// <summary>
+    /// The canonical Git common directory for an explicit repository grant.
+    /// Folder and global grants leave this value null.
+    /// </summary>
+    [JsonPropertyName("repository")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Repository { get; init; }
 
     /// <summary>
     /// When this grant was first persisted, or <c>null</c> for entries
@@ -98,7 +113,8 @@ public sealed record ApprovalEntry([property: JsonPropertyName("verb")] string V
         ApprovalShell shell,
         IReadOnlyList<string> verbTokens,
         string? directory = null,
-        DateTimeOffset? createdAt = null)
+        DateTimeOffset? createdAt = null,
+        ApprovalAssignmentDigest? assignmentDigest = null)
     {
         ArgumentNullException.ThrowIfNull(verbTokens);
         ApprovalEntryValidation.ValidateTokens(verbTokens);
@@ -107,9 +123,29 @@ public sealed record ApprovalEntry([property: JsonPropertyName("verb")] string V
             Shell = shell,
             Match = ApprovalMatchKind.TokenPrefix,
             VerbTokens = Array.AsReadOnly(verbTokens.ToArray()),
+            AssignmentDigest = assignmentDigest,
             Directory = directory,
             CreatedAt = createdAt,
         };
+    }
+
+    /// <summary>
+    /// Creates a typed shell phrase for registered worktrees of one repository.
+    /// </summary>
+    public static ApprovalEntry CreateRepositoryTokenPrefix(
+        ApprovalShell shell,
+        IReadOnlyList<string> verbTokens,
+        string repository,
+        DateTimeOffset? createdAt = null,
+        ApprovalAssignmentDigest? assignmentDigest = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(repository);
+        var entry = CreateTokenPrefix(
+            shell,
+            verbTokens,
+            createdAt: createdAt,
+            assignmentDigest: assignmentDigest);
+        return entry with { Repository = repository };
     }
 
     /// <summary>
@@ -142,6 +178,10 @@ public sealed record ApprovalEntry([property: JsonPropertyName("verb")] string V
         var phrase = Shell is { } shell && Match is { } match
             ? $"{shell} {FormatMatch(match)} {JsonSerializer.Serialize(Verb)}"
             : $"NonShell exact {JsonSerializer.Serialize(Verb)}";
+        if (AssignmentDigest is { } assignmentDigest)
+            phrase += $" with assignment {assignmentDigest.Value}";
+        if (Repository is not null)
+            return $"{phrase} in repository {Repository}";
         return Directory is null ? $"{phrase} anywhere" : $"{phrase} in {Directory}";
     }
 
@@ -222,7 +262,8 @@ public sealed record ApprovalEntry([property: JsonPropertyName("verb")] string V
                     nonShellRemainder,
                     out var nonShellVerb,
                     out var nonShellTail) ||
-                !TryReadScopeTail(nonShellTail, out var nonShellDirectory))
+                !TryReadScopeTail(nonShellTail, out var nonShellDirectory, out var nonShellRepository) ||
+                nonShellRepository is not null)
             {
                 error = "The typed approval scope is invalid.";
                 return false;
@@ -273,7 +314,10 @@ public sealed record ApprovalEntry([property: JsonPropertyName("verb")] string V
         }
 
         if (!TryReadJsonString(remainder, out var verb, out var tail) ||
-            !TryReadScopeTail(tail, out var directory))
+            !TryReadAssignmentDigest(tail, out var assignmentDigest, out var scopeTail) ||
+            !TryReadScopeTail(scopeTail, out var directory, out var repository) ||
+            assignmentDigest is not null && match != ApprovalMatchKind.TokenPrefix ||
+            repository is not null && match != ApprovalMatchKind.TokenPrefix)
         {
             error = "The typed approval scope is invalid.";
             return false;
@@ -282,7 +326,17 @@ public sealed record ApprovalEntry([property: JsonPropertyName("verb")] string V
         try
         {
             entry = match == ApprovalMatchKind.TokenPrefix
-                ? CreateTokenPrefix(shell, verb.Split(' ', StringSplitOptions.RemoveEmptyEntries), directory)
+                ? repository is null
+                    ? CreateTokenPrefix(
+                        shell,
+                        verb.Split(' ', StringSplitOptions.RemoveEmptyEntries),
+                        directory,
+                        assignmentDigest: assignmentDigest)
+                    : CreateRepositoryTokenPrefix(
+                        shell,
+                        verb.Split(' ', StringSplitOptions.RemoveEmptyEntries),
+                        repository,
+                        assignmentDigest: assignmentDigest)
                 : CreateLegacyExact(shell, verb, directory);
             return true;
         }
@@ -343,12 +397,22 @@ public sealed record ApprovalEntry([property: JsonPropertyName("verb")] string V
         return false;
     }
 
-    private static bool TryReadScopeTail(string tail, out string? directory)
+    private static bool TryReadScopeTail(string tail, out string? directory, out string? repository)
     {
         const string InPrefix = " in ";
+        const string RepositoryPrefix = " in repository ";
         directory = null;
+        repository = null;
         if (string.Equals(tail, " anywhere", StringComparison.Ordinal))
         {
+            return true;
+        }
+
+        if (tail.StartsWith(RepositoryPrefix, StringComparison.Ordinal))
+        {
+            if (tail.Length == RepositoryPrefix.Length)
+                return false;
+            repository = tail[RepositoryPrefix.Length..];
             return true;
         }
 
@@ -361,10 +425,85 @@ public sealed record ApprovalEntry([property: JsonPropertyName("verb")] string V
         return true;
     }
 
+    private static bool TryReadAssignmentDigest(
+        string tail,
+        out ApprovalAssignmentDigest? assignmentDigest,
+        out string scopeTail)
+    {
+        const string AssignmentPrefix = " with assignment ";
+        assignmentDigest = null;
+        scopeTail = tail;
+        if (!tail.StartsWith(AssignmentPrefix, StringComparison.Ordinal))
+            return true;
+
+        var digestStart = AssignmentPrefix.Length;
+        var digestLength = ApprovalAssignmentDigest.CanonicalLength;
+        if (tail.Length < digestStart + digestLength)
+            return false;
+
+        try
+        {
+            assignmentDigest = new ApprovalAssignmentDigest(
+                tail.Substring(digestStart, digestLength));
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+
+        scopeTail = tail[(digestStart + digestLength)..];
+        return true;
+    }
+
     private static string FormatMatch(ApprovalMatchKind match) => match switch
     {
         ApprovalMatchKind.TokenPrefix => "token-prefix",
         ApprovalMatchKind.LegacyExact => "legacy-exact",
         _ => throw new ArgumentOutOfRangeException(nameof(match), match, "The approval match kind is invalid."),
     };
+}
+
+/// <summary>
+/// Identifies the exact bounded shell assignments that qualify one approval.
+/// </summary>
+public readonly record struct ApprovalAssignmentDigest
+{
+    internal const int CanonicalLength = 71;
+    private const string Prefix = "sha256:";
+
+    public ApprovalAssignmentDigest(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        if (!IsCanonical(value))
+        {
+            throw new ArgumentException(
+                "The assignment digest must use canonical SHA-256 text.",
+                nameof(value));
+        }
+
+        Value = value;
+    }
+
+    /// <summary>Gets the canonical digest text.</summary>
+    public string Value { get; }
+
+    /// <inheritdoc />
+    public override string ToString() => Value;
+
+    internal static bool IsCanonical(string? value)
+    {
+        if (value is null || value.Length != CanonicalLength ||
+            !value.StartsWith(Prefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        foreach (var character in value.AsSpan(Prefix.Length))
+        {
+            if (character is not (>= '0' and <= '9' or >= 'a' and <= 'f'))
+                return false;
+        }
+
+        return true;
+    }
 }

@@ -102,6 +102,7 @@ internal sealed class ParentSessionApprovalBridge :
                         candidate.Verb,
                         candidate.Directory)
                     {
+                        AssignmentDigest = candidate.AssignmentDigest,
                         Shell = candidate.Shell,
                         VerbTokens = candidate.VerbTokens,
                     }).ToList())),
@@ -139,18 +140,24 @@ internal sealed class ParentSessionApprovalBridge :
             Patterns = request.Approval.Patterns,
             CandidateVerbs = request.Approval.CandidateVerbs,
             Candidates = (request.Approval.Candidates ?? [])
-                .Select(static candidate => new ApprovalCandidate(candidate.Verb, candidate.Directory)
+                .Select(static candidate => new ApprovalCandidate(
+                    candidate.Verb,
+                    candidate.Directory)
                 {
+                    AssignmentDigest = candidate.AssignmentDigest,
                     Shell = candidate.Shell,
                     VerbTokens = candidate.VerbTokens,
                 }).ToList(),
             Cwd = request.Approval.Cwd,
+            RepositoryCommonDirectory = request.Approval.RepositoryCommonDirectory,
             IsMessy = request.Approval.IsMessy,
             HasAdoptedContext = _hasAdoptedContext,
             HasThirdPartyAdoptedContext = _hasThirdPartyAdoptedContext,
             AdoptedSpeakerIds = _adoptedSpeakerIds,
             PersistedAdoptedContext = _hasAdoptedContext,
             Options = request.Approval.Options
+                .Where(option => !ApprovalOptionKeys.IsRepository(option.Key.Value)
+                                 || request.Approval.RepositoryCommonDirectory is not null)
                 .Select(static option => new ToolInteractionOption(option.Key, option.Label))
                 .ToList()
         }, PersistApprovalState: false));
@@ -162,6 +169,7 @@ internal sealed class ParentSessionApprovalBridge :
             ApprovalDecision.ApprovedOnce => ParentApprovalDecision.ApprovedOnce,
             ApprovalDecision.ApprovedSession => ParentApprovalDecision.ApprovedSession,
             ApprovalDecision.ApprovedAlways => ParentApprovalDecision.ApprovedAlways,
+            ApprovalDecision.ApprovedRepository => ParentApprovalDecision.ApprovedRepository,
             ApprovalDecision.ApprovedEverywhere => ParentApprovalDecision.ApprovedEverywhere,
             ApprovalDecision.TimedOut => ParentApprovalDecision.TimedOut,
             _ => ParentApprovalDecision.Denied

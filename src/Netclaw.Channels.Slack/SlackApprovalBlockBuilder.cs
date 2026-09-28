@@ -272,7 +272,7 @@ internal static class SlackApprovalBlockBuilder
 
     private static string BuildGenericResolutionLine(string selectedKey, bool isMcpTool)
         => isMcpTool
-            ? selectedKey switch
+            ? ApprovalOptionKeys.CanonicalDecisionKey(selectedKey) switch
             {
                 ApprovalOptionKeys.ApproveAlways or ApprovalOptionKeys.ApproveEverywhere => "Always allowed this MCP tool",
                 ApprovalOptionKeys.ApproveSession => "Allowed this MCP tool for this chat",
@@ -280,9 +280,10 @@ internal static class SlackApprovalBlockBuilder
                 ApprovalOptionKeys.Deny => "Denied",
                 _ => "Resolved"
             }
-            : selectedKey switch
+            : ApprovalOptionKeys.CanonicalDecisionKey(selectedKey) switch
             {
                 ApprovalOptionKeys.ApproveAlways => "Saved: always here",
+                ApprovalOptionKeys.ApproveRepository => "Saved: this repository",
                 ApprovalOptionKeys.ApproveEverywhere => "Saved: always anywhere",
                 ApprovalOptionKeys.ApproveSession => "Saved for this chat",
                 ApprovalOptionKeys.ApproveOnce => "Approved (no save)",
@@ -371,7 +372,7 @@ internal static class SlackApprovalBlockBuilder
     {
         if (request.ToolName.IsMcp)
         {
-            return selectedKey switch
+            return ApprovalOptionKeys.CanonicalDecisionKey(selectedKey) switch
             {
                 ApprovalOptionKeys.ApproveAlways or ApprovalOptionKeys.ApproveEverywhere => $"Always allowed: {request.ToolName}",
                 ApprovalOptionKeys.ApproveSession => $"Allowed for this chat: {request.ToolName}",
@@ -384,9 +385,10 @@ internal static class SlackApprovalBlockBuilder
         var verbs = string.Join(", ", ResolveDisplayVerbs(request));
         var location = ResolveHeaderLocation(request);
 
-        return selectedKey switch
+        return ApprovalOptionKeys.CanonicalDecisionKey(selectedKey) switch
         {
             ApprovalOptionKeys.ApproveAlways => $"Saved: {verbs} in {location}",
+            ApprovalOptionKeys.ApproveRepository => $"Saved: {verbs} in this repository",
             ApprovalOptionKeys.ApproveEverywhere => $"Saved: {verbs} anywhere",
             ApprovalOptionKeys.ApproveSession => $"Saved for this chat: {verbs} in {location}",
             ApprovalOptionKeys.ApproveOnce => "Approved (no save)",

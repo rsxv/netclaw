@@ -29,7 +29,7 @@
 
 ## Focused Mutation Tests
 
-The path-access, tool authorization, approval directory, reminder execution, and shell analysis mutation jobs run on each pull request, merge group, and `dev` push.
+The path-access, tool authorization, approval directory, reminder execution, shell analysis, and shell assignment mutation jobs run on each pull request, merge group, and `dev` push.
 Each Linux job runs in parallel with the normal test matrix.
 
 Focused mutation tests prove that deterministic tests reject a specific unsafe
@@ -43,10 +43,14 @@ coverage. They do not replace positive and negative behavior tests.
 | `PathAccessPolicy.AddSessionRoots` | Only a Personal context receives shared session roots | 2 killed | `./scripts/run-path-access-mutations.sh` |
 | `ToolAccessPolicy.AuthorizeMcpInvocation` | Server and tool audience grants precede approval | 2 killed | `./scripts/run-tool-authorization-mutations.sh` |
 | `ToolAccessPolicy.AuthorizeShellInvocation` | A shell hard denial precedes approval | 1 killed | `./scripts/run-tool-authorization-mutations.sh` |
-| Shell analysis, denial-only, tree effects, and reviewed-safe gates | Parser-proved regions and authored diagnostic syntax preserve hard denials; only bounded audited non-path values and consistent non-link-following tree facts can use reusable approval | 79 killed | `./scripts/run-shell-command-analysis-mutations.sh` |
-| `ApprovalPatternMatching.EvaluateApprovalScope` | Folder grants require containment and reject link escape | 4 killed | `./scripts/run-approval-directory-mutations.sh` |
+| `ShellGrantCandidateResult.IsFor` | Approval evidence keeps the requested candidate facts | 1 killed | `./scripts/run-tool-authorization-mutations.sh` |
+| `ShellPolicyEvaluation.CandidateState.ApplyActorEvidence` | Actor evidence cannot replace existing candidate coverage | 1 killed | `./scripts/run-tool-authorization-mutations.sh` |
+| Shell analysis, denial-only, tree effects, and reviewed-safe gates | Parser-proved regions and authored diagnostic syntax preserve hard denials; only bounded audited non-path values and consistent non-link-following tree facts can use reusable approval | 81 killed | `./scripts/run-shell-command-analysis-mutations.sh` |
+| Shell assignment identity, wrapper fallback, syntax reconciliation, host mode, prompt rollback, and Bash sanitation | Reusable grants require exact facts, fallback wrappers must stay one-time, versioned prompts must fail closed, and strong modes require the reviewed launch contract | 56 killed | `./scripts/run-shell-assignment-mutations.sh` |
+| Approval scope and repository persistence | Folder and repository grants require candidate scope, identity, registration, and containment | 12 killed | `./scripts/run-approval-directory-mutations.sh` |
 | `ReminderManagerActor.HandleExecutionOutcomeAsync` | Only the current attempt can settle; the manager replies after settlement | 2 killed | `./scripts/run-reminder-execution-mutations.sh` |
 | `ActiveExecutionTracker.TryRemove` | Only the current owner can remove its guard; cleanup removes that guard | 2 killed | `./scripts/run-reminder-execution-mutations.sh` |
+| `McpArtifactMaterializer.TryAdmit` | Scanner approval and verified MIME both precede MCP artifact storage | 4 killed | `./scripts/run-mcp-artifact-admission-mutations.sh` |
 
 Run the path-access check locally:
 
@@ -61,6 +65,29 @@ A cold CI runner should take two to four minutes.
 
 The harness uses xUnit 2 because Stryker's VSTest adapter does not support xUnit 3 correctly.
 The script requires `perl` and `jq`, which the Linux CI image supplies.
+
+### MCP Artifact Admission Gate
+
+Run the MCP artifact admission gate:
+
+```bash
+./scripts/run-mcp-artifact-admission-mutations.sh
+```
+
+The script selects the two fail-closed checks in
+`McpArtifactMaterializer.TryAdmit`. It requires two killed mutants for scanner
+approval and two killed mutants for verified MIME presence.
+
+The tests supply inconsistent scanner results on purpose. One result has a
+verified MIME with an explicit rejection. The other has approval without a
+verified MIME. Neither result can authorize storage.
+
+The source selector rejects a missing or duplicate boundary before Stryker
+starts. The gate also rejects a changed mutant count, a survivor, or a compile
+error in the selected span.
+
+The local run took 1 minute 40 seconds after package restore. The separate CI
+job retains a 10-minute timeout and uploads `mcp-artifact-admission-mutation-report`.
 
 ### Tool Authorization Gate
 
@@ -102,22 +129,29 @@ Run the approval directory gate:
 ./scripts/run-approval-directory-mutations.sh
 ```
 
-The script reuses the xUnit 2 harness and selects `Netclaw.Security.csproj` as the mutation target.
-It selects three source locations in `EvaluateApprovalScope`:
+The script reuses the xUnit 2 harness.
+It selects six security source regions and three approval actor conditions:
 
 | Decision | Expected mutants |
 |----------|------------------|
 | Windows path containment | 1 killed: remove the logical negation |
 | POSIX path containment | 1 killed: remove the logical negation |
 | POSIX link rejection | 2 killed: force either conditional outcome |
+| Candidate repository scope and identity | 3 killed: force a result or relax the identity check |
+| Common identity across candidates | 1 killed: remove the logical negation |
+| Reciprocal worktree registration | 1 killed: remove the logical negation |
+| Persistence candidate resolution | 1 killed: remove the logical negation |
+| Persistence common identity | 1 killed: remove the logical negation |
+| Persistence worktree root | 1 killed: remove the logical negation |
 
-The script requires these counts at their exact source locations and four tested mutants overall.
+The script requires these counts at their exact source locations and 12 tested mutants overall.
 It fails if a target is absent, survives, exceeds its time limit, or cannot compile.
 The source selector rejects an absent or duplicate boundary before Stryker starts.
 This protects the gate when the authorization code and diagnostic code contain similar conditions.
 
-Fifteen cases exercise the public typed approval matcher with real directories and links.
+Seventeen cases exercise the approval matcher and persistence gate with real directories and links.
 They cover the grant root, normal descendants, sibling prefixes, traversal, relative paths, and candidate scope that differs from cwd.
+The repository cases cover candidate resolution, mixed identities, reciprocal registration, and a nested registered worktree.
 The link cases prove that the link reaches the sibling directory before they require denial.
 Windows path cases cover case rules, drive boundaries, and traversal on every host.
 The native filesystem cases select Bash on POSIX hosts and PowerShell on Windows.
@@ -128,9 +162,10 @@ These tests preserve PRD-002 SEC-003 and
 [the directory-root approval contract](openspec/specs/tool-approval-gates/spec.md#requirement-directory-root-approvals-for-shell_execute).
 They prove folder-grant decisions. They do not prove native process containment or races between authorization and file access.
 
-The final local run took 41 seconds after package restore.
+The final local run took less than four minutes after package restore.
 The separate CI job retains a 10-minute timeout and uploads `approval-directory-mutation-report`.
 Its report directory is `artifacts/stryker/approval-directory`.
+The durable actor report is below its `actor` directory.
 
 ### Reminder Execution Gate
 
@@ -188,14 +223,35 @@ Run the shell analysis gate:
 ./scripts/run-shell-command-analysis-mutations.sh
 ```
 
-The script tests 79 mutants across execution-region accounting, denial-only
+The script tests 81 mutants across execution-region accounting, denial-only
 matching, tree traversal and root correspondence, bounded non-filesystem
-values, candidate extraction, approval mode, path facts, and reviewed-safe
-policy. The job fails unless every mutant dies.
+values, bare status-parameter output, candidate extraction, approval mode,
+path facts, and reviewed-safe policy. The job fails unless every mutant dies.
 
-The final local run took about 6 minutes. CI allows 30 minutes for
+Two status-parameter mutants test the rule that only bare `$?` can preserve
+reusable candidates. The focused test rejects other unknown output data.
+The new target took 49 seconds after package restore.
+
+The script groups targets by source project. Stryker analyzes each source project once.
+The local run on 2026-09-24 took under four minutes. CI allows 30 minutes for
 hosted-runner variance and report upload. The report directory is
 `artifacts/stryker/shell-command-analysis`.
+
+### Shell Assignment Gate
+
+Run the shell assignment gate:
+
+```bash
+./scripts/run-shell-assignment-mutations.sh
+```
+
+The script tests 56 mutants across eight narrow boundaries.
+It covers grant identity, wrapper fallback, prompt rollback, reviewed-safe exclusion, source spans, Bash host selection, and environment sanitation.
+The job fails unless every mutant dies.
+
+The local calibration run took about five minutes after package restore.
+CI allows 15 minutes for hosted-runner variance and report upload.
+The report directory is `artifacts/stryker/shell-assignment`.
 
 ### Scope Review
 

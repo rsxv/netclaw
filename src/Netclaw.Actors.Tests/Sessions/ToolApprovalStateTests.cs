@@ -6,7 +6,9 @@
 using Netclaw.Actors.Channels;
 using Netclaw.Actors.Protocol;
 using Netclaw.Actors.Sessions;
+using Netclaw.Actors.Tools;
 using Netclaw.Configuration;
+using Netclaw.Security;
 using Netclaw.Tools;
 using Xunit;
 using static Netclaw.Actors.Sessions.SessionProtocol;
@@ -34,6 +36,30 @@ public sealed class ToolApprovalStateTests
         Assert.Equal(1, state.ResolvedCount);
         Assert.Equal(ApprovalTurnPhase.Running, state.TurnPhase);
         Assert.False(state.Resolve(request.CallId, ApprovalDecision.Denied, out _));
+    }
+
+    [Fact]
+    public void Restart_stop_requires_an_unresolved_durable_prompt_with_restored_authority()
+    {
+        var state = new ToolApprovalState();
+        var request = CreateRequest("call-1", requestedAtMs: 10);
+
+        state.Request(request, persistApprovalState: false, recovered: false);
+        Assert.False(state.HasRecoverablePending(request.CallId));
+
+        state.Request(request, persistApprovalState: true, recovered: false);
+        Assert.True(state.HasRecoverablePending(request.CallId));
+
+        Assert.True(state.Resolve(request.CallId, ApprovalDecision.ApprovedOnce, out _));
+        Assert.False(state.HasRecoverablePending(request.CallId));
+
+        var legacy = request with { CallId = "legacy-restorable", TurnContext = null };
+        state.Request(legacy, persistApprovalState: true, recovered: true);
+        Assert.False(state.HasRecoverablePending(legacy.CallId));
+
+        var incomplete = request with { CallId = "legacy-call", TurnContext = null, ChannelType = null };
+        state.Request(incomplete, persistApprovalState: true, recovered: true);
+        Assert.False(state.HasRecoverablePending(incomplete.CallId));
     }
 
     [Fact]
@@ -95,6 +121,37 @@ public sealed class ToolApprovalStateTests
         Assert.Equal("legacy approval event is missing channel type", pending.TurnContextRestoreFailure);
         Assert.False(state.MarkRedriving(pending));
     }
+
+    [Fact]
+    public void A_legacy_prompt_cannot_authorize_a_new_repository_scope()
+    {
+        Assert.False(LlmSessionActor.IsOfferedApprovalOption(
+            [], ApprovalOptionKeys.ApproveRepository, "/work/main/.git"));
+        Assert.True(LlmSessionActor.IsOfferedApprovalOption(
+            [], ApprovalOptionKeys.ApproveOnce, repositoryCommonDirectory: null));
+        Assert.False(LlmSessionActor.IsOfferedApprovalOption(
+            [ApprovalOptionKeys.ApproveOnce, ApprovalOptionKeys.Deny],
+            ApprovalOptionKeys.ApproveRepository,
+            "/work/main/.git"));
+        Assert.False(LlmSessionActor.IsOfferedApprovalOption(
+            [ApprovalOptionKeys.ApproveRepository],
+            ApprovalOptionKeys.ApproveRepository,
+            repositoryCommonDirectory: null));
+        Assert.True(LlmSessionActor.IsOfferedApprovalOption(
+            [ApprovalOptionKeys.ApproveRepository],
+            ApprovalOptionKeys.ApproveRepository,
+            "/work/main/.git"));
+    }
+
+    [Theory]
+    [InlineData(ApprovalOptionKeys.ApproveAssignmentSessionV1, ApprovalDecision.ApprovedSession)]
+    [InlineData(ApprovalOptionKeys.ApproveAssignmentAlwaysV1, ApprovalDecision.ApprovedAlways)]
+    [InlineData(ApprovalOptionKeys.ApproveAssignmentRepositoryV1, ApprovalDecision.ApprovedRepository)]
+    [InlineData(ApprovalOptionKeys.ApproveAssignmentEverywhereV1, ApprovalDecision.ApprovedEverywhere)]
+    public void New_runtime_maps_assignment_option_keys(
+        string optionKey,
+        ApprovalDecision expected)
+        => Assert.Equal(expected, LlmSessionActor.MapApprovalDecision(optionKey));
 
     [Fact]
     public void Approval_turn_transitions_reject_invalid_source_states()
@@ -162,6 +219,43 @@ public sealed class ToolApprovalStateTests
         Assert.Equal(approved.AuthorizationAttemptId, attempts[approved.CallId].Value);
         Assert.Equal(denied.AuthorizationAttemptId, attempts[denied.CallId].Value);
         Assert.False(attempts.ContainsKey(pending.CallId));
+    }
+
+    [Fact]
+    public void Resolved_assignment_grant_redrives_only_the_exact_call_once()
+    {
+        var digest = new ApprovalAssignmentDigest($"sha256:{new string('a', 64)}");
+        var candidate = new ApprovalCandidate(
+            "inspect",
+            "/work/repository")
+        {
+            AssignmentDigest = digest,
+            Shell = ApprovalShell.Bash,
+            VerbTokens = ["inspect"],
+        };
+        var request = CreateRequest("call-assignment", requestedAtMs: 10) with
+        {
+            Patterns = ["inspect item"],
+            CandidateVerbs = ["inspect"],
+            Candidates = [candidate],
+            Cwd = "/work/repository",
+            OptionKeys =
+            [
+                ApprovalOptionKeys.ApproveOnce,
+                ApprovalOptionKeys.ApproveAssignmentAlwaysV1,
+                ApprovalOptionKeys.Deny,
+            ],
+        };
+        var state = new ToolApprovalState();
+        state.Request(request, persistApprovalState: true, recovered: true);
+        Assert.True(state.Resolve(request.CallId, ApprovalDecision.ApprovedAlways, out _));
+
+        var plan = state.BuildRedrivePlan([request.CallId]);
+
+        Assert.Equal(
+            OneTimeApprovalKeys.Create(request.Patterns, request.Candidates, request.Cwd),
+            plan.OneTimeApprovalPreSeed![request.CallId]);
+        Assert.Null(plan.DecisionOverride);
     }
 
     private static ToolApprovalRequested CreateRequest(string callId, long requestedAtMs)

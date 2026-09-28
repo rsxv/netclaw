@@ -53,6 +53,43 @@ public sealed class ToolApprovalActorTests : TestKit
     }
 
     [Fact]
+    public async Task Non_shell_session_approval_uses_the_structured_session_store()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var actor = Sys.ActorOf(ToolApprovalActor.CreateProps());
+        var service = CreateService(actor);
+        var toolName = new ToolName("file_read");
+
+        await service.RecordApprovalAsync(
+            "session-a",
+            TrustAudience.Personal,
+            toolName,
+            ["file_read"],
+            persistent: false,
+            cwd: "/ignored",
+            ct);
+
+        var sameSession = await service.CheckApprovalAsync(
+            "session-a",
+            TrustAudience.Personal,
+            toolName,
+            [new ApprovalCandidate("file_read", Directory: null)],
+            cwd: "/other",
+            ct);
+        var otherSession = await service.CheckApprovalAsync(
+            "session-b",
+            TrustAudience.Personal,
+            toolName,
+            [new ApprovalCandidate("file_read", Directory: null)],
+            cwd: "/other",
+            ct);
+
+        Assert.Empty(sameSession.UnapprovedPatterns);
+        Assert.Equal("session", Assert.Single(sameSession.ApprovedMatches).Source);
+        Assert.Equal(["file_read"], otherSession.UnapprovedPatterns);
+    }
+
+    [Fact]
     public async Task Unapproved_pattern_not_found()
     {
         var ct = TestContext.Current.CancellationToken;
@@ -693,6 +730,72 @@ public sealed class ToolApprovalActorTests : TestKit
     }
 
     [Fact]
+    public async Task Persistent_assignment_grant_requires_the_same_exact_digest()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tempFile = Path.GetTempFileName();
+        try
+        {
+            var store = CreateStore(tempFile);
+            var actor = Sys.ActorOf(ToolApprovalActor.CreateProps(store));
+            var service = CreateService(actor);
+            var firstDigest = new ApprovalAssignmentDigest($"sha256:{new string('a', 64)}");
+            var secondDigest = new ApprovalAssignmentDigest($"sha256:{new string('b', 64)}");
+            var candidate = BashCandidate("inspect") with
+            {
+                AssignmentDigest = firstDigest,
+            };
+
+            await service.RecordApprovalCandidatesAsync(
+                (ToolApprovalSessionId)"session-a",
+                TrustAudience.Personal,
+                new ToolName("shell_execute"),
+                [new ToolApprovalGrant(candidate, Directory: null)],
+                persistent: true,
+                ct);
+
+            var entry = Assert.Single(
+                store.GetApprovedEntries(TrustAudience.Personal, "shell_execute"));
+            Assert.Equal(firstDigest, entry.AssignmentDigest);
+            var matching = await service.CheckApprovalAsync(
+                "session-b",
+                TrustAudience.Personal,
+                new ToolName("shell_execute"),
+                [candidate],
+                cwd: null,
+                ct);
+            var changed = await service.CheckApprovalAsync(
+                "session-b",
+                TrustAudience.Personal,
+                new ToolName("shell_execute"),
+                [candidate with
+                {
+                    AssignmentDigest = secondDigest,
+                }],
+                cwd: null,
+                ct);
+            var unqualified = await service.CheckApprovalAsync(
+                "session-b",
+                TrustAudience.Personal,
+                new ToolName("shell_execute"),
+                [candidate with { AssignmentDigest = null }],
+                cwd: null,
+                ct);
+
+            Assert.Empty(matching.UnapprovedPatterns);
+            Assert.Single(matching.ApprovedMatches);
+            Assert.Equal(["inspect"], changed.UnapprovedPatterns);
+            Assert.Empty(changed.ApprovedMatches);
+            Assert.Equal(["inspect"], unqualified.UnapprovedPatterns);
+            Assert.Empty(unqualified.ApprovedMatches);
+        }
+        finally
+        {
+            File.Delete(tempFile);
+        }
+    }
+
+    [Fact]
     public async Task Persistent_phrase_uses_parser_tokens_when_legacy_projection_is_shorter()
     {
         var ct = TestContext.Current.CancellationToken;
@@ -761,15 +864,14 @@ public sealed class ToolApprovalActorTests : TestKit
                     SessionId: null,
                     TrustAudience.Personal,
                     new ToolName("shell_execute"),
-                    TestShellEnvironment.Current,
                     [
                         new ShellGrantCandidate(new ShellPolicyCandidateId(0), first, RealDirectory: null),
                         new ShellGrantCandidate(new ShellPolicyCandidateId(1), second, RealDirectory: null)
                     ]),
                 ct);
 
-            Assert.All(result.CandidateMatches, match =>
-                Assert.Equal(ShellCoverageKind.PersistentGlobal, match.GrantCoverage));
+            Assert.All(result.Candidates, candidate =>
+                Assert.Equal(ShellCoverageKind.PersistentGlobal, candidate.Coverage));
         }
         finally
         {
@@ -852,17 +954,14 @@ public sealed class ToolApprovalActorTests : TestKit
                     (ToolApprovalSessionId)"session-a",
                     TrustAudience.Personal,
                     new ToolName("shell_execute"),
-                    TestShellEnvironment.Current,
                     candidates),
                 ct);
 
-            var unavailable = Assert.IsType<PersistentGrantStoreStatus.Unavailable>(result.PersistentStore);
-            Assert.Equal(ApprovalStoreFailure.InvalidData, unavailable.Failure);
-            Assert.Equal([7, 11], result.CandidateMatches.Select(match => match.CandidateId.Value));
-            Assert.Equal(ShellCoverageKind.Session, result.CandidateMatches[0].GrantCoverage);
-            Assert.NotNull(result.CandidateMatches[0].Match);
-            Assert.Null(result.CandidateMatches[1].GrantCoverage);
-            Assert.Null(result.CandidateMatches[1].Match);
+            Assert.Equal(ApprovalStoreFailure.InvalidData, result.PersistentStoreFailure);
+            Assert.Equal([7, 11], result.Candidates.Select(candidate => candidate.CandidateId.Value));
+            Assert.Equal(ShellCoverageKind.Session, result.Candidates[0].Coverage);
+            Assert.Equal(ShellCoverageKind.Uncovered, result.Candidates[1].Coverage);
+            Assert.Null(result.Candidates[1].NearMiss);
         }
         finally
         {
@@ -900,7 +999,6 @@ public sealed class ToolApprovalActorTests : TestKit
                     SessionId: null,
                     TrustAudience.Personal,
                     new ToolName("shell_execute"),
-                    TestShellEnvironment.Current,
                     [
                         new ShellGrantCandidate(
                             new ShellPolicyCandidateId(0),
@@ -909,8 +1007,8 @@ public sealed class ToolApprovalActorTests : TestKit
                     ]),
                 ct);
 
-            var match = Assert.Single(result.CandidateMatches);
-            Assert.Equal(ShellCoverageKind.PersistentGlobal, match.GrantCoverage);
+            var match = Assert.Single(result.Candidates);
+            Assert.Equal(ShellCoverageKind.PersistentGlobal, match.Coverage);
             Assert.Equal(grantTimestamp, match.GrantCreatedAt);
         }
         finally
@@ -951,7 +1049,6 @@ public sealed class ToolApprovalActorTests : TestKit
                     SessionId: null,
                     TrustAudience.Personal,
                     new ToolName("shell_execute"),
-                    TestShellEnvironment.Current,
                     [
                         new ShellGrantCandidate(
                             new ShellPolicyCandidateId(0),
@@ -960,11 +1057,10 @@ public sealed class ToolApprovalActorTests : TestKit
                     ]),
                 ct);
 
-            var match = Assert.Single(result.CandidateMatches);
-            Assert.Null(match.Match);
-            Assert.Null(match.GrantCoverage);
+            var match = Assert.Single(result.Candidates);
+            Assert.Equal(ShellCoverageKind.Uncovered, match.Coverage);
             Assert.Null(match.GrantCreatedAt);
-            var nearMiss = Assert.Single(match.NearMisses);
+            var nearMiss = Assert.IsType<ShellApprovalNearMiss>(match.NearMiss);
             Assert.Equal(ShellApprovalNearMissReason.OutsideDirectory, nearMiss.Reason);
             Assert.Equal(grantTimestamp, nearMiss.Grant.CreatedAt);
         }

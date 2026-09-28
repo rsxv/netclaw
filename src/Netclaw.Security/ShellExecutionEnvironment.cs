@@ -52,6 +52,7 @@ public sealed class ShellExecutionEnvironment
         ShellGrammar grammar,
         ShellPathStyle pathStyle,
         ImmutableArray<string> commandArguments,
+        Version? bashVersion,
         PwshDialect? powerShellDialect)
     {
         if (string.IsNullOrWhiteSpace(executablePath))
@@ -66,6 +67,7 @@ public sealed class ShellExecutionEnvironment
         Grammar = grammar;
         PathStyle = pathStyle;
         CommandArguments = commandArguments;
+        BashVersion = bashVersion;
         PowerShellDialect = powerShellDialect;
     }
 
@@ -109,6 +111,12 @@ public sealed class ShellExecutionEnvironment
     public IReadOnlyList<string> CommandArguments { get; }
 
     /// <summary>
+    /// Gets the GNU Bash version that passed host probing, or <see langword="null"/>
+    /// when no version proof exists.
+    /// </summary>
+    public Version? BashVersion { get; }
+
+    /// <summary>
     /// Gets the selected PowerShell dialect, or <see langword="null"/> for Bash.
     /// </summary>
     public PwshDialect? PowerShellDialect { get; }
@@ -127,6 +135,28 @@ public sealed class ShellExecutionEnvironment
             ShellGrammar.Bash,
             ShellPathStyle.Posix,
             BashCommandArguments,
+            bashVersion: null,
+            powerShellDialect: null);
+    }
+
+    /// <summary>
+    /// Creates a Bash identity with the version that passed host probing.
+    /// </summary>
+    public static ShellExecutionEnvironment CreateBash(
+        ShellPlatform platform,
+        Version bashVersion)
+    {
+        ArgumentNullException.ThrowIfNull(bashVersion);
+        if (platform is not (ShellPlatform.Linux or ShellPlatform.MacOS))
+            throw new ArgumentOutOfRangeException(nameof(platform), platform, "Bash is supported only on Linux and macOS.");
+
+        return new ShellExecutionEnvironment(
+            platform,
+            "/bin/bash",
+            ShellGrammar.Bash,
+            ShellPathStyle.Posix,
+            BashCommandArguments,
+            bashVersion,
             powerShellDialect: null);
     }
 
@@ -164,11 +194,12 @@ public sealed class ShellExecutionEnvironment
             ShellGrammar.PowerShell,
             ShellPathStyle.Windows,
             PowerShellCommandArguments,
+            bashVersion: null,
             dialect);
     }
 
     /// <summary>
-    /// Parses source with the environment's grammar, dialect, working directory, and unknown initial state.
+    /// Parses source with the environment's grammar, dialect, directory, and selected bounded initial state.
     /// </summary>
     public ParsedCommand Parse(string source, string? workingDirectory = null)
         => ParseForApproval(source, workingDirectory, publishAuthoredSourceFacts: false);
@@ -185,22 +216,58 @@ public sealed class ShellExecutionEnvironment
 
         return Grammar switch
         {
-            ShellGrammar.Bash => new BashParser(new BashParserOptions
-            {
-                WorkingDirectory = workingDirectory,
-                InitialStateMode = BashInitialStateMode.Unknown,
-                PublishAuthoredSourceFacts = publishAuthoredSourceFacts
-            }).Parse(source),
+            ShellGrammar.Bash => CreateBashParser(
+                workingDirectory,
+                publishAuthoredSourceFacts).Parse(source),
             ShellGrammar.PowerShell when PowerShellDialect is { } dialect =>
                 new PwshParser(new PwshParserOptions
                 {
                     WorkingDirectory = workingDirectory,
-                    InitialStateMode = PwshInitialStateMode.Unknown,
+                    InitialStateMode = PowerShellInitialStateMode,
                     Dialect = dialect
                 }).Parse(source),
             _ => throw new InvalidOperationException("The shell environment has no supported parser identity.")
         };
     }
+
+    internal bool TryProjectFiniteBashScopes(
+        string source,
+        string? workingDirectory,
+        out BashFiniteScopeProjection? projection)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        if (Grammar != ShellGrammar.Bash)
+        {
+            projection = null;
+            return false;
+        }
+
+        return CreateBashParser(workingDirectory, publishAuthoredSourceFacts: true)
+            .TryProjectFiniteScopes(source, out projection);
+    }
+
+    private BashParser CreateBashParser(
+        string? workingDirectory,
+        bool publishAuthoredSourceFacts)
+        => new(new BashParserOptions
+        {
+            WorkingDirectory = workingDirectory,
+            InitialStateMode = BashInitialStateMode,
+            PublishAuthoredSourceFacts = publishAuthoredSourceFacts
+        });
+
+    private BashInitialStateMode BashInitialStateMode =>
+        BashVersion is { Major: 5, Minor: 2 or 3 }
+        && ExecutablePath == "/bin/bash"
+        && CommandArguments.SequenceEqual(BashCommandArguments)
+            ? BashInitialStateMode.FreshNonInteractiveNoStartup
+            : BashInitialStateMode.Unknown;
+
+    private PwshInitialStateMode PowerShellInitialStateMode =>
+        PowerShellDialect is PwshDialect.PowerShell7 or PwshDialect.WindowsPowerShell51
+        && CommandArguments.SequenceEqual(PowerShellCommandArguments)
+            ? PwshInitialStateMode.IsolatedNonInteractiveNoProfile
+            : PwshInitialStateMode.Unknown;
 
     /// <summary>
     /// Creates fresh process-start data for one submitted command.
@@ -222,7 +289,25 @@ public sealed class ShellExecutionEnvironment
         foreach (var argument in CommandArguments)
             startInfo.ArgumentList.Add(argument);
         startInfo.ArgumentList.Add(command);
+        if (Grammar == ShellGrammar.Bash)
+            RemoveBashStartupOverrides(startInfo.Environment);
         return startInfo;
+    }
+
+    internal static void RemoveBashStartupOverrides(IDictionary<string, string?> environment)
+    {
+        // The parser starts from the authored command. A shell startup hook or imported function
+        // can change its verbs and directory effects before that command runs.
+        foreach (var key in environment.Keys.Where(static key =>
+                     key is "BASH_ENV" or "ENV" or "SHELLOPTS" or "BASHOPTS" or "CDPATH"
+                         or "GLOBIGNORE" or "IFS" or "POSIXLY_CORRECT" or "BASH_COMPAT"
+                         or "LIBPATH" or "SHLIB_PATH"
+                     || key.StartsWith("BASH_FUNC_", StringComparison.Ordinal)
+                     || key.StartsWith("LD_", StringComparison.Ordinal)
+                     || key.StartsWith("DYLD_", StringComparison.Ordinal)).ToArray())
+        {
+            environment.Remove(key);
+        }
     }
 
     private static bool IsFullyQualified(string path, ShellPathStyle pathStyle) => pathStyle switch

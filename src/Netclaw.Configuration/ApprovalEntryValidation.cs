@@ -35,7 +35,21 @@ internal static class ApprovalEntryValidation
             }
         }
 
-        if (entry.Match is null && entry.Shell is null && entry.VerbTokens is null)
+        if (entry.Repository is not null)
+        {
+            ValidatePersistedString(entry.Repository, "repository", allowWhitespace: true);
+            if (entry.Directory is not null
+                || entry.Shell is null
+                || entry.Match != ApprovalMatchKind.TokenPrefix
+                || !IsCanonicalPosixAbsolutePath(entry.Repository)
+                   && !IsCanonicalWindowsAbsolutePath(entry.Repository))
+            {
+                throw new JsonException("A repository grant requires one canonical Git directory and a token-prefix shell phrase.");
+            }
+        }
+
+        if (entry.Match is null && entry.Shell is null && entry.VerbTokens is null
+            && entry.AssignmentDigest is null)
         {
             return;
         }
@@ -50,13 +64,19 @@ internal static class ApprovalEntryValidation
         {
             case ApprovalMatchKind.TokenPrefix when entry.VerbTokens is not null:
                 ValidateTokens(entry.VerbTokens);
+                if (entry.AssignmentDigest is { } assignmentDigest
+                    && !ApprovalAssignmentDigest.IsCanonical(assignmentDigest.Value))
+                {
+                    throw new JsonException("The assignment digest is invalid.");
+                }
                 if (!string.Equals(entry.Verb, string.Join(" ", entry.VerbTokens), StringComparison.Ordinal))
                 {
                     throw new JsonException("The token phrase and display verb differ.");
                 }
 
                 return;
-            case ApprovalMatchKind.LegacyExact when entry.VerbTokens is null:
+            case ApprovalMatchKind.LegacyExact when entry.VerbTokens is null
+                                                     && entry.AssignmentDigest is null:
                 return;
             default:
                 throw new JsonException("The approval entry has an invalid phrase form.");

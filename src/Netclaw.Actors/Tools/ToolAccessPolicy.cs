@@ -239,25 +239,24 @@ public sealed class ToolAccessPolicy
         if (!decision.NeedsApproval)
         {
             return new ShellPolicyPreflightResult.Complete(
-                decision,
-                decision.Outcome == ToolAuthorizationOutcome.Allowed ? analysis : null);
+                ToolAuthorizationResult.CreateShell(
+                    decision,
+                    decision.Outcome == ToolAuthorizationOutcome.Allowed ? analysis : null));
         }
 
         if (analysis is null)
         {
             return new ShellPolicyPreflightResult.Complete(
-                decision,
-                authorizedAnalysis: null);
+                ToolAuthorizationResult.CreateShell(decision, authorizedAnalysis: null));
         }
 
         return decision.ApprovalContext is { } approvalContext
             ? new ShellPolicyPreflightResult.Continue(
                 analysis,
-                approvalContext,
-                ShellEnvironment)
+                approvalContext)
             : new ShellPolicyPreflightResult.Complete(
-                ToolAuthorizationDecision.Deny("internal_policy_failure"),
-                authorizedAnalysis: null);
+                ToolAuthorizationResult.Stop(
+                    ToolAuthorizationDecision.Deny("internal_policy_failure")));
     }
 
     private ToolAuthorizationDecision AuthorizeMcpInvocation(
@@ -338,6 +337,10 @@ public sealed class ToolAccessPolicy
                 return ToolAuthorizationDecision.Deny("shell_references_protected_path");
         }
 
+        // The OS resolves ".." after a symlink. Lexical policy normalization does not.
+        if (workingDirectory is not null && ShellPathRules.HasParentDirectorySegment(workingDirectory))
+            return ToolAuthorizationDecision.Deny("shell_invalid_working_directory");
+
         // All shell policy checks use the directory that ShellTool executes.
         // The explicit tool argument can be absent while the context supplies
         // an active project, session, or inherited directory.
@@ -348,6 +351,54 @@ public sealed class ToolAccessPolicy
                 toolName,
                 analysisArguments,
                 shellAnalysis);
+
+        // Keep causal intent rules for lists that they already prove.
+        // A complete scope proof can clear the headless unresolved-input gate.
+        // A failed proof keeps that gate.
+        if (shellAnalysis is not null
+            && shellApproval is { IsMessy: true, Candidates.Count: 0 }
+            && !BashCausalApprovalIntent.TryProject(
+                ShellEnvironment,
+                shellAnalysis,
+                _shellApprovalMatcher,
+                IsEligiblePlatformTemporaryPath,
+                out _)
+            && BashStaticCompoundApprovalProjection.TryCreate(
+                shellAnalysis,
+                _shellCommandPolicy,
+                _shellApprovalMatcher,
+                out var staticProjection)
+            && staticProjection is not null
+            && staticProjection.Slices.All(slice =>
+                IsCausalIntentDirectoryEligible(slice.WorkingDirectory)))
+        {
+            foreach (var slice in staticProjection.Slices)
+            {
+                var scopedDeny = _shellCommandPolicy.Evaluate(slice.Analysis);
+                if (!scopedDeny.Allowed)
+                {
+                    return ToolAuthorizationDecision.Deny(
+                        $"hard_deny_{scopedDeny.DenyCategory?.ToWireName() ?? "unknown"}");
+                }
+
+                if (_toolPathPolicy.CommandReferencesDeniedPath(slice.Analysis))
+                    return ToolAuthorizationDecision.Deny("shell_references_protected_path");
+
+                var scopedPathDeny = EnforceShellFileProtection(
+                    slice.Approval,
+                    slice.Analysis,
+                    slice.WorkingDirectory,
+                    context);
+                if (scopedPathDeny is not null)
+                    return scopedPathDeny;
+            }
+
+            shellApproval = shellApproval with
+            {
+                Candidates = staticProjection.Candidates,
+                IsMessy = false
+            };
+        }
 
         // Shell does not classify an executable as a reader or writer. Once
         // shell capability and command policy pass, every known path must pass
@@ -651,7 +702,7 @@ public sealed class ToolAccessPolicy
 
         var decision = _pathAccessPolicy.Evaluate(rawPath, context, request.Operation);
         return decision is PathAccessPolicy.PathAccessDecision.Denied
-            { Failure: PathAccessPolicy.PathAccessFailure.AccessDenied } denied
+        { Failure: PathAccessPolicy.PathAccessFailure.AccessDenied } denied
             ? ToolAuthorizationDecision.Deny("path_access_denied", denied.Error)
             : null;
     }
@@ -783,6 +834,9 @@ public sealed class ToolAccessPolicy
 
         var managedTemporaryRetry = context.Approval.ManagedTemporaryRetry;
         var isManagedTemporaryRetry = managedTemporaryRetry is not null;
+        var repository = isManagedTemporaryRetry
+            ? null
+            : ResolveOfferedRepository(toolName, isMessy, hasReusablePhrase, candidates, context.Approval.Cwd);
         IReadOnlyList<ToolApprovalOption> options;
         if (isManagedTemporaryRetry)
         {
@@ -790,11 +844,14 @@ public sealed class ToolAccessPolicy
         }
         else
         {
-            options = BuildApprovalOptions(GetApprovalOptionProfile(
-                toolName,
-                isMessy,
-                hasReusablePhrase,
-                directoryApprovalAvailable));
+            options = BuildApprovalOptions(
+                GetApprovalOptionProfile(
+                    toolName,
+                    isMessy,
+                    hasReusablePhrase,
+                    directoryApprovalAvailable),
+                repository is not null,
+                HasAssignmentDigest(candidates));
         }
 
         var approvalContext = new ToolApprovalContext(
@@ -809,7 +866,8 @@ public sealed class ToolAccessPolicy
         {
             IsManagedTemporaryRetry = isManagedTemporaryRetry,
             ManagedTemporaryDirectory = managedTemporaryRetry?.ManagedTemporaryDirectory,
-            PlatformTemporaryRoot = managedTemporaryRetry?.PlatformTemporaryRoot
+            PlatformTemporaryRoot = managedTemporaryRetry?.PlatformTemporaryRoot,
+            RepositoryCommonDirectory = repository
         };
 
         return ToolAuthorizationDecision.RequiresApproval(
@@ -902,6 +960,7 @@ public sealed class ToolAccessPolicy
             .Select(static candidate => candidate.Verb)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+        string? repository = null;
         IReadOnlyList<ToolApprovalOption> options;
         if (context.IsManagedTemporaryRetry)
         {
@@ -909,15 +968,23 @@ public sealed class ToolAccessPolicy
         }
         else
         {
-            options = BuildApprovalOptions(GetApprovalOptionProfile(
-                new ToolName(ShellTool.ToolName),
-                isMessy: false,
-                unapprovedCandidates.All(HasReusableShellPhrase),
-                IsShellDirectoryApprovalAvailable(
-                    unapprovedCandidates,
-                    context.Cwd,
-                    sessionOwnedDirectories,
-                    pathStyle)));
+            var shellToolName = new ToolName(ShellTool.ToolName);
+            var hasReusablePhrase = unapprovedCandidates.All(HasReusableShellPhrase);
+            repository = ResolveOfferedRepository(
+                shellToolName, isMessy: false, hasReusablePhrase,
+                unapprovedCandidates, context.Cwd);
+            options = BuildApprovalOptions(
+                GetApprovalOptionProfile(
+                    shellToolName,
+                    isMessy: false,
+                    hasReusablePhrase,
+                    IsShellDirectoryApprovalAvailable(
+                        unapprovedCandidates,
+                        context.Cwd,
+                        sessionOwnedDirectories,
+                        pathStyle)),
+                repository is not null,
+                HasAssignmentDigest(unapprovedCandidates));
         }
 
         return context with
@@ -925,7 +992,8 @@ public sealed class ToolAccessPolicy
             Patterns = candidateVerbs,
             CandidateVerbs = candidateVerbs,
             Candidates = unapprovedCandidates,
-            Options = options
+            Options = options,
+            RepositoryCommonDirectory = repository
         };
     }
 
@@ -1038,7 +1106,10 @@ public sealed class ToolAccessPolicy
     /// allow this tool</c> because it persists a canonical-tool grant.</item>
     /// </list>
     /// </summary>
-    private static IReadOnlyList<ToolApprovalOption> BuildApprovalOptions(ApprovalOptionProfile profile)
+    private static IReadOnlyList<ToolApprovalOption> BuildApprovalOptions(
+        ApprovalOptionProfile profile,
+        bool includeRepository,
+        bool hasAssignmentDigest)
     {
         if (profile is ApprovalOptionProfile.OneShotOnly)
         {
@@ -1049,25 +1120,70 @@ public sealed class ToolAccessPolicy
             ];
         }
 
-        var options = new List<ToolApprovalOption>(5)
+        var options = new List<ToolApprovalOption>(6)
         {
             new ToolApprovalOption(ApprovalOptionKeys.ApproveOnceKey, ApprovalOptionKeys.ApproveOnceLabel),
-            new ToolApprovalOption(ApprovalOptionKeys.ApproveSessionKey, ApprovalOptionKeys.ApproveSessionLabel)
+            new ToolApprovalOption(
+                hasAssignmentDigest
+                    ? ApprovalOptionKeys.ApproveAssignmentSessionV1Key
+                    : ApprovalOptionKeys.ApproveSessionKey,
+                ApprovalOptionKeys.ApproveSessionLabel)
         };
 
         if (profile is ApprovalOptionProfile.StandardWithDirectory)
         {
-            options.Add(new ToolApprovalOption(ApprovalOptionKeys.ApproveAlwaysKey, ApprovalOptionKeys.ApproveAlwaysLabel));
+            options.Add(new ToolApprovalOption(
+                hasAssignmentDigest
+                    ? ApprovalOptionKeys.ApproveAssignmentAlwaysV1Key
+                    : ApprovalOptionKeys.ApproveAlwaysKey,
+                ApprovalOptionKeys.ApproveAlwaysLabel));
+        }
+
+        if (includeRepository)
+        {
+            options.Add(new ToolApprovalOption(
+                hasAssignmentDigest
+                    ? ApprovalOptionKeys.ApproveAssignmentRepositoryV1Key
+                    : ApprovalOptionKeys.ApproveRepositoryKey,
+                ApprovalOptionKeys.ApproveRepositoryLabel));
         }
 
         options.Add(new ToolApprovalOption(
-            ApprovalOptionKeys.ApproveEverywhereKey,
+            hasAssignmentDigest
+                ? ApprovalOptionKeys.ApproveAssignmentEverywhereV1Key
+                : ApprovalOptionKeys.ApproveEverywhereKey,
             ApprovalOptionKeys.LabelFor(
-                ApprovalOptionKeys.ApproveEverywhere,
+                hasAssignmentDigest
+                    ? ApprovalOptionKeys.ApproveAssignmentEverywhereV1
+                    : ApprovalOptionKeys.ApproveEverywhere,
                 profile is ApprovalOptionProfile.McpTool)));
         options.Add(new ToolApprovalOption(ApprovalOptionKeys.DenyKey, ApprovalOptionKeys.DenyLabel));
 
         return options;
+    }
+
+    internal static bool HasAssignmentDigest(IReadOnlyList<ApprovalCandidate> candidates)
+        => candidates.Any(static candidate =>
+            candidate.AssignmentDigest is not null);
+
+    private static string? ResolveOfferedRepository(
+        ToolName toolName,
+        bool isMessy,
+        bool hasReusablePhrase,
+        IReadOnlyList<ApprovalCandidate> candidates,
+        string? cwd)
+    {
+        var grantCandidates = candidates
+            .Where(static candidate => !ApprovalPatternMatching.IsPureSideEffect(candidate))
+            .ToArray();
+        if (isMessy || !hasReusablePhrase
+            || !string.Equals(toolName.Value, ShellTool.ToolName, StringComparison.Ordinal)
+            || !GitRepositoryApprovalScope.TryResolveCandidates(grantCandidates, cwd, out var scopes))
+        {
+            return null;
+        }
+
+        return scopes![0].CommonDirectory;
     }
 
     private static bool HasReusableShellPhrase(ApprovalCandidate candidate) =>
@@ -1242,6 +1358,8 @@ public sealed record ToolApprovalContext(
     internal string? ManagedTemporaryDirectory { get; init; }
 
     internal string? PlatformTemporaryRoot { get; init; }
+
+    internal string? RepositoryCommonDirectory { get; init; }
 }
 
 public sealed record ToolApprovalOption(ApprovalOptionKey Key, string Label);

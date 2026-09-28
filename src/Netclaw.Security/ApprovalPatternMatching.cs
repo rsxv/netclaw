@@ -49,7 +49,9 @@ public static class ApprovalPatternMatching
             candidateDirectory,
             cwd,
             approvedEntries.Where(entry =>
-                ToolApprovalEntryComparer.Equals(entry.Verb, candidateVerb)));
+                entry.Repository is null
+                && entry.AssignmentDigest is null
+                && ToolApprovalEntryComparer.Equals(entry.Verb, candidateVerb)));
 
     private static bool MatchesApprovalScope(
         string? candidateDirectory,
@@ -69,8 +71,10 @@ public static class ApprovalPatternMatching
         {
             if (EvaluateApprovalScope(
                     effectiveDirectory,
+                    candidateDirectory,
                     entry,
                     shell,
+                    cwd,
                     ref normalizedCandidate) == ShellApprovalScopeResult.Match)
             {
                 return true;
@@ -82,10 +86,20 @@ public static class ApprovalPatternMatching
 
     private static ShellApprovalScopeResult EvaluateApprovalScope(
         string? effectiveDirectory,
+        string? candidateDirectory,
         ApprovalEntry entry,
         ApprovalShell? shell,
+        string? cwd,
         ref string? normalizedCandidate)
     {
+        if (entry.Repository is not null)
+        {
+            return GitRepositoryApprovalScope.TryResolveCandidate(candidateDirectory, cwd, out var scope)
+                   && ToolApprovalEntryComparer.Equals(scope!.CommonDirectory, entry.Repository)
+                ? ShellApprovalScopeResult.Match
+                : ShellApprovalScopeResult.OutsideDirectory;
+        }
+
         if (entry.Directory is null)
             return ShellApprovalScopeResult.Match;
 
@@ -161,8 +175,10 @@ public static class ApprovalPatternMatching
             {
                 var scopeResult = EvaluateApprovalScope(
                     effectiveDirectory,
+                    candidate.Directory,
                     entry,
                     candidate.Shell,
+                    cwd,
                     ref normalizedCandidate);
                 if (scopeResult == ShellApprovalScopeResult.Match)
                     return new ShellApprovalEvaluation(entry, []);
@@ -217,6 +233,12 @@ public static class ApprovalPatternMatching
             return true;
         }
 
+        if (candidate.AssignmentDigest != entry.AssignmentDigest)
+        {
+            reason = ShellApprovalNearMissReason.AssignmentMismatch;
+            return true;
+        }
+
         reason = ShellApprovalNearMissReason.TokenMismatch;
         return true;
     }
@@ -232,6 +254,11 @@ public static class ApprovalPatternMatching
 
     private static bool PhraseMatches(ApprovalCandidate candidate, ApprovalEntry entry)
     {
+        if (candidate.AssignmentDigest != entry.AssignmentDigest)
+        {
+            return false;
+        }
+
         if (entry.Match is null)
         {
             return ToolApprovalEntryComparer.Equals(entry.Verb, candidate.Verb);
@@ -412,7 +439,8 @@ public static class ApprovalPatternMatching
     {
         foreach (var approved in approvedEntries)
         {
-            if (ToolApprovalEntryComparer.Equals(approved.Verb, candidate))
+            if (approved.Repository is null
+                && ToolApprovalEntryComparer.Equals(approved.Verb, candidate))
                 return true;
         }
 
@@ -438,7 +466,7 @@ public static class ApprovalPatternMatching
     /// </remarks>
     public static bool IsPureSideEffect(ApprovalCandidate candidate)
     {
-        if (candidate.Directory is not null)
+        if (candidate.Directory is not null || candidate.AssignmentDigest is not null)
             return false;
 
         return ShellTokenizer.SingleTokenSideEffectVerbs.Contains(candidate.Verb);
@@ -603,6 +631,7 @@ internal enum ShellApprovalNearMissReason
     MissingDirectory = 2,
     TokenMismatch = 3,
     ShellMismatch = 4,
+    AssignmentMismatch = 5,
 }
 
 internal sealed record ShellApprovalNearMiss(
