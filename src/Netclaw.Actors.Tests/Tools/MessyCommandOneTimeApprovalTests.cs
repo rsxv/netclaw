@@ -14,6 +14,7 @@ using Netclaw.Actors.Tools;
 using Netclaw.Configuration;
 using Netclaw.Tests.Utilities;
 using Netclaw.Tools;
+using Netclaw.Tools.Authorization.Consent;
 using Xunit;
 using Xunit.v3;
 
@@ -91,14 +92,14 @@ public sealed class MessyCommandOneTimeApprovalTests : TestKit
         var approvalService = new AkkaToolApprovalService(new StubRequiredActor(approvalActor));
         var executor = new DispatchingToolExecutor(registry, policy, approvalService);
 
-        // The runtime iterator is unresolved, so the command remains messy
-        // even though bounded literal loops can now publish authored facts.
+        // The parser does not support a while loop, so the whole command stays
+        // unresolved and has no command candidates.
         var toolCall = new FunctionCallContent(
             "call-messy-once",
             "shell_execute",
             ToolInput.Create(
                 "Command",
-                "for i in $(printf '1 2 3'); do echo \"$i\"; done",
+                "while read -r f; do cat \"$f\"; done < list.txt",
                 "_rationale",
                 "Verify one-time approval for a complex command."));
 
@@ -122,8 +123,7 @@ public sealed class MessyCommandOneTimeApprovalTests : TestKit
         // tool-name and patterns on the context. For messy commands the
         // patterns list is empty (per ApprovalContext.Patterns above), so
         // the bypass must rely on tool-name match only.
-        context.OneTimeApprovedToolName = toolCall.Name;
-        context.SetOneTimeApprovedPatterns(OneTimeApprovalKeys.Create(firstAttempt.ApprovalContext));
+        context.Approval.SeedOneTimeConsent(new OneTimeConsent(toolCall.Name, OneTimeApprovalKeys.Create(firstAttempt.ApprovalContext)));
 
         // The retry must succeed without throwing. Output text varies by
         // environment (bash for-loop expansion); the load-bearing assertion
@@ -132,8 +132,7 @@ public sealed class MessyCommandOneTimeApprovalTests : TestKit
 
         // After the per-retry cleanup runs, the bypass is gone and a
         // subsequent attempt re-prompts.
-        context.OneTimeApprovedToolName = null;
-        context.SetOneTimeApprovedPatterns([]);
+        context.Approval.ClearOneTimeConsent();
 
         await Assert.ThrowsAsync<ToolApprovalRequiredException>(() =>
             executor.ExecuteAsync(toolCall, context, TestContext.Current.CancellationToken));

@@ -6,6 +6,7 @@
 using Netclaw.Configuration;
 using Netclaw.Daemon.Configuration;
 using Netclaw.Security;
+using Netclaw.Security.Authorization.Filesystem;
 using ShellSyntaxTree;
 using Xunit;
 
@@ -13,21 +14,27 @@ namespace Netclaw.Daemon.Tests.Configuration;
 
 public sealed class DaemonToolPathPolicyFactoryTests
 {
-    [Fact]
-    public void Ordinary_config_is_readable_but_not_writable_or_shell_accessible()
+    // Owner decision (approval taxonomy stack 2, PR C): the agent may read its
+    // own configuration with a file tool. A write and a shell command that
+    // names the file stay denied, because shell text cannot show a read from a write.
+    [Theory]
+    [InlineData("netclaw.json")]
+    [InlineData("tool-approvals.json")]
+    public void Own_config_is_readable_but_not_writable_or_shell_accessible(string fileName)
     {
         var paths = new NetclawPaths(Path.Combine(Path.GetTempPath(), "netclaw-policy-contract"));
         var policy = DaemonToolPathPolicyFactory.Create(
             paths,
             ShellExecutionEnvironment.CreateBash(ShellPlatform.Linux));
+        var configPath = Path.Combine(paths.ConfigDirectory, fileName);
 
-        Assert.False(policy.IsReadDenied(paths.NetclawConfigPath));
-        Assert.True(policy.IsDenied(paths.NetclawConfigPath));
-        Assert.True(policy.CommandReferencesDeniedPath($"cat '{paths.NetclawConfigPath}'"));
+        Assert.False(policy.FileSystem.IsProtected(configPath, PathOperation.Read));
+        Assert.True(policy.FileSystem.IsProtected(configPath, PathOperation.Write));
+        Assert.True(policy.CommandReferencesDeniedPath($"cat '{configPath}'"));
     }
 
     [Fact]
-    public void Other_configuration_and_control_plane_files_remain_read_denied()
+    public void Credentials_and_control_plane_files_remain_read_denied()
     {
         var paths = new NetclawPaths(Path.Combine(Path.GetTempPath(), "netclaw-policy-contract"));
         var policy = DaemonToolPathPolicyFactory.Create(
@@ -36,8 +43,8 @@ public sealed class DaemonToolPathPolicyFactoryTests
         string[] protectedPaths =
         [
             paths.SecretsPath,
+            Path.Combine(paths.KeysDirectory, "key-1.xml"),
             paths.WebhooksDirectory,
-            paths.ToolApprovalsPath,
             paths.HardDenyOverridesPath,
             paths.DaemonEnvironmentFilePath,
             paths.DevicesPath,
@@ -48,7 +55,7 @@ public sealed class DaemonToolPathPolicyFactoryTests
             paths.RestartManifestPath
         ];
 
-        Assert.All(protectedPaths, path => Assert.True(policy.IsReadDenied(path), path));
+        Assert.All(protectedPaths, path => Assert.True(policy.FileSystem.IsProtected(path, PathOperation.Read), path));
     }
 
     [Theory]
@@ -66,8 +73,8 @@ public sealed class DaemonToolPathPolicyFactoryTests
         var policy = DaemonToolPathPolicyFactory.Create(paths, environment);
         var skillPath = Path.Combine(paths.SystemSkillsDirectory, "netclaw-operations", "SKILL.md");
 
-        Assert.False(policy.IsReadDenied(skillPath));
-        Assert.True(policy.IsDenied(skillPath));
+        Assert.False(policy.FileSystem.IsProtected(skillPath, PathOperation.Read));
+        Assert.True(policy.FileSystem.IsProtected(skillPath, PathOperation.Write));
     }
 
     [Theory]
@@ -81,8 +88,8 @@ public sealed class DaemonToolPathPolicyFactoryTests
             ShellExecutionEnvironment.CreateBash(ShellPlatform.Linux));
         var catalogPath = Path.Combine([paths.ToolingShadowDirectory, .. relativePath.Split('/')]);
 
-        Assert.True(policy.IsDenied(catalogPath));
-        Assert.True(policy.IsReadDenied(catalogPath));
+        Assert.True(policy.FileSystem.IsProtected(catalogPath, PathOperation.Write));
+        Assert.True(policy.FileSystem.IsProtected(catalogPath, PathOperation.Read));
         Assert.True(policy.CommandReferencesDeniedPath($"inspect '{catalogPath}'"));
         Assert.True(policy.CommandReferencesDeniedPath("find", catalogPath));
     }

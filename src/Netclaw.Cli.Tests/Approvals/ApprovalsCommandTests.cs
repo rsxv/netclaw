@@ -248,7 +248,7 @@ public sealed class ApprovalsCommandTests : IDisposable
     {
         var repository = ApprovalEntry.CreateRepositoryTokenPrefix(
             ApprovalShell.Bash, ["./scripts/bump-version.sh"], "/work/main/.git");
-        var folder = InDir("./scripts/bump-version.sh", "/work/main");
+        var folder = InDir("/work/main/scripts/bump-version.sh", "/work/main");
         _store.AddApproval(TrustAudience.Personal, "shell_execute", repository);
         _store.AddApproval(TrustAudience.Personal, "shell_execute", folder);
 
@@ -603,14 +603,18 @@ public sealed class ApprovalsCommandTests : IDisposable
     [Fact]
     public async Task Revoke_old_scope_rejects_ambiguous_typed_phrases()
     {
-        _store.AddApproval(
-            TrustAudience.Personal,
-            "shell_execute",
-            ApprovalEntry.CreateTokenPrefix(ApprovalShell.Bash, ["git", "push"]));
-        _store.AddApproval(
-            TrustAudience.Personal,
-            "shell_execute",
-            ApprovalEntry.CreateLegacyExact(ApprovalShell.Bash, "git push"));
+        // The store no longer saves a grant that another grant covers, so an
+        // older store file holds the two equal phrases.
+        Directory.CreateDirectory(Path.GetDirectoryName(_paths.ToolApprovalsPath)!);
+        await File.WriteAllTextAsync(
+            _paths.ToolApprovalsPath,
+            """
+            {"version":3,"audiences":{"personal":{"shell_execute":[
+              {"shell":"Bash","match":"TokenPrefix","verbTokens":["git","push"],"directory":null,"createdAt":null},
+              {"shell":"Bash","match":"LegacyExact","verb":"git push","directory":null,"createdAt":null}
+            ]}}}
+            """,
+            TestContext.Current.CancellationToken);
 
         var exit = await ApprovalsCommand.RunAsync(
             ["approvals", "revoke", "git push anywhere"],
@@ -778,6 +782,6 @@ public sealed class ApprovalsCommandTests : IDisposable
 
         var output = _output.ToString();
         Assert.Contains("trust-verb", output);
-        Assert.Contains("typed token prefixes", output);
+        Assert.Contains("covers exactly its command words", output);
     }
 }

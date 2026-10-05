@@ -2,11 +2,29 @@
 
 ## Unreleased
 
+### Configuration
+
+- **Configured tool lists now replace the defaults.** Before this change, the daemon added configured `Tools` list items to the built-in defaults, so an operator could not narrow an audience tool allowlist, file roots, `GlobalReadRoots`, attachment categories, or `WebFetch.HttpAllowList`. The Security & Access TUI tool-group and attachment changes also had no effect on the daemon. Now a configured list is the complete list.
+  - `[]`, `null`, and `{}` give an empty list. For `null` and `{}`, the daemon logs a startup warning that names the key.
+  - The daemon now stops at startup, with an error that names the key, when a list key has a scalar value, when an attachment category is not one defined name (for example `"Bogus"` or `"Pdf, Document"`), or when an empty `NETCLAW_*` variable and a config file both set the same list.
+  - `netclaw doctor` now warns when a Public or Team allowlist does not include `tool_output_read`. Spilled tool output tells the model to call that tool. The warning has no auto-fix, because a narrow list can be intentional.
+  - **Exact older default lists map to today's defaults.** `netclaw init` 0.8.0 to 0.25.4 (and 0.26.0-beta.1 to beta.5) wrote the complete Public and Team `AllowedTools` default lists. When a stored list exactly matches one of those older lists, the daemon applies today's default for that audience and logs a startup warning. A 0.8.0 to 0.19.0 Public list maps to today's Public default and so loses `file_write`.
+  - **`netclaw doctor --fix` removes copied default lists.** `netclaw doctor` reports a Public or Team `AllowedTools` list that exactly matches any shipped default, which includes today's default. `netclaw doctor --fix` backs up `netclaw.json` to `netclaw.json.legacy-tool-defaults.bak` (or the next free `.N.bak`) and deletes that key. The rest of the profile stays. The audience then follows the default, so it gets the tools that later releases add.
+  - **Edited older lists are applied as written.** An older list that was edited, for example with Web Access turned off in the TUI, or the 17-tool list that the 0.24 TUI wrote when it changed a profile from `All` to `Allowlist`, is not an exact match. The daemon applies it as written, so it does not get `file_search` or `tool_output_read`. Add those tools to the list by hand.
+  - **Upgrade impact:** if `netclaw.json` has a narrowed list, the daemon now applies it. For example, `"Team": { "AllowedTools": ["file_read", "file_list"] }` gave all 15 Team tools before and gives only those two tools now. To add one entry to a default list, write the complete list, for example `"GlobalReadRoots": ["{skills_dir}", "{identity_dir}", "{workspaces_dir}", "/srv/docs"]`. Check each `Tools` list in `netclaw.json`, `secrets.json`, and `NETCLAW_*` variables before you upgrade.
+
+- **`netclaw init` saves the posture, not the default tool lists.** Init writes `Security.DeploymentPosture`, `Security.ShellExecutionMode`, `Security.StrictDefaults`, and `Tools.ShellMode`. It does not write `Tools.AudienceProfiles`. The daemon computes the audience profiles from the posture, so a new install gets the tools that later releases add to its defaults. The Personal posture rule, approval for `shell_execute` on Personal, is now a daemon default. A new install gets the same effective tool configuration as before. `netclaw doctor` no longer asks for explicit audience profiles.
+
 ### Shell authorization
 
 - **Static shell assignments can use exact reusable approvals.** Netclaw binds each grant to a digest of the complete Bash or PowerShell assignment facts.
 - **Shell launch facts stay aligned with parser facts.** Netclaw probes Bash versions and uses isolated PowerShell processes for bounded assignment analysis.
 - **Finite PowerShell loops can reuse exact grants.** Netclaw checks all public path facts before it reuses a stored verb.
+
+### MCP OAuth
+
+- **A reconnect no longer loses a rotated refresh token.** Netclaw sends one refresh grant at a time for each MCP server, and each connection redeems the newest stored refresh token. A connection from before an explicit authorization cannot replace the credentials of that authorization ([#2263](https://github.com/netclaw-dev/netclaw/issues/2263)).
+- **Rejected refresh grants are logged.** The daemon logs the token endpoint status and the OAuth `error` fields when an authorization server rejects a refresh. The refresh diagnostic line no longer reports an absent client secret as a blocker ([#2263](https://github.com/netclaw-dev/netclaw/issues/2263)).
 
 ## 0.27.1-beta.1 (2026-09-24)
 

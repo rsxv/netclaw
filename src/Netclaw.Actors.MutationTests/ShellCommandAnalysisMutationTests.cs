@@ -32,23 +32,47 @@ public sealed class ShellCommandAnalysisMutationTests
         var matcher = new ShellApprovalMatcher(environment);
         var analysis = policy.Analyze("cd /work/sub && true; touch marker.txt", "/work");
 
-        Assert.True(BashStaticCompoundApprovalProjection.TryCreate(
+        Assert.True(BashDirectoryScopeProjection.TryCreate(
             analysis, policy, matcher, out var projection));
 
-        Assert.Equal(["/work", "/work/sub"], projection!.Candidates
+        Assert.Equal(["/work", "/work/sub"], projection.Candidates
             .Where(static candidate => candidate.Verb == "touch")
             .Select(static candidate => candidate.Directory)
             .Distinct()
             .Order(StringComparer.Ordinal));
     }
 
-    [Fact]
-    public void Bare_status_output_keeps_static_candidates_without_accepting_other_unknown_data_or_redirects()
+    // Owner decision D2: only a kill whose operand text names the Netclaw
+    // daemon stays hard-denied. Any other kill reaches the approval gate. A
+    // name split by quotes or an escape is unparseable, and the text scan
+    // still joins it.
+    [Theory]
+    [InlineData("pkill netclawd", false)]
+    [InlineData("kill -9 $(cat ~/.netclaw/daemon.pid)", false)]
+    [InlineData("KILLALL NetClaw", false)]
+    [InlineData("pkill net''clawd", false)]
+    [InlineData("pkill net\\clawd", false)]
+    [InlineData("kill -9 12345", true)]
+    [InlineData("pkill -f 'http.server 8899'", true)]
+    [InlineData("echo netclaw", true)]
+    public void Only_a_kill_that_names_the_daemon_is_hard_denied(string command, bool allowed)
+    {
+        var policy = new ShellCommandPolicy(ShellExecutionEnvironment.CreateBash(ShellPlatform.Linux));
+
+        Assert.Equal(allowed, policy.Evaluate(command).Allowed);
+    }
+
+    // A word with a control character gets the deepest ancestor directory of
+    // its text before that character, not an unresolved scope.
+    [Theory]
+    [InlineData("python3 -c \"import sys\nprint(1)\"", "python3@/work")]
+    [InlineData("python3 -c \"/opt/tools/run\nexit()\"", "python3@/opt/tools")]
+    public void Control_character_word_gets_its_clean_ancestor_scope(string command, string expected)
     {
         var matcher = new ShellApprovalMatcher(
             ShellExecutionEnvironment.CreateBash(ShellPlatform.Linux));
 
-        ShellApprovalAnalysis Analyze(string command) => matcher.AnalyzeInvocation(
+        var analysis = matcher.AnalyzeInvocation(
             new ToolName("shell_execute"),
             new Dictionary<string, object?>
             {
@@ -56,16 +80,105 @@ public sealed class ShellCommandAnalysisMutationTests
                 ["WorkingDirectory"] = "/work"
             });
 
+        Assert.False(analysis.IsMessy);
+        Assert.Equal(
+            [expected],
+            analysis.Candidates.Select(static candidate => $"{candidate.Verb}@{candidate.Directory}"));
+    }
+
+    // An absolute word below an absent top-level directory names no existing
+    // file (an API route), so it has no path scope. The probe needs a working
+    // directory that exists on this host; a synthetic one keeps the scope.
+    [Theory]
+    [InlineData("gh api /repos/o/r/actions/jobs/1/logs", true, "gh api@{cwd}")]
+    [InlineData("gh api \"/advisories?ecosystem=nuget\"", true, "gh api@{cwd}")]
+    [InlineData("ls /usr/netclaw-absent", true, "ls@/usr/netclaw-absent")]
+    [InlineData("gh api /repos/o/r/actions/jobs/1/logs", false, "gh api@/repos/o/r/actions/jobs/1/logs")]
+    public void Absent_top_level_word_has_no_path_scope(string command, bool realWorkingDirectory, string expected)
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var cwd = realWorkingDirectory ? Path.GetFullPath(AppContext.BaseDirectory).TrimEnd('/') : "/netclaw-synthetic/work";
+        var matcher = new ShellApprovalMatcher(
+            ShellExecutionEnvironment.CreateBash(ShellPlatform.Linux));
+
+        var analysis = matcher.AnalyzeInvocation(
+            new ToolName("shell_execute"),
+            new Dictionary<string, object?>
+            {
+                ["Command"] = command,
+                ["WorkingDirectory"] = cwd
+            });
+
+        Assert.False(analysis.IsMessy);
+        Assert.Equal(
+            [expected.Replace("{cwd}", cwd, StringComparison.Ordinal)],
+            analysis.Candidates.Select(static candidate => $"{candidate.Verb}@{candidate.Directory}"));
+    }
+
+    // A dynamic value is data only in an operand of an output command: echo,
+    // :, true, false, or printf after a literal format that is not an option.
+    [Theory]
+    [InlineData("git push; echo \"head: $(git rev-parse HEAD)\"", false)]
+    [InlineData("git push; true \"$(date)\"", false)]
+    [InlineData("git push; printf '%s' \"$(date)\"", false)]
+    [InlineData("git push; printf \"$(date)\" x", true)]
+    [InlineData("git push; printf -v name '%s' \"$(date)\"", true)]
+    [InlineData("git push; cat \"$(date)\"", true)]
+    [InlineData("git push; echo $?", false)]
+    [InlineData("git push; echo $? > /work/out/marker", false)]
+    [InlineData("git push; echo $? > \"$(date)\"", true)]
+    [InlineData("git push; \"$(date)\" \"$@\"", true)]
+    public void Dynamic_value_is_data_only_in_an_output_operand(string command, bool messy)
+    {
+        var matcher = new ShellApprovalMatcher(
+            ShellExecutionEnvironment.CreateBash(ShellPlatform.Linux));
+
+        var analysis = matcher.AnalyzeInvocation(
+            new ToolName("shell_execute"),
+            new Dictionary<string, object?>
+            {
+                ["Command"] = command,
+                ["WorkingDirectory"] = "/work"
+            });
+
+        Assert.Equal(messy, analysis.IsMessy);
+        Assert.Equal(messy, analysis.Candidates.Count == 0);
+    }
+
+    // PowerShell keeps the bare status rule: only $? keeps the static
+    // candidates of an output command without a redirect.
+    [Fact]
+    public void Power_shell_bare_status_output_keeps_static_candidates()
+    {
+        var matcher = new ShellApprovalMatcher(PowerShellEnvironment);
+
+        ShellApprovalAnalysis Analyze(string command) => matcher.AnalyzeInvocation(
+            new ToolName("shell_execute"),
+            new Dictionary<string, object?>
+            {
+                ["Command"] = command,
+                ["WorkingDirectory"] = @"C:\work"
+            });
+
         var status = Analyze("git push; echo $?");
-        var positional = Analyze("git push; echo $@");
-        var redirect = Analyze("git push; echo $? > /tmp/marker");
+        var other = Analyze("git push; echo $dynamic");
 
         Assert.False(status.IsMessy);
-        Assert.Equal(["git push", "echo"], status.Candidates.Select(static candidate => candidate.Verb));
-        Assert.True(positional.IsMessy);
-        Assert.Empty(positional.Candidates);
-        Assert.True(redirect.IsMessy);
-        Assert.Empty(redirect.Candidates);
+        Assert.Contains("git push", status.Candidates.Select(static candidate => candidate.Verb));
+        Assert.True(other.IsMessy);
+    }
+
+    // The data-operand rule is Bash only. In PowerShell, echo is an alias of
+    // Write-Output, so a dynamic value keeps the call unresolved.
+    [Fact]
+    public void Power_shell_output_alias_keeps_a_dynamic_value_unresolved()
+    {
+        var analysis = new ShellCommandAnalyzer(PowerShellEnvironment).Analyze("echo $dynamic", @"C:\work");
+
+        Assert.Equal(ShellAnalysisFailure.None, analysis.Failure);
+        Assert.True(analysis.HasDynamicSyntax);
     }
 
     [Fact]

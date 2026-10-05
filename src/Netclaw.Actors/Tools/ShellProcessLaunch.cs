@@ -5,6 +5,7 @@
 // -----------------------------------------------------------------------
 using System.Diagnostics;
 using Netclaw.Security;
+using Netclaw.Security.Authorization.Filesystem;
 using Netclaw.Tools;
 
 namespace Netclaw.Actors.Tools;
@@ -40,7 +41,7 @@ public sealed class ShellProcessLaunch
         WorkingDirectory = workingDirectory;
         if (!Path.IsPathFullyQualified(WorkingDirectory))
             throw new ShellProcessStartException("Shell execution requires an absolute working directory.");
-        if (ShellPathRules.HasParentDirectorySegment(WorkingDirectory))
+        if (CanonicalPath.HasParentSegment(WorkingDirectory))
             throw new ShellProcessStartException("Shell execution requires a working directory without parent traversal segments.");
         _context = context;
         _commandPolicy = commandPolicy;
@@ -101,19 +102,20 @@ public sealed class ShellProcessLaunch
         if (_context.ProjectDirectory is { } projectDirectory)
             paths.Add(projectDirectory);
         AddPaths(analysis);
-        if (BashStaticCompoundApprovalProjection.TryCreate(
+        // The same directory proof that authorized each occurrence names the paths to recheck (#2122, #1828).
+        if (BashDirectoryScopeProjection.TryCreate(
                 analysis,
                 _commandPolicy,
                 new ShellApprovalMatcher(Environment),
                 out var projection))
         {
-            foreach (var slice in projection!.Slices)
+            foreach (var slice in projection.Slices)
                 AddPaths(slice.Analysis);
         }
 
         return paths.Order(StringComparer.Ordinal).Select(static path =>
         {
-            ToolPathPolicy.TryResolveSymlinksInPath(path, out var target);
+            FileSystemAuthority.TryResolveLinks(path, out var target);
             return new LaunchPathState(path, target, Directory.Exists(path));
         }).ToArray();
 
@@ -135,7 +137,8 @@ public sealed class ShellProcessLaunch
     private ShellCommandAnalysis CheckHardPolicies()
     {
         // Parse again because filesystem facts and policy can change while the request waits.
-        var analysis = _commandPolicy.Analyze(Command, WorkingDirectory);
+        // The launch facts are the variables that this launch sets on the child process.
+        var analysis = _commandPolicy.Analyze(Command, WorkingDirectory, Storage.ManagedTemporary);
         var decision = _commandPolicy.Evaluate(analysis);
         if (!decision.Allowed)
             throw new ShellProcessStartException($"Error: Command blocked by hard deny policy: {decision.DenyReason}");
@@ -174,7 +177,7 @@ public sealed class ShellProcessLaunch
                 $"Error: Working directory '{WorkingDirectory}' does not exist. Create it first, e.g.: {CreateDirectoryHint()}");
         }
 
-        _startInfo.WorkingDirectory = WorkingDirectory;
+        Environment.ApplyWorkingDirectory(_startInfo, WorkingDirectory);
     }
 
     private string CreateDirectoryHint()

@@ -136,11 +136,50 @@ security_patterns+=("ShellCommandAnalysis.cs{$span_start..$span_end}")
 read -r wrapper_start wrapper_end wrapper_start_line wrapper_start_column wrapper_end_line wrapper_end_column < <(
   find_span \
     "$analysis_file" \
-    "if (commands.Skip(innerCommandStart).Any" \
-    "if (commands.Skip(innerCommandStart).Any" \
+    "if (occurrence.Assignments.Count > 0" \
+    "if (occurrence.Assignments.Count > 0" \
     "return ShellAnalysisFailure.Unresolved;"
 )
 security_patterns+=("ShellCommandAnalysis.cs{$wrapper_start..$wrapper_end}")
+
+read -r source_start source_end source_start_line source_start_column source_end_line source_end_column < <(
+  find_span \
+    "$analysis_file" \
+    "private static WrapperSource FindWrapperSource" \
+    "var invoker = words.FindIndex" \
+    "return new WrapperSource.Missing();"
+)
+security_patterns+=("ShellCommandAnalysis.cs{$source_start..$source_end}")
+
+# The final "return true;" is not a target: a false result only screens each
+# list element again and adds the same clauses.
+read -r screen_start screen_end screen_start_line screen_start_column screen_end_line screen_end_column < <(
+  find_span \
+    "$analysis_file" \
+    "private bool TryCollectScreenClauses" \
+    "foreach (var state in ScreenStates)" \
+    "if (screened.Failure == ShellAnalysisFailure.None)"
+)
+security_patterns+=("ShellCommandAnalysis.cs{$screen_start..$screen_end}")
+
+read -r screen_miss_start screen_miss_end screen_miss_start_line screen_miss_start_column screen_miss_end_line screen_miss_end_column < <(
+  find_span \
+    "$analysis_file" \
+    "private bool TryCollectScreenClauses" \
+    "return false;" \
+    "return false;"
+)
+security_patterns+=("ShellCommandAnalysis.cs{$screen_miss_start..$screen_miss_end}")
+
+policy_file="$repo_root/src/Netclaw.Security/ShellCommandPolicy.cs"
+read -r screen_deny_start screen_deny_end screen_deny_start_line screen_deny_start_column screen_deny_end_line screen_deny_end_column < <(
+  find_span \
+    "$policy_file" \
+    "private ShellCommandDecision EvaluateClauses" \
+    "foreach (var clause in clauses)" \
+    "return decision;"
+)
+security_patterns+=("ShellCommandPolicy.cs{$screen_deny_start..$screen_deny_end}")
 
 environment_file="$repo_root/src/Netclaw.Security/ShellExecutionEnvironment.cs"
 read -r mode_start mode_end mode_start_line mode_start_column mode_end_line mode_end_column < <(
@@ -172,15 +211,15 @@ read -r option_start option_end option_start_line option_start_column option_end
 )
 actor_patterns+=("Tools/ToolAccessPolicy.cs{$option_start..$option_end}")
 
-session_actor_file="$repo_root/src/Netclaw.Actors/Sessions/LlmSessionActor.cs"
+consent_answer_file="$repo_root/src/Netclaw.Actors/Authorization/Consent/ConsentAnswer.cs"
 read -r offered_start offered_end offered_start_line offered_start_column offered_end_line offered_end_column < <(
   find_span \
-    "$session_actor_file" \
-    "internal static bool IsOfferedApprovalOption(" \
+    "$consent_answer_file" \
+    "internal static bool IsOffered(" \
     "=> ApprovalOptionKeys.IsAssignmentVariant(selectedKey)" \
     ": optionKeys.Count == 0 || optionKeys.Contains(selectedKey, StringComparer.Ordinal);"
 )
-actor_patterns+=("Sessions/LlmSessionActor.cs{$offered_start..$offered_end}")
+actor_patterns+=("Authorization/Consent/ConsentAnswer.cs{$offered_start..$offered_end}")
 
 read -r sanitizer_start sanitizer_end sanitizer_start_line sanitizer_start_column sanitizer_end_line sanitizer_end_column < <(
   find_span \
@@ -194,10 +233,14 @@ security_patterns+=("ShellExecutionEnvironment.cs{$sanitizer_start..$sanitizer_e
 security_output="$output_path/security"
 run_group "stryker-shell-command-analysis.json" "$security_output" "${security_patterns[@]}"
 security_report="$security_output/reports/mutation-report.json"
-assert_report "$security_report" 41
+assert_report "$security_report" 56
 assert_target "$security_report" "digest-match" "$matching_file" "$matching_start_line" "$matching_start_column" "$matching_end_line" "$matching_end_column" 2
 assert_target "$security_report" "assignment-span" "$analysis_file" "$span_start_line" "$span_start_column" "$span_end_line" "$span_end_column" 1
-assert_target "$security_report" "fallback-wrapper-assignments" "$analysis_file" "$wrapper_start_line" "$wrapper_start_column" "$wrapper_end_line" "$wrapper_end_column" 4
+assert_target "$security_report" "fallback-wrapper-assignments" "$analysis_file" "$wrapper_start_line" "$wrapper_start_column" "$wrapper_end_line" "$wrapper_end_column" 6
+assert_target "$security_report" "wrapper-child-source" "$analysis_file" "$source_start_line" "$source_start_column" "$source_end_line" "$source_end_column" 9
+assert_target "$security_report" "hard-deny-screen" "$analysis_file" "$screen_start_line" "$screen_start_column" "$screen_end_line" "$screen_end_column" 2
+assert_target "$security_report" "hard-deny-screen-elements" "$analysis_file" "$screen_miss_start_line" "$screen_miss_start_column" "$screen_miss_end_line" "$screen_miss_end_column" 1
+assert_target "$security_report" "hard-deny-screen-policy" "$policy_file" "$screen_deny_start_line" "$screen_deny_start_column" "$screen_deny_end_line" "$screen_deny_end_column" 1
 assert_target "$security_report" "bash-initial-state" "$environment_file" "$mode_start_line" "$mode_start_column" "$mode_end_line" "$mode_end_column" 7
 assert_target "$security_report" "bash-sanitizer" "$environment_file" "$sanitizer_start_line" "$sanitizer_start_column" "$sanitizer_end_line" "$sanitizer_end_column" 27
 
@@ -207,4 +250,4 @@ actor_report="$actor_output/reports/mutation-report.json"
 assert_report "$actor_report" 15
 assert_target "$actor_report" "reviewed-safe" "$reviewed_file" "$reviewed_start_line" "$reviewed_start_column" "$reviewed_end_line" "$reviewed_end_column" 2
 assert_target "$actor_report" "rollback-safe-options" "$access_policy_file" "$option_start_line" "$option_start_column" "$option_end_line" "$option_end_column" 2
-assert_target "$actor_report" "legacy-prompt-options" "$session_actor_file" "$offered_start_line" "$offered_start_column" "$offered_end_line" "$offered_end_column" 11
+assert_target "$actor_report" "legacy-prompt-options" "$consent_answer_file" "$offered_start_line" "$offered_start_column" "$offered_end_line" "$offered_end_column" 11

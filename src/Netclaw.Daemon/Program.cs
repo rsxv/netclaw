@@ -169,7 +169,7 @@ static async Task RunDaemonAsync(
     builder.WebHost.UseUrls($"http://{daemonConfig.Host}:{daemonConfig.Port}");
     var daemonLogLevel = builder.ConfigureNetclawLogging(paths);
     builder.AddNetclawTelemetry();
-    ConfigureDaemonServices(
+    var configurationWarnings = ConfigureDaemonServices(
         builder.Services,
         builder.Configuration,
         paths,
@@ -242,6 +242,9 @@ static async Task RunDaemonAsync(
         shellResolution.Environment.ExecutablePath,
         shellResolution.Environment.Grammar,
         shellResolution.Environment.PowerShellDialect?.ToString() ?? "not-applicable");
+    foreach (var warning in configurationWarnings)
+        startupLogger.LogWarning("Configuration warning: {ConfigurationWarning}", warning);
+
     if (shellResolution.FallbackReason is { } fallbackReason)
     {
         startupLogger.LogWarning(
@@ -399,10 +402,7 @@ static NetclawPaths ConfigureConfigServices(
     // 1. netclaw.json (base config, optional)
     // 2. secrets.json (credentials overlay, optional)
     // 3. NETCLAW_* environment variables (highest priority)
-    configuration
-        .AddJsonFile(bootstrapPaths.NetclawConfigPath, optional: true, reloadOnChange: false)
-        .AddJsonFile(bootstrapPaths.SecretsPath, optional: true, reloadOnChange: false)
-        .AddEnvironmentVariables("NETCLAW_");
+    configuration.AddNetclawDaemonSources(bootstrapPaths);
 
     // Re-create paths with config-driven overrides (e.g. custom workspaces directory).
     var workspacesDir = configuration.GetValue<string>("Workspaces:Directory");
@@ -439,7 +439,8 @@ static NetclawPaths ConfigureConfigServices(
 // Daemon-only services (actor system, tools, persistence)
 // ═══════════════════════════════════════════════════════════════════════
 
-static void ConfigureDaemonServices(
+// Returns configuration warnings. The caller logs them after the host builds its loggers.
+static IReadOnlyList<string> ConfigureDaemonServices(
     IServiceCollection services,
     IConfigurationManager configuration,
     NetclawPaths paths,
@@ -584,23 +585,15 @@ static void ConfigureDaemonServices(
     var sessionConfig = SessionConfig.BindFromConfiguration(configuration.GetSection("Session"));
     services.AddSingleton(sessionConfig);
 
-    // Tools (auto-bound, no required properties)
-    var toolConfig = configuration.GetSection("Tools")
-        .Get<ToolConfig>() ?? new ToolConfig();
-    var attachmentErrors = toolConfig.AudienceProfiles.ValidateChannelAttachments();
-    if (attachmentErrors.Count > 0)
-    {
-        throw new InvalidOperationException(
-            "Invalid Tools.AudienceProfiles.ChannelAttachments configuration: "
-            + string.Join("; ", attachmentErrors));
-    }
-    services.AddSingleton(toolConfig);
-
-    var securityPolicyConfig = configuration.GetSection("Security")
-        .Get<SecurityPolicyConfig>() ?? new SecurityPolicyConfig();
+    // The Tools defaults depend on the resolved posture, so Security and Tools bind together.
+    var policyConfiguration = PolicyConfiguration.Bind(configuration);
+    var securityPolicyConfig = policyConfiguration.Security;
     services.AddSingleton(securityPolicyConfig);
-    var effectivePolicyDefaults = SecurityPolicyDefaults.Resolve(securityPolicyConfig);
+    var effectivePolicyDefaults = policyConfiguration.Defaults;
     services.AddSingleton(effectivePolicyDefaults);
+    var toolConfig = policyConfiguration.Tools;
+    var toolConfigWarnings = policyConfiguration.ToolWarnings;
+    services.AddSingleton(toolConfig);
     services.AddSingleton<TrustContextDeriver>();
 
     // Reminder limits stay private. Netclaw sets the library acknowledgement
@@ -632,21 +625,6 @@ static void ConfigureDaemonServices(
     var toolPathPolicy = DaemonToolPathPolicyFactory.Create(paths, shellEnvironment);
     services.AddSingleton(toolPathPolicy);
 
-    // Load operator-authored hard-deny overrides (additive only — see
-    // HardDenyOverridesLoader). Missing file → empty list and only shipped
-    // defaults apply. Malformed file → daemon refuses to start; the
-    // loader throws InvalidDataException with operator-facing context so
-    // the failure surfaces loudly rather than silently dropping rules.
-    var hardDenyOverridesLoader = new HardDenyOverridesLoader();
-    var hardDenyOverrides = hardDenyOverridesLoader.Load(paths.HardDenyOverridesPath);
-    services.AddSingleton(hardDenyOverridesLoader);
-
-    var shellCommandPolicy = new ShellCommandPolicy(
-        shellEnvironment,
-        toolConfig.HardDenyPatterns,
-        hardDenyOverrides);
-    services.AddSingleton(shellCommandPolicy);
-
     services.AddShellParser(shellEnvironment);
 
     // Subagent timeout configuration
@@ -676,7 +654,6 @@ static void ConfigureDaemonServices(
         SkillSyncEnabled: skillSyncConfig.Enabled,
         SubAgentsEnabled: subAgentConfig.Enabled,
         SchedulingEnabled: schedulingConfig.Enabled);
-    var fileApprovalMatcher = new FilePathApprovalMatcher(paths.ConfigDirectory);
     // Safe-verbs list: bundled per-OS defaults only — embedded resource in
     // Netclaw.Configuration with no on-disk user override. Used by the
     // approval gate's verb-pattern Layer to auto-allow demonstrably
@@ -687,29 +664,15 @@ static void ConfigureDaemonServices(
     var safeVerbs = SafeVerbLoader.Load(shellEnvironment.Platform == ShellPlatform.Windows);
     services.AddSingleton(safeVerbs);
 
-    var toolAccessPolicy = new ToolAccessPolicy(
+    var toolAccessPolicy = services.AddDaemonToolAuthorization(
         paths,
+        shellEnvironment,
         toolConfig,
         effectivePolicyDefaults,
-        shellCommandPolicy,
         toolPathPolicy,
-        fileApprovalMatcher,
+        safeVerbs,
         featureGates,
-        safeVerbs);
-    services.AddSingleton(toolAccessPolicy);
-
-    var approvalShell = shellEnvironment.Grammar switch
-    {
-        ShellGrammar.Bash => ApprovalShell.Bash,
-        ShellGrammar.PowerShell => ApprovalShell.PowerShell,
-        _ => throw new InvalidOperationException("The native shell grammar is invalid.")
-    };
-    var toolApprovalStore = new ToolApprovalStore(
-        paths.ToolApprovalsPath,
-        TimeProvider.System,
-        new ApprovalStoreMigrationContext(approvalShell));
-    services.AddSingleton(toolApprovalStore);
-    services.AddSingleton<IToolApprovalService, AkkaToolApprovalService>();
+        TimeProvider.System);
 
     var toolRegistry = new ToolRegistry();
     toolRegistry.WithFirstPartyTools(toolAccessPolicy, searchBackend,
@@ -814,13 +777,7 @@ static void ConfigureDaemonServices(
 
     services.AddSingleton<IMemoryExtractor>(NullMemoryExtractor.Instance);
 
-    services.AddSingleton(toolRegistry);
-    services.AddSingleton<IToolExecutor>(sp =>
-        new DispatchingToolExecutor(
-            toolRegistry,
-            toolAccessPolicy,
-            sp.GetService<IToolApprovalService>(),
-            sp.GetRequiredService<ILogger<DispatchingToolExecutor>>()));
+    services.AddDaemonToolExecutor(toolRegistry, toolAccessPolicy);
     // Operational notification webhooks
     var notificationsConfig = configuration.GetSection("Notifications")
         .Get<NotificationsConfig>() ?? new NotificationsConfig();
@@ -1102,10 +1059,9 @@ static void ConfigureDaemonServices(
         {
             var reminderManager = registry.Get<Netclaw.Actors.Hosting.ReminderManagerActorKey>();
             var tp = sp.GetRequiredService<TimeProvider>();
-            var historyStore = sp.GetRequiredService<ReminderHistoryStore>();
             var targetResolvers = sp.GetServices<Netclaw.Actors.Reminders.IReminderTargetResolver>();
             var schedulingCfg = sp.GetRequiredService<SchedulingConfig>();
-            toolRegistry.WithReminderTools(reminderManager, tp, historyStore, schedulingCfg, targetResolvers);
+            toolRegistry.WithReminderTools(reminderManager, tp, schedulingCfg, targetResolvers);
 
             var bgJobManager = registry.Get<Netclaw.Actors.Hosting.BackgroundJobManagerActorKey>();
             toolRegistry.WithBackgroundJobTools(bgJobManager);
@@ -1211,6 +1167,8 @@ static void ConfigureDaemonServices(
     // Active session cleanup during host shutdown
     services.AddSingleton<SessionRegistryShutdownService>();
     services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<SessionRegistryShutdownService>());
+
+    return toolConfigWarnings;
 }
 
 static ISearchBackend? CreateSearchBackend(SearchConfig config)

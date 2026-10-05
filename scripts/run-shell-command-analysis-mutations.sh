@@ -149,6 +149,15 @@ read -r traversal_start traversal_end < <(
 )
 security_mutations+=("ShellFileSystemTreeAccessPolicy.cs{$traversal_start..$traversal_end}")
 
+read -r kill_start kill_end < <(
+  find_span \
+    "$policy_file" \
+    "internal sealed record DaemonProcessKillDenyPattern(" \
+    "return KillVerbs.Contains(verb)" \
+    "token.AuthoredValue.Contains(DaemonName, StringComparison.OrdinalIgnoreCase));"
+)
+security_mutations+=("ShellCommandPolicy.cs{$kill_start..$kill_end}")
+
 read -r nonfile_start nonfile_end < <(
   find_span \
     "$analysis_file" \
@@ -176,6 +185,24 @@ read -r status_start status_end < <(
 )
 security_mutations+=("ShellCommandAnalysis.cs{$status_start..$status_end}")
 
+read -r data_start data_end < <(
+  find_span \
+    "$analysis_file" \
+    "private bool HasOnlyDataOperands(" \
+    "=> Environment.Grammar == ShellGrammar.Bash" \
+    "&& ShellVerbPolicyData.SingleTokenSideEffectVerbs.Contains(verb);"
+)
+security_mutations+=("ShellCommandAnalysis.cs{$data_start..$data_end}")
+
+read -r data_use_start data_use_end < <(
+  find_span \
+    "$analysis_file" \
+    "private ShellUnresolvedPart ClassifyUnresolvedPart(" \
+    "return !HasOnlyDataOperands(command)" \
+    ": ShellUnresolvedPart.None;"
+)
+security_mutations+=("ShellCommandAnalysis.cs{$data_use_start..$data_use_end}")
+
 matcher_file="$repo_root/src/Netclaw.Security/IToolApprovalMatcher.cs"
 read -r candidate_start candidate_end < <(
   find_span \
@@ -186,19 +213,177 @@ read -r candidate_start candidate_end < <(
 )
 security_mutations+=("IToolApprovalMatcher.cs{$candidate_start..$candidate_end}")
 
+read -r control_start control_end < <(
+  find_span \
+    "$matcher_file" \
+    "private static string? ResolveControlCharacterScope(" \
+    "var firstControl = resolved.AsSpan().IndexOfAny(ControlCharacters);" \
+    ": GetRedirectDirectory(resolved![..firstControl], pathStyle);"
+)
+security_mutations+=("IToolApprovalMatcher.cs{$control_start..$control_end}")
+
+read -r absent_guard_start absent_guard_end < <(
+  find_span \
+    "$matcher_file" \
+    "private static bool HasAbsentTopLevelDirectory(" \
+    "if (!CanonicalPath.IsHostPathStyle(pathStyle)" \
+    "|| !Directory.Exists(workingDirectory))"
+)
+security_mutations+=("IToolApprovalMatcher.cs{$absent_guard_start..$absent_guard_end}")
+
+read -r absent_start absent_end < <(
+  find_span \
+    "$matcher_file" \
+    "private static bool HasAbsentTopLevelDirectory(" \
+    "return !Path.Exists(topLevel);" \
+    "return !Path.Exists(topLevel);"
+)
+security_mutations+=("IToolApprovalMatcher.cs{$absent_start..$absent_end}")
+
+read -r split_start split_end < <(
+  find_span \
+    "$matcher_file" \
+    "private IReadOnlyList<ApprovalCandidate> ExtractCommandCandidates(" \
+    "var part = occurrence.WorkingDirectory is ShellValueDomain.Exact" \
+    ": ShellUnresolvedPart.Command;"
+)
+security_mutations+=("IToolApprovalMatcher.cs{$split_start..$split_end}")
+
+read -r exact_start exact_end < <(
+  find_span \
+    "$matcher_file" \
+    "private ApprovalCandidate? CreateExactCandidate(" \
+    "var unresolved = part == ShellUnresolvedPart.None" \
+    "Unresolved = unresolved,"
+)
+security_mutations+=("IToolApprovalMatcher.cs{$exact_start..$exact_end}")
+
 read -r messy_start messy_end < <(
   find_span \
     "$matcher_file" \
-    "private bool IsMessy(ShellCommandAnalysis analysis)" \
+    "private bool IsMessy(ShellCommandAnalysis analysis, LinkRule hostLinks)" \
     "if (!analysis.IsResolved" \
     "return true;"
 )
 security_mutations+=("IToolApprovalMatcher.cs{$messy_start..$messy_end}")
 
+# ShellSyntaxTree 0.4.0-beta.17 facts. Decision D5 (option A): a glob word gets
+# the decision of each literal path that its segments can match.
+path_policy_file="$repo_root/src/Netclaw.Security/ToolPathPolicy.cs"
+glob_file="$repo_root/src/Netclaw.Security/ShellGlobScope.cs"
+read -r glob_deny_start glob_deny_end < <(
+  find_span \
+    "$path_policy_file" \
+    "private bool GlobMayReachDeniedPath(" \
+    "var glob = ShellGlobScope.AsGlobPattern(pattern);" \
+    "|| IsShellDenied(match));"
+)
+security_mutations+=("ToolPathPolicy.cs{$glob_deny_start..$glob_deny_end}")
+
+read -r credential_start credential_end < <(
+  find_span \
+    "$path_policy_file" \
+    "private IEnumerable<string> DefaultCredentialStorePaths()" \
+    "var home = Environment.HomeDirectory;" \
+    '"config", "secrets.json"))'
+)
+security_mutations+=("ToolPathPolicy.cs{$credential_start..$credential_end}")
+
+read -r glob_fact_start glob_fact_end < <(
+  find_span \
+    "$glob_file" \
+    "internal static ShellValueDomain.PathPattern? AsGlobPattern(" \
+    "=> domain is ShellValueDomain.PathPattern" \
+    ": null;"
+)
+security_mutations+=("ShellGlobScope.cs{$glob_fact_start..$glob_fact_end}")
+
+read -r segment_start segment_end < <(
+  find_span \
+    "$glob_file" \
+    "internal static bool SegmentMayMatch(" \
+    "if (!segment.IsPattern)" \
+    "ignoreCase: true);"
+)
+security_mutations+=("ShellGlobScope.cs{$segment_start..$segment_end}")
+
+read -r toward_start toward_end < <(
+  find_span \
+    "$glob_file" \
+    "internal static string? MatchPathToward(" \
+    "var glob = pattern.Glob!;" \
+    "return prefix + string.Join(separator, relative[..reach]);"
+)
+security_mutations+=("ShellGlobScope.cs{$toward_start..$toward_end}")
+
+read -r bracket_start bracket_end < <(
+  find_span \
+    "$glob_file" \
+    "private static string ToSimpleExpression(" \
+    "=> text.Contains('[', StringComparison.Ordinal)" \
+    '? "*" : text;'
+)
+security_mutations+=("ShellGlobScope.cs{$bracket_start..$bracket_end}")
+
+read -r walk_start walk_end < <(
+  find_span \
+    "$glob_file" \
+    "internal static bool IsLinkContained(" \
+    "if (!Directory.Exists(coveringDirectory.Value))" \
+    "return current.All(HasOnlyContainedLinkEntries);"
+)
+security_mutations+=("ShellGlobScope.cs{$walk_start..$walk_end}")
+
+read -r glob_part_start glob_part_end < <(
+  find_span \
+    "$analysis_file" \
+    "var globMayAddOption = false;" \
+    "var globMayAddOption = false;" \
+    "globMayAddOption |= pattern.Glob!.MayStartWithDash;"
+)
+security_mutations+=("ShellCommandAnalysis.cs{$glob_part_start..$glob_part_end}")
+
+# A bound value gets the hard-deny decision of its literal twin.
+read -r effective_use_start effective_use_end < <(
+  find_span \
+    "$policy_file" \
+    "private ShellCommandDecision EvaluateStructuralAnalysis(" \
+    "if (Environment.Grammar == ShellGrammar.Bash)" \
+    "if (!decision.Allowed)"
+)
+security_mutations+=("ShellCommandPolicy.cs{$effective_use_start..$effective_use_end}")
+
+read -r effective_start effective_end < <(
+  find_span \
+    "$policy_file" \
+    "private ShellCommandDecision EvaluateEffectiveValues(" \
+    "var choices = new List<IReadOnlyList<string>>();" \
+    "return ShellCommandDecision.Allow();"
+)
+security_mutations+=("ShellCommandPolicy.cs{$effective_start..$effective_end}")
+
+read -r proved_start proved_end < <(
+  find_span \
+    "$policy_file" \
+    "private static IReadOnlyList<string>? ProvedValues(" \
+    "foreach (var argument in occurrence.Arguments)" \
+    "_ => null"
+)
+security_mutations+=("ShellCommandPolicy.cs{$proved_start..$proved_end}")
+
+read -r combine_start combine_end < <(
+  find_span \
+    "$policy_file" \
+    "private static IEnumerable<IReadOnlyList<string>> Combine(" \
+    "IEnumerable<IReadOnlyList<string>> combinations = [[]];" \
+    "return combinations;"
+)
+security_mutations+=("ShellCommandPolicy.cs{$combine_start..$combine_end}")
+
 run_group \
   "stryker-shell-command-analysis.json" \
   "$output_path/security" \
-  72 \
+  166 \
   "${security_mutations[@]}"
 
 actor_mutations=()
@@ -233,8 +418,63 @@ read -r reviewed_start reviewed_end < <(
 )
 actor_mutations+=("Tools/ReviewedSafeShellPolicy.cs{$reviewed_start..$reviewed_end}")
 
+coordinator_file="$repo_root/src/Netclaw.Actors/Tools/ShellPolicyCoordinator.cs"
+read -r d1_grant_start d1_grant_end < <(
+  find_span \
+    "$coordinator_file" \
+    "private static ShellApprovalMatchResult KeepUnknownOperandGlobalGrants(" \
+    "return candidate.Unresolved == ShellUnresolvedPart.None" \
+    "&& evidence.Grant is { Scope: GrantScope.Everywhere }"
+)
+actor_mutations+=("Tools/ShellPolicyCoordinator.cs{$d1_grant_start..$d1_grant_end}")
+
+read -r split_use_start split_use_end < <(
+  find_span \
+    "$tool_policy_file" \
+    "internal static ShellApprovalAnalysis WithCommandCandidates(" \
+    "=> approval is { IsMessy: true, Candidates.Count: 0, CommandCandidates.Count: > 0 }" \
+    "=> approval is { IsMessy: true, Candidates.Count: 0, CommandCandidates.Count: > 0 }"
+)
+actor_mutations+=("Tools/ToolAccessPolicy.cs{$split_use_start..$split_use_end}")
+
+read -r reusable_start reusable_end < <(
+  find_span \
+    "$tool_policy_file" \
+    "private static bool HasReusableShellPhrase(" \
+    "&& candidate.Unresolved == ShellUnresolvedPart.None" \
+    "&& candidate.Unresolved == ShellUnresolvedPart.None"
+)
+actor_mutations+=("Tools/ToolAccessPolicy.cs{$reusable_start..$reusable_end}")
+
+read -r d1_safe_start d1_safe_end < <(
+  find_span \
+    "$reviewed_file" \
+    "string? proposedProjectRoot = null," \
+    "if (candidate.Unresolved == ShellUnresolvedPart.Command" \
+    "|| candidate.Unresolved == ShellUnresolvedPart.Operand && !allowUnknownOperands"
+)
+actor_mutations+=("Tools/ReviewedSafeShellPolicy.cs{$d1_safe_start..$d1_safe_end}")
+
+read -r d1_fact_start d1_fact_end < <(
+  find_span \
+    "$reviewed_file" \
+    "private bool AllAuthoredPathsStayWithinRoots(" \
+    "if (allowUnknownOperands" \
+    "&& fact.State == ShellPolicyPathResolutionState.UnknownDynamic)"
+)
+actor_mutations+=("Tools/ReviewedSafeShellPolicy.cs{$d1_fact_start..$d1_fact_end}")
+
+read -r d1_call_start d1_call_end < <(
+  find_span \
+    "$reviewed_file" \
+    "internal bool ShortCircuits(" \
+    "allowUnknownOperands: candidate.Unresolved == ShellUnresolvedPart.Operand)" \
+    "allowUnknownOperands: candidate.Unresolved == ShellUnresolvedPart.Operand)"
+)
+actor_mutations+=("Tools/ReviewedSafeShellPolicy.cs{$d1_call_start..$d1_call_end}")
+
 run_group \
   "stryker-config.json" \
   "$output_path/actors" \
-  9 \
+  27 \
   "${actor_mutations[@]}"

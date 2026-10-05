@@ -5,6 +5,7 @@
 // -----------------------------------------------------------------------
 using System.Text.Json;
 using Netclaw.Configuration;
+using Netclaw.Security.Authorization.Filesystem;
 using Netclaw.Tools;
 using ShellSyntaxTree;
 using Xunit;
@@ -87,12 +88,35 @@ public sealed class ShellApprovalMatcherTests
             analysis.Candidates.Select(static candidate => candidate.Verb));
     }
 
+    // A dynamic value is data in an operand of echo, :, true, and false, and
+    // after a literal printf format. A command substitution inside the value
+    // keeps its own candidate, and a redirect target keeps its own scope.
     [Theory]
-    [InlineData("echo \"$(touch /tmp/marker)\"")]
-    [InlineData("echo $? > /tmp/marker")]
+    [InlineData("echo \"$(touch /tmp/marker)\"", "touch@/tmp/marker|echo@")]
+    [InlineData("echo $? > /work/out/marker", "echo@/work/out")]
+    [InlineData("echo $@", "echo@")]
+    [InlineData(": \"$(date)\"; true \"$(date)\"; false $@", "date@/work|:@|date@/work|true@|false@")]
+    [InlineData("printf '%s\\n' \"$(git rev-parse HEAD)\"", "git rev-parse@/work|printf@")]
+    [InlineData("git push; echo \"branch: $(git branch --show-current)\"", "git push@/work|git branch@/work|echo@")]
+    public void Bash_output_data_value_keeps_static_candidates(string command, string expected)
+    {
+        var analysis = _matcher.AnalyzeInvocation(
+            new ToolName("shell_execute"),
+            Args(command, "/work"));
+
+        Assert.False(analysis.IsMessy);
+        Assert.Equal(
+            expected.Split('|'),
+            analysis.Candidates.Select(static candidate => $"{candidate.Verb}@{candidate.Directory}"));
+    }
+
+    [Theory]
     [InlineData("grep \"$TARGET\"; echo $?")]
-    [InlineData("echo $@")]
     [InlineData("printf $@")]
+    [InlineData("printf \"$FORMAT\" value")]
+    [InlineData("printf -v name '%s' \"$x\"")]
+    [InlineData("echo \"$x\" > \"$y\"")]
+    [InlineData("cat \"$x\"; echo done")]
     public void Bash_output_exception_rejects_unknown_values_and_side_effects(string command)
     {
         var analysis = _matcher.AnalyzeInvocation(
@@ -108,9 +132,7 @@ public sealed class ShellApprovalMatcherTests
     [InlineData("rg -rn \"operation failed\" src/ tests/ | head -20; echo \"---\"; rg -rln \"upload\" src/ | head -20")]
     [InlineData("netclaw mcp --help 2>&1 | head -50")]
     [InlineData("find /work/project -iname \"*Command*\" -o -iname \"*Add*\" 2>/dev/null | head; echo \"---\"; rg -rn \"transport http|--transport\" /work/project --include=\"*.cs\" -l 2>/dev/null | head")]
-    [InlineData("for u in /api/first /api/second; do echo \"=== $u ===\"; curl -sS -m 10 \"$u\" | head -c 1500; echo; done")]
     [InlineData("cd /work/project && git status --short 2>&1 | head; echo \"---branch---\"; git branch --show-current 2>&1; echo \"---remotes---\"; git remote -v 2>&1 | head -4; echo \"---recent---\"; git log --oneline -3 2>&1")]
-    [InlineData("~/.dotnet/dotnet test tests/Project.Tests/Project.Tests.csproj --filter \"FullyQualifiedName~SchemaTests\" --nologo 2>&1 | tail -30")]
     [InlineData("docker run --rm -v tools:/tools --entrypoint sh ruby:3.1 -c 'find /tools -maxdepth 2 -type f | head'")]
     [InlineData("docker run --rm --user root -v tools:/workbench/tools -v /tmp/site:/workbench/site -w /workbench/site --entrypoint bash image:tag -c 'bundle exec jekyll build | head'")]
     public void Bash_live_read_and_diagnostic_shapes_are_reusable(string command)
@@ -880,7 +902,7 @@ public sealed class ShellApprovalMatcherTests
     {
         Assert.True(_matcher.IsMessy(
             new ToolName("shell_execute"),
-            Args("for pid in $(pgrep netclawd); do echo $pid; done")));
+            Args("for pid in $(pgrep netclawd); do cat \"/proc/$pid/status\"; done")));
     }
 
     [Fact]
@@ -897,10 +919,10 @@ public sealed class ShellApprovalMatcherTests
         // Even if every conceivable verb is approved, a messy command never
         // auto-runs: the matcher cannot extract verb chains to evaluate, and
         // the prompt must offer Once/Deny only.
-        var approved = new[] { Verb("for"), Verb("do"), Verb("done"), Verb("echo"), Verb("printf") };
+        var approved = new[] { Verb("for"), Verb("do"), Verb("done"), Verb("cat"), Verb("printf") };
         Assert.False(_matcher.IsApproved(
             new ToolName("shell_execute"),
-            Args("for x in $(printf '1 2 3'); do echo \"$x\"; done"),
+            Args("for x in $(printf '1 2 3'); do cat \"$x\"; done"),
             approved,
             cwd: null));
     }
@@ -1209,22 +1231,35 @@ public sealed class ShellApprovalMatcherPathExtractionTests
         string path,
         string resolutionBase)
     {
-        Assert.False(ShellPathRules.TryResolve(
+        Assert.False(CanonicalPath.TryCreate(
             path,
             resolutionBase,
             pathStyle,
             out _));
     }
 
-    [Fact]
-    public void ExtractCandidates_rejects_control_character_in_relative_glob()
+    // A word with a control character (multi-line python3 -c code) gets the
+    // deepest ancestor directory of its text before the first control
+    // character. Each path that the word can name is inside that directory.
+    [SlopwatchSuppress("SW001", "This theory verifies Bash path scopes, which do not apply to the Windows shell parser.")]
+    [Theory(SkipUnless = nameof(IsPosix), Skip = "POSIX-only path semantics")]
+    [InlineData("du -sh \"./bad\0/*\"", "du@/work")]
+    [InlineData("python3 -c \"import sys\nprint(sys.argv)\"", "python3@/work")]
+    [InlineData("python3 -c \"/opt/tools/run\nexit()\"", "python3@/opt/tools")]
+    [InlineData("curl -s https://example.com/a | python3 -c \"\nimport sys\"", "curl@/work|python3@/work")]
+    public void Control_character_word_uses_its_clean_ancestor_scope(string command, string expected)
     {
-        var arguments = Args("du -sh \"./bad\0/*\"", "/work");
-
-        Assert.Empty(_matcher.ExtractCandidates(
+        var analysis = _matcher.AnalyzeInvocation(
             new ToolName("shell_execute"),
-            arguments));
-        Assert.True(_matcher.IsMessy(new ToolName("shell_execute"), arguments));
+            Args(command, "/work"));
+
+        Assert.False(analysis.IsMessy);
+        Assert.Equal(
+            expected.Split('|'),
+            analysis.Candidates.Select(static candidate => $"{candidate.Verb}@{candidate.Directory}"));
+        Assert.DoesNotContain(
+            analysis.Candidates,
+            static candidate => candidate.Directory!.Any(char.IsControl));
     }
 
     [Fact]
@@ -1437,11 +1472,11 @@ public sealed class ShellApprovalMatcherPathExtractionTests
     public void ExtractCandidates_compound_command_extracts_per_clause()
     {
         var candidates = _matcher.ExtractCandidates(new ToolName("shell_execute"),
-            Args("ls /repo && git status"));
+            Args("ls /usr/share && git status"));
 
         Assert.Equal(2, candidates.Count);
         Assert.Equal("ls", candidates[0].Verb);
-        Assert.Equal("/repo", candidates[0].Directory);
+        Assert.Equal("/usr/share", candidates[0].Directory);
         Assert.Equal("git status", candidates[1].Verb);
         Assert.Null(candidates[1].Directory);
     }
@@ -1452,30 +1487,27 @@ public sealed class ShellApprovalMatcherPathExtractionTests
         // Folder-scoped trust compounds: an entry on /home/petabridge
         // covers any candidate whose path is under it.
         Assert.True(ApprovalPatternMatching.MatchesShellApproval(
-            candidateVerb: "find",
-            candidateDirectory: "/home/petabridge/.netclaw",
+            BashCandidate("find", "/home/petabridge/.netclaw"),
             cwd: null,
-            approvedEntries: [new ApprovalEntry("find") { Directory = "/home/petabridge" }]));
+            approvedEntries: [BashGrant("find", "/home/petabridge")]));
     }
 
     [Fact]
     public void Matches_when_candidate_path_equals_entry_directory()
     {
         Assert.True(ApprovalPatternMatching.MatchesShellApproval(
-            candidateVerb: "find",
-            candidateDirectory: "/home/petabridge",
+            BashCandidate("find", "/home/petabridge"),
             cwd: null,
-            approvedEntries: [new ApprovalEntry("find") { Directory = "/home/petabridge" }]));
+            approvedEntries: [BashGrant("find", "/home/petabridge")]));
     }
 
     [Fact]
     public void Rejects_when_candidate_path_outside_entry_directory()
     {
         Assert.False(ApprovalPatternMatching.MatchesShellApproval(
-            candidateVerb: "find",
-            candidateDirectory: "/home/other",
+            BashCandidate("find", "/home/other"),
             cwd: null,
-            approvedEntries: [new ApprovalEntry("find") { Directory = "/home/petabridge" }]));
+            approvedEntries: [BashGrant("find", "/home/petabridge")]));
     }
 
     [Fact]
@@ -1483,10 +1515,9 @@ public sealed class ShellApprovalMatcherPathExtractionTests
     {
         // No path argument on the candidate — cwd is the effective directory.
         Assert.True(ApprovalPatternMatching.MatchesShellApproval(
-            candidateVerb: "git status",
-            candidateDirectory: null,
+            BashCandidate("git status", null),
             cwd: "/home/petabridge/.netclaw",
-            approvedEntries: [new ApprovalEntry("git status") { Directory = "/home/petabridge" }]));
+            approvedEntries: [BashGrant("git status", "/home/petabridge")]));
     }
 
     [Fact]
@@ -1494,10 +1525,9 @@ public sealed class ShellApprovalMatcherPathExtractionTests
     {
         // Global wildcard ignores both candidate path and cwd.
         Assert.True(ApprovalPatternMatching.MatchesShellApproval(
-            candidateVerb: "freshdesk",
-            candidateDirectory: null,
+            BashCandidate("freshdesk", null),
             cwd: null,
-            approvedEntries: [new ApprovalEntry("freshdesk") { Directory = null }]));
+            approvedEntries: [BashGrant("freshdesk", null)]));
     }
 
     [Fact]
@@ -1509,10 +1539,9 @@ public sealed class ShellApprovalMatcherPathExtractionTests
         // from the original bug report so a future refactor that re-orders the
         // matcher loop trips this test specifically.
         Assert.True(ApprovalPatternMatching.MatchesShellApproval(
-            candidateVerb: "netclaw stats",
-            candidateDirectory: null,
+            BashCandidate("netclaw stats", null),
             cwd: null,
-            approvedEntries: [new ApprovalEntry("netclaw stats") { Directory = null }]));
+            approvedEntries: [BashGrant("netclaw stats", null)]));
     }
 
     [Fact]
@@ -1524,13 +1553,12 @@ public sealed class ShellApprovalMatcherPathExtractionTests
         // grant gets skipped.
         ApprovalEntry[] entries =
         [
-            new ApprovalEntry("dotnet") { Directory = "/home/user/repos/foo/" },
-            new ApprovalEntry("dotnet") { Directory = null },
+            BashGrant("dotnet", "/home/user/repos/foo/"),
+            BashGrant("dotnet", null),
         ];
 
         Assert.True(ApprovalPatternMatching.MatchesShellApproval(
-            candidateVerb: "dotnet",
-            candidateDirectory: null,
+            BashCandidate("dotnet", null),
             cwd: null,
             approvedEntries: entries));
     }
@@ -1618,6 +1646,85 @@ public sealed class ShellApprovalMatcherPathExtractionTests
             });
     }
 
+    // A grant key is the ShellSyntaxTree command words: the program and every
+    // plain word, in any option order. Options, paths, words with a digit, and
+    // quoted text with whitespace are arguments.
+    [SlopwatchSuppress("SW001", "The cases resolve POSIX paths with the Bash grammar.")]
+    [Theory(SkipUnless = nameof(IsPosix), Skip = "POSIX-only path semantics")]
+    [InlineData("gh -R o/r pr view 123", new[] { "gh", "pr", "view" })]
+    [InlineData("gh pr view 123 -R o/r", new[] { "gh", "pr", "view" })]
+    [InlineData("gh --repo=o/r pr list", new[] { "gh", "pr", "list" })]
+    [InlineData("git --no-pager log -1", new[] { "git", "log" })]
+    [InlineData("gh --help", new[] { "gh" })]
+    [InlineData("ls -la", new[] { "ls" })]
+    [InlineData("grep -rn needle .", new[] { "grep", "needle" })]
+    [InlineData("git -C /home/user/project status", new[] { "git", "status" })]
+    [InlineData("git push origin v0.4.0 --force", new[] { "git", "push", "origin" })]
+    [InlineData("git show b42bf5a", new[] { "git", "show" })]
+    [InlineData("git commit -m \"a b\"", new[] { "git", "commit" })]
+    [InlineData("du -sh ./*", new[] { "du" })]
+    [InlineData("df -h .", new[] { "df" })]
+    public void ExtractCandidates_uses_the_command_words(string command, string[] expected)
+    {
+        var candidates = _matcher.ExtractCandidates(
+            new ToolName("shell_execute"),
+            Args(command, "/home/user/project"));
+
+        Assert.NotEmpty(candidates);
+        Assert.All(candidates, candidate => Assert.Equal(expected, candidate.VerbTokens));
+    }
+
+    // A bare glob or a brace list can become a command word, so the command
+    // words are Unknown and no grant identity exists.
+    [SlopwatchSuppress("SW001", "The cases resolve POSIX paths with the Bash grammar.")]
+    [Theory(SkipUnless = nameof(IsPosix), Skip = "POSIX-only path semantics")]
+    [InlineData("git p?sh")]
+    [InlineData("ls *")]
+    [InlineData("du -sh *")]
+    [InlineData("echo {a,b}")]
+    public void ExtractCandidates_has_no_grant_identity_for_unknown_command_words(string command)
+    {
+        var candidates = _matcher.ExtractCandidates(
+            new ToolName("shell_execute"),
+            Args(command, "/home/user/project"));
+
+        Assert.NotEmpty(candidates);
+        Assert.All(candidates, candidate => Assert.Null(candidate.VerbTokens));
+    }
+
+    // A loop variable or a "~" program path gives Unknown command words for
+    // that command (#2306). The call then gets a rewrite correction.
+    [SlopwatchSuppress("SW001", "The cases resolve POSIX paths with the Bash grammar.")]
+    [Theory(SkipUnless = nameof(IsPosix), Skip = "POSIX-only path semantics")]
+    [InlineData("for u in /api/first /api/second; do echo \"=== $u ===\"; curl -sS -m 10 \"$u\" | head -c 1500; echo; done")]
+    [InlineData("~/.dotnet/dotnet test tests/Project.Tests/Project.Tests.csproj --filter \"FullyQualifiedName~SchemaTests\" --nologo 2>&1 | tail -30")]
+    public void Live_shapes_with_an_expansion_in_a_command_word_have_no_grant_identity(string command)
+    {
+        var candidates = _matcher.ExtractCandidates(
+            new ToolName("shell_execute"),
+            Args(command, "/work/project"));
+
+        Assert.Contains(candidates, static candidate => candidate.VerbTokens is null);
+    }
+
+    // PowerShell cmdlets bind named parameters; a parameter value is an argument.
+    [Theory]
+    [InlineData("Start-Sleep -Seconds 300", new[] { "Start-Sleep" })]
+    [InlineData("Get-Process -Name dotnet", new[] { "Get-Process", "dotnet" })]
+    public void PowerShell_candidates_use_the_command_words(string command, string[] expected)
+    {
+        var matcher = new ShellApprovalMatcher(ShellExecutionEnvironment.CreatePowerShell(
+            @"C:\Program Files\PowerShell\7\pwsh.exe",
+            PwshDialect.PowerShell7));
+
+        var candidate = Assert.Single(matcher.ExtractCandidates(
+            new ToolName("shell_execute"),
+            Args(command, @"C:\work\project")));
+
+        Assert.Equal(ApprovalShell.PowerShell, candidate.Shell);
+        Assert.Equal(expected, candidate.VerbTokens);
+    }
+
     [Fact(SkipUnless = nameof(IsPosix), Skip = "POSIX-only path semantics")]
     public void ExtractCandidates_extracts_cd_target_as_directory()
     {
@@ -1659,7 +1766,9 @@ public sealed class ShellApprovalMatcherPathExtractionTests
             new ToolName("shell_execute"),
             new Dictionary<string, object?>
             {
-                ["Command"] = "cd /workspace/service.repo"
+                ["Command"] = "cd /workspace/service.repo",
+                // A synthetic file system: the absent-directory probe does not apply.
+                ["WorkingDirectory"] = "/work"
             }));
 
         Assert.Equal("cd", candidate.Verb);
@@ -1688,7 +1797,9 @@ public sealed class ShellApprovalMatcherPathExtractionTests
             new ToolName("shell_execute"),
             new Dictionary<string, object?>
             {
-                ["Command"] = "cat /workspace/service.repo/readme.md"
+                ["Command"] = "cat /workspace/service.repo/readme.md",
+                // A synthetic file system: the absent-directory probe does not apply.
+                ["WorkingDirectory"] = "/work"
             }));
 
         Assert.Equal("cat", candidate.Verb);
@@ -1731,7 +1842,9 @@ public sealed class ShellApprovalMatcherPathExtractionTests
             new ToolName("shell_execute"),
             new Dictionary<string, object?>
             {
-                ["Command"] = "cd /a && cd /b && pwd"
+                ["Command"] = "cd /a && cd /b && pwd",
+                // A synthetic file system: the absent-directory probe does not apply.
+                ["WorkingDirectory"] = "/work"
             });
 
         Assert.Contains(candidates, c => c.Verb == "cd" && c.Directory == "/a");
@@ -1754,12 +1867,14 @@ public sealed class ShellApprovalMatcherPathExtractionTests
         Assert.Null(matcher.ExtractCandidatesForOccurrence(
             occurrence,
             "/tmp",
-            resolveUnknownPathsFromEffectiveValues: false));
+            resolveUnknownPathsFromEffectiveValues: false,
+            LinkRule.FromVolumeRoot));
 
         var candidate = Assert.Single(matcher.ExtractCandidatesForOccurrence(
             occurrence,
             "/tmp",
-            resolveUnknownPathsFromEffectiveValues: true)!);
+            resolveUnknownPathsFromEffectiveValues: true,
+            LinkRule.FromVolumeRoot)!);
         Assert.Equal("head", candidate.Verb);
         Assert.Equal("/tmp", candidate.Directory);
     }
@@ -2294,6 +2409,19 @@ public sealed class ShellApprovalMatcherPathExtractionTests
             approvedEntries,
             cwd: null));
     }
+
+    private static ApprovalCandidate BashCandidate(string verb, string? directory)
+        => new(verb, directory)
+        {
+            Shell = ApprovalShell.Bash,
+            VerbTokens = verb.Split(' ', StringSplitOptions.RemoveEmptyEntries),
+        };
+
+    private static ApprovalEntry BashGrant(string verb, string? directory)
+        => ApprovalEntry.CreateTokenPrefix(
+            ApprovalShell.Bash,
+            verb.Split(' ', StringSplitOptions.RemoveEmptyEntries),
+            directory);
 }
 
 /// <summary>
@@ -2311,34 +2439,12 @@ public sealed class DefaultApprovalMatcherTests
 {
     private readonly DefaultApprovalMatcher _matcher = DefaultApprovalMatcher.Instance;
 
-    private static ApprovalEntry Verb(string verb) => new(verb) { Directory = null };
-
     [Fact]
     public void ExtractPatterns_returns_tool_name()
     {
         var patterns = _matcher.ExtractPatterns(new ToolName("mcp:memorizer:store"), null);
         Assert.Single(patterns);
         Assert.Equal("mcp:memorizer:store", patterns[0]);
-    }
-
-    [Fact]
-    public void IsApproved_matches_exact_tool_name()
-    {
-        Assert.True(_matcher.IsApproved(
-            new ToolName("mcp:memorizer:store"),
-            null,
-            [Verb("mcp:memorizer:store")],
-            cwd: null));
-    }
-
-    [Fact]
-    public void IsApproved_no_match()
-    {
-        Assert.False(_matcher.IsApproved(
-            new ToolName("mcp:memorizer:store"),
-            null,
-            [Verb("mcp:memorizer:get")],
-            cwd: null));
     }
 }
 

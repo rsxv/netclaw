@@ -3,7 +3,7 @@ name: netclaw-operations
 description: "REQUIRED when the user asks about scheduling, reminders, cron jobs, timers, background jobs, diagnostics, troubleshooting, MCP tools, daemon health, identity updates, or Netclaw capabilities and self-maintenance."
 metadata:
   author: netclaw
-  version: "2.75.3"
+  version: "2.91.0"
 ---
 
 # Netclaw Operations
@@ -32,6 +32,7 @@ a reference file — load the one matching the user's intent with
 | Manage skills and sources | `skill_read_resource('netclaw-operations', 'references/skills.md')` |
 | Manage inbound webhooks / attachments | `skill_read_resource('netclaw-operations', 'references/webhooks.md')` |
 | Add/switch LLM or search provider, OAuth login | `skill_read_resource('netclaw-operations', 'references/providers.md')` |
+| Change a `Tools` list (audience tools, roots, attachments, HTTP allow list) | [Tool Lists in Config](#tool-lists-in-config) |
 | Diagnose problems, kill switches, self-update | `skill_read_resource('netclaw-operations', 'references/diagnostics.md')` |
 | Rotate or repair secrets | `skill_read_resource('netclaw-operations', 'references/secrets.md')` |
 | Pair remote devices, manage access | `skill_read_resource('netclaw-operations', 'references/devices.md')` |
@@ -148,7 +149,12 @@ runs contribute no parent working-context changes.
 Reminders: `set_reminder` with schedule type `once` / `interval` / `cron`. Always
 set `delivery_kind` explicitly (`current_session` / `channel` / `none`). A reminder
 that fires unattended cannot answer approval prompts, so pre-approve any shell verbs
-it needs first with `netclaw approvals trust-verb <verb>`. Background shell: set
+it needs first with `netclaw approvals trust-verb <verb>`, or test it with
+`/run-reminder <id>` (the `run-reminder` skill and the `run_reminder` tool). The
+test runs the reminder's exact prompt in the chat, so the user can answer each
+prompt with an "Always" grant that the scheduled run reads. The CLI form is
+`netclaw reminder run <id>`. The test runs only in a chat at the reminder's
+audience, and a CLI chat is Personal (#2330). Background shell: set
 `_background: true` on `shell_execute` (max 5 concurrent; cancel servers/watchers
 when done; background jobs are killed when the session passivates).
 
@@ -337,6 +343,29 @@ with that provider and set it with `netclaw mcp add --client-id <id> ...`.
 | `AuthFailed` | The server rejected credentials that were supplied. Reauthorize SDK-managed OAuth, or check the configured `Authorization` header if it owns auth. |
 | `Unreachable` | A non-auth transport, network, timeout, or initialization failure prevented connection. Check the endpoint and daemon logs. |
 
+### Read catalog refresh health
+
+The daemon marks a connected server degraded after three consecutive catalog
+refresh failures. The connection state stays `Connected`.
+`/api/mcp/statuses` reports `degraded: true`, and `netclaw status` reports
+`degraded`. `netclaw mcp list` and `netclaw doctor` report
+`connected but not responding` with the cached tool count. The doctor check
+returns `Warning`.
+
+A healthy server uses a catalog poll interval of five minutes. After consecutive
+failures, the minimum retry intervals are 30, 60, 120, 240, and 300 seconds.
+The poll runs every 30 seconds and can delay an attempt beyond its minimum
+interval. A successful refresh or reconnect clears the failure count and
+restores the interval of five minutes. Caller cancellation, daemon shutdown,
+and lease deactivation do not increase the failure count. Diagnostics retain the
+last refresh failure timestamp after recovery.
+
+Cached tools stay published and callable while catalog refreshes fail. A
+degraded status does not block tool calls, so a call can still time out.
+Check the endpoint and daemon logs before you repeat a call. The daemon reports
+expected timeout and transport failures without a stack trace. Unexpected
+failures keep their stack trace.
+
 At startup, the daemon connects enabled MCP servers concurrently. It waits
 for each initial attempt before it reports ready. A failed server has its own
 status; other server tools remain available. Use `netclaw mcp list` to inspect
@@ -383,6 +412,11 @@ label the persistent choice `Always allow this tool` rather than the
 shell-oriented `Always anywhere`. Other non-shell tools also omit `Always here`
 because their approval matchers do not consume directory scope.
 
+After a person approves a prompt, the tool result ends with one line that
+names the choice, for example `[approval: once]` or
+`[approval: always in this folder]`. `once` and `this chat only` do not carry
+over to another session. A scheduled reminder run is another session.
+
 Shell approvals store a typed phrase and a scope in `tool-approvals.json`:
 
 - **verb** — the command head plus subcommand chain only (e.g. `git push`,
@@ -394,6 +428,34 @@ Shell approvals store a typed phrase and a scope in `tool-approvals.json`:
   - **Cwd** when no path argument is present (`git status`, `freshdesk`).
   - **`null`** for the global wildcard ("approve this verb in any
     directory") — only set by `Always anywhere`.
+
+A program path names a file, not a spelling. When the program word has a
+slash (`./tool`, `../bin/tool`, `/opt/bin/tool`), the grant stores the
+absolute path of the file. Netclaw joins a relative path with the working
+directory of that command, after each `cd`. So `cd ~/.dotnet/tools &&
+./ilspycmd` and `/home/user/.dotnet/tools/ilspycmd` use one grant, and
+`./ilspycmd` in another folder needs its own approval. A bare name such as
+`dotnet` does not change. A program that starts with `~/` gets a correction:
+write the full path of the program instead. A `This repository` grant stores
+a repository program by its path below the worktree root
+(`./scripts/build.sh`), so it covers that file in each worktree.
+
+Older grants saved the spelling. Netclaw reads `~/x` and `/abs/x` grants as
+the absolute path, and joins a folder grant's `./x` with its folder. A `./x`
+grant with no folder keeps its old reach, and `netclaw approvals list` and
+`netclaw doctor` show it as a `legacy program spelling`. Revoke it and approve
+the program again to cover one file.
+A word that names an existing file or folder in the command's directory is
+not a command word, unless it is the program or the first word after it. So
+`dotnet build Phobos.slnx` uses the `dotnet build` grant, and a new grant
+never stores a file name. The store also skips a grant that a saved grant
+already covers. `netclaw doctor --fix` removes a grant that another grant
+covers. It reports and keeps a folder grant that names a file of its folder
+and a grant whose folder is gone. It never touches an "anywhere" grant for a
+file-like word.
+An older exact-phrase grant covers a call whose command words equal its
+phrase. The grant `dotnet list package` covers
+`dotnet list package --vulnerable`, even when the prompt shows `dotnet list`.
 
 `This repository` stores a distinct Git repository scope. It applies to
 registered worktrees of one repository. Netclaw derives this scope from each
@@ -422,6 +484,20 @@ A changed assignment needs a separate approval.
 An unqualified grant cannot cover an assignment-qualified command.
 The reviewed-safe list does not cover an assignment-qualified command.
 An incomplete assignment gets only `Once` and `Deny`.
+A name with a run-time value (`PID=$!`, `x=$(cmd)`, `read x`) is unknown, so a
+command that reads it as a word gets only `Once` and `Deny`.
+A word that reads a bound value (`x=/etc/app.conf; cat "$x"`) gets the
+decision of the literal value, so a protected path or a hard-deny form stays
+denied.
+
+On Linux, a glob word (`ls -d ~/repositories/*/akka*`) reaches the paths below
+its covering directory, and that directory is its scope. A glob that can match
+a protected path or the credential store (`~/.netclaw/keys`,
+`~/.netclaw/config/secrets.json`) is denied, as the literal path is. A glob
+whose first segment is a wildcard (`*/notes.md`) can expand to an option, so
+only a safe phrase or an `Always anywhere` grant covers it. Commands inside
+`if`, `case`, `while`, `until`, and a background list (`server &`) each get
+their own decision.
 
 The approval gate runs three layers in order:
 
@@ -429,11 +505,14 @@ The directory order reserves `temp_dir` for disposable output.
 Preserve an explicitly required platform temporary path.
 Netclaw does not automatically clean managed temporary storage yet.
 
-1. **Hard-deny list** — system-protected paths. Always blocks.
-2. **Safe-verb ∩ safe-space short-circuit** — when the verb is on the curated
-   safe list AND the effective directory (path arg or cwd) is under your
-   declared safe space (`session_dir` or `project_dir`), the call auto-runs
-   with no prompt. The list covers demonstrably read-only verbs: file readers
+1. **Hard-deny list** — system-protected paths and self-destructive commands.
+   Always blocks. A process kill is blocked only when it names the Netclaw
+   daemon (`pkill netclawd`); stopping a test server you started
+   (`pkill -f 'http.server 8899'`) prompts like any other command.
+2. **Safe-verb short-circuit** — in an interactive session, when the verb is
+   on the curated safe list AND your audience may read every path of the call
+   with a file tool, the call auto-runs with no prompt. A protected path never
+   qualifies. The list covers demonstrably read-only verbs: file readers
    (`ls`, `grep`, `cat`, …), system/info verbs (`date`, `whoami`, `uname`,
    `uptime`, …), and read-only `git`/`gh` queries (`git status`, `git log`,
    `gh pr view`, `gh run list`, …). Mutating verbs (`git push`, `git fetch`,
@@ -458,6 +537,8 @@ compound command includes pure side-effect verbs (`echo`, `printf`, `:`,
 `true`, `false`) with no path argument and no redirect, those clauses are
 authorized for the current call by the click but no `ApprovalEntry` is
 written for them. Recording every literal `echo "==="` would be noise.
+A dynamic operand of these verbs is data: `echo "head: $(git rev-parse HEAD)"`
+keeps reusable candidates, and the command inside `$(...)` gets its own.
 
 **Prompts survive passivation and restart.** Pending approval prompts are
 journaled with their requester and trust context, so if the session goes idle or
@@ -483,40 +564,52 @@ The reminder expires ten minutes after the interruption. A completed turn,
 partial reply, or possible tool effect does not create this reminder.
 
 **Why you may not see a prompt at all.** If the user invokes a read-only verb
-(say `grep`) with a path argument under a tree the operator has previously
-trusted, the safe-verb short-circuit applies and there is no prompt. This
-is intended behavior — read-only inspection of declared work surfaces is
-implicit. Mutating verbs in the same directory still prompt.
+(say `grep`) on a path that the audience may read, the safe-verb
+short-circuit applies in an interactive session and there is no prompt. This
+is intended behavior. Mutating verbs in the same directory still prompt.
 
 **When the prompt offers fewer buttons.** Two cases:
 
 - **Unresolved commands** get only `Once` and `Deny`.
   These commands include dynamic assignments and unknown path facts.
-  The matcher cannot extract a complete reusable identity.
+  The matcher cannot extract a complete reusable identity. In an interactive
+  Bash call, only the unresolved command is shown, as its exact text; the
+  other commands keep their grants. A command whose only unknown part is an
+  operand runs under a safe phrase or an `Always anywhere` grant (decision D1).
+  Multi-line `python3 -c` code is not unresolved: its scope is the working
+  directory, so the prompt offers reusable grants.
+  An API route such as `gh api /repos/o/r/...` is not a folder: a word below a
+  top-level directory that does not exist uses the working directory scope.
 - **Shallow cwd** (e.g. `/etc/`, `/`) hides `Always here` only. Persisting a
   too-shallow root would grant the verb across most of the filesystem;
   `This chat` and `Always anywhere` remain available.
 
-If a user keeps getting prompted in their repo on read-only verbs, the
-likely cause is the commands they're running don't carry a path argument
-(e.g. `git status` with no `-C`). Suggest they call
-`set_working_directory <path>` so the safe-verb short-circuit treats that
-tree as a safe space. If they keep getting prompted for the same mutating
+If a user keeps getting prompted on read-only verbs, the likely cause is an
+unresolved command, a write redirect, or an option before the verb
+(`git -C dir status`). Prefer `WorkingDirectory` over `-C`. If they keep getting prompted for the same mutating
 verb (e.g. `git push`), suggest `Always here` to persist
 `(git push, effective directory)`.
 
-When auditing repeated prompts, check both the tool audit trail and daemon
-logs. A later call satisfied by an existing grant records
-`ApprovalDecision=PreviouslyApproved` and an `ApprovalPattern` like
-`git push [persistent: git push in /home/user/repo]`. If the daemon prompts
-despite a same-verb persisted grant, it logs an approval near-miss with the
-candidate directory, cwd, persisted grant, creation time, and mismatch reason.
+When you check repeated prompts, read the daemon log. Netclaw has no separate
+tool audit store. Each decision logs `Tool authorization evaluated: <tool>
+outcome=<outcome>` with an `authorizationAttemptId`; a denial also logs
+`reason=`. Each shell decision logs ordered `Shell policy trace:` rows. A row
+for a covered candidate names its coverage, for example `PersistentFolder`. If
+the daemon prompts despite a same-verb saved grant, the `StoredGrantMatch` row
+gives the near-miss reason (`TokenMismatch`, `ShellMismatch`,
+`OutsideDirectory`, or `Symlink`) and the grant creation time. The trace never
+holds raw paths or arguments.
 
 ### Inspecting, revoking, and pre-approving grants
 
 Use the `netclaw approvals` CLI rather than hand-editing
 `tool-approvals.json`. The daemon reads the file on every approval check, so
 mutations take effect on the next prompt without a daemon restart.
+
+You may read your own configuration with `file_read`:
+`~/.netclaw/config/netclaw.json` and `~/.netclaw/config/tool-approvals.json`.
+You cannot write them, and you cannot read `secrets.json` or `~/.netclaw/keys`.
+A shell command that names the config directory is denied, so use `file_read`.
 
 ```bash
 # Interactive TUI: see everything grouped by audience and tool
@@ -566,6 +659,14 @@ Example dialogue when the user asks you to schedule a daily Freshdesk report:
 On confirmation, run the trust-verb command via `shell_execute`, then create
 the reminder. The grant persists across daemon restarts.
 
+An unattended task uses the same rules as a chat of the same audience: the
+same file reach, reviewed-safe catalog, and grants. The one difference: a call
+that would prompt in a chat is denied with `approval_required_unattended`,
+because nobody can answer. Suggest an "Always" grant for that call in a chat
+with the same audience (for a reminder, `/run-reminder <id>`). A grant never
+opens a protected path (the config directory, secrets, or keys), and Auto mode
+does not use grants.
+
 ### Last-resort recovery
 
 If the approval file gets corrupted (the daemon will quarantine it to
@@ -613,6 +714,40 @@ never by direct file edit. Protected paths (`secrets.json`, `.netclaw/keys`,
 Add or switch model providers (including OAuth login) and configure search backends
 (e.g. SearXNG) via provider config. Full setup:
 `skill_read_resource('netclaw-operations', 'references/providers.md')`.
+
+## Tool Lists in Config
+
+A list under `Tools` in `netclaw.json` replaces the built-in default list. It does not
+add to it. This applies to `AllowedTools`, `ReadFiles`/`WriteFiles`/`AttachFiles` `Roots`,
+`ChannelAttachments.AllowedCategories`, `GlobalReadRoots`, and `WebFetch.HttpAllowList`.
+
+- To add one entry, write the complete list with the defaults. For example, to add
+  `/srv/docs` to `GlobalReadRoots`, write
+  `["{skills_dir}", "{identity_dir}", "{workspaces_dir}", "/srv/docs"]`.
+  `["/srv/docs"]` alone removes the skills, identity, and workspaces roots.
+- An absent key keeps the defaults. `[]`, `null`, and `{}` give an empty list.
+- The daemon stops at startup when a list key has a scalar value, when an attachment
+  category is not valid, or when an empty `NETCLAW_*` variable and a config file both set
+  the same list. The error names the key.
+- A Public or Team `AllowedTools` list that exactly matches an older Netclaw default gets
+  today's default, with a startup warning. Any other list is applied as written, which
+  includes an edited older list. If such a list lacks `file_search` or `tool_output_read`,
+  add them by hand.
+- `netclaw doctor` reports a list that exactly matches any Netclaw default, which includes
+  today's default. `netclaw doctor --fix` backs up `netclaw.json`, then deletes that
+  `AllowedTools` key, so the audience follows the default in later releases.
+- `netclaw doctor` warns when a Public or Team allowlist does not include
+  `tool_output_read`. A spilled tool result tells the model to call that tool. The warning
+  has no auto-fix, because a narrow list can be intentional.
+- The daemon reads `netclaw.json`, `secrets.json`, and `NETCLAW_*` variables.
+  `netclaw doctor` reads only `netclaw.json`, so it can show a different list.
+- `netclaw init` writes only the posture (`Security.DeploymentPosture`,
+  `Security.ShellExecutionMode`, `Security.StrictDefaults`) and `Tools.ShellMode`. It does
+  not write `Tools.AudienceProfiles`. The daemon computes the profiles from the posture. An
+  absent profile is normal and gets the posture default. For the Personal posture, that
+  default requires approval for `shell_execute` on Personal.
+- Do not write a default list into `netclaw.json` to "make it visible". Write only the key
+  that you change.
 
 ## Diagnostics, Kill Switches & Self-Maintenance
 

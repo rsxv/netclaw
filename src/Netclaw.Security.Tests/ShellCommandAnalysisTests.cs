@@ -463,7 +463,7 @@ public sealed class ShellCommandAnalysisTests
     }
 
     [Theory]
-    [InlineData("echo $(git push)")]
+    [InlineData("cat $(git push)")]
     public void Dynamic_command_syntax_is_explicit(string command)
     {
         var analysis = _analyzer.Analyze(command);
@@ -523,13 +523,36 @@ public sealed class ShellCommandAnalysisTests
             || analysis.HasDynamicSyntax);
     }
 
-    [Fact]
-    public void Background_list_fails_closed_when_parser_omits_its_tail()
+    // A bracket pattern in the program word names no fixed program, so the
+    // command stays unresolved, as with ShellSyntaxTree 0.4.0-beta.10. Other
+    // program words without command words keep their earlier decision.
+    [Theory]
+    [InlineData("[\"ci\",\"build\"]", true)]
+    [InlineData("[\"batch one\"]", true)]
+    [InlineData("{\"b\":2,\"nested\":{\"c\":3}}", false)]
+    [InlineData("^\\d{4}-\\d{2}-\\d{2}$", false)]
+    [InlineData("[ -d /work ]", false)]
+    public void Bracket_program_word_stays_unresolved(string command, bool unresolved)
     {
-        var analysis = _analyzer.Analyze("git status & git push");
+        var analysis = new ShellCommandAnalyzer(
+                ShellExecutionEnvironment.CreateBash(ShellPlatform.Linux, new Version(5, 2)))
+            .Analyze(command, "/work");
 
-        Assert.Equal(ShellAnalysisFailure.Unresolved, analysis.Failure);
-        Assert.Empty(analysis.Commands);
+        Assert.Equal(unresolved, analysis.HasDynamicSyntax);
+    }
+
+    // ShellSyntaxTree 0.4.0-beta.14 parses a background list as a group, so
+    // each command in it and after it has its own facts.
+    [Fact]
+    public void Background_list_exposes_each_command()
+    {
+        var analysis = _analyzer.Analyze("git status & git push", "/work");
+
+        Assert.Equal(ShellAnalysisFailure.None, analysis.Failure);
+        Assert.False(analysis.HasDynamicSyntax);
+        Assert.Equal(
+            ["git status", "git push"],
+            analysis.Commands.Select(static command => string.Join(' ', command.Clause.Verb.Tokens)));
     }
 
     [Fact]
