@@ -235,3 +235,162 @@ be preserved.
 - **AND** a live CLI or TUI subscriber is attached
 - **WHEN** the receive timeout fires
 - **THEN** passivation is deferred while the subscriber remains attached
+
+### Requirement: Accepted input survives a graceful stop
+
+The session SHALL store each accepted input before acknowledgment. The record SHALL retain its identity, order, content, media, source identity, and original authority.
+
+Use the [engineering glossary](../../../docs/spec/GLOSSARY.md) for shared terms.
+
+#### Scenario: Input acknowledgment follows its journal record
+
+- **GIVEN** a session receives user input
+- **WHEN** the journal stores its admission record
+- **THEN** the session acknowledges the input
+- **AND** cold recovery restores the pending input and its authority
+
+#### Scenario: Journal failure rejects input
+
+- **GIVEN** the journal cannot store an admission record
+- **WHEN** the session receives input
+- **THEN** the session rejects that input
+- **AND** it starts no model call for that input
+
+#### Scenario: A lost acknowledgment does not duplicate input
+
+- **GIVEN** the journal stores input with a stable source ID
+- **WHEN** the source retries that input
+- **THEN** the session acknowledges the stored input
+- **AND** it does not add a second pending record
+
+### Requirement: Graceful drain creates only a safe restart reminder
+
+The session SHALL create a restart reminder only after an eligible model task stops. It SHALL use the existing reminder definition and `current_session` delivery contract.
+
+#### Scenario: An interrupted model call creates a reminder
+
+- **GIVEN** a model call has pending admitted input
+- **AND** no tool batch or partial reply exists
+- **WHEN** graceful drain cancels the call and confirms its task stopped
+- **THEN** the restart manifest stores one reminder for that session
+- **AND** the reminder expires ten minutes after interruption
+
+#### Scenario: A completed turn stays quiet
+
+- **GIVEN** a model call completes during drain
+- **AND** no admitted input remains pending
+- **WHEN** the daemon starts again
+- **THEN** it registers no restart reminder for that session
+
+#### Scenario: A possible effect blocks the reminder
+
+- **GIVEN** a tool batch started or partial text reached a subscriber
+- **WHEN** graceful drain stops the session
+- **THEN** the manifest contains no restart reminder for that turn
+- **AND** the daemon reports the blocked session
+
+### Requirement: A fresh restart reminder resumes stored work
+
+The reminder manager SHALL deliver a fresh restart reminder through its existing `current_session` path. The session SHALL restore pending input under its recorded authority.
+
+#### Scenario: A fresh reminder resumes the pending input
+
+- **GIVEN** the restart manifest contains a reminder that has not expired
+- **WHEN** the daemon starts
+- **THEN** startup registers the reminder through `SaveReminderCommand`
+- **AND** the session resumes the stored input without a user prompt
+
+#### Scenario: The original authority remains in force
+
+- **GIVEN** a restart reminder wakes a session with pending input
+- **WHEN** the session starts the model call
+- **THEN** it restores the recorded requester, audience, and trust boundary
+- **AND** reminder automation authority does not replace that context
+
+#### Scenario: An expired reminder stays quiet
+
+- **GIVEN** the reminder expiration is in the past
+- **WHEN** startup reads the restart manifest
+- **THEN** it does not register or deliver that reminder
+- **AND** it logs one warning
+
+#### Scenario: Stored authority has no channel type
+
+- **GIVEN** an interrupted session has no stored channel type
+- **WHEN** graceful drain classifies the session
+- **THEN** the actor creates no restart reminder
+- **AND** the actor does not contain a channel-specific route list
+
+### Requirement: SignalR text success confirms durable admission
+
+The daemon SHALL return success for a text SendMessage request only after its journal stores the input admission record.
+The daemon SHALL preserve the input's source identity and original authority.
+The success response SHALL NOT wait for model completion.
+Use the [engineering glossary](../../../docs/spec/GLOSSARY.md) for shared terms.
+
+#### Scenario: Journal admission precedes the hub response
+
+- **GIVEN** an authenticated connection is attached to its target session
+- **AND** the journal holds the text admission write
+- **WHEN** the connection sends text
+- **THEN** the hub response remains incomplete until the journal stores that record
+- **AND** success does not require a model response
+
+#### Scenario: Buffered text retains the same contract
+
+- **GIVEN** the session already processes or compacts an earlier turn
+- **WHEN** an attached connection sends later text
+- **THEN** success confirms that the journal stores the later input and its authority
+- **AND** success does not require the earlier turn to finish
+
+#### Scenario: An admission fault fails explicitly
+
+- **GIVEN** session initialization, input enqueue, or the journal write fails
+- **WHEN** a connection sends text
+- **THEN** the daemon returns a failure or timeout
+- **AND** the daemon does not report successful admission
+
+#### Scenario: Attachment or ingress denial preserves authority
+
+- **GIVEN** the connection lacks target attachment or ingress is closed
+- **WHEN** the connection sends text
+- **THEN** the daemon rejects the request before admission
+- **AND** it starts no model call for that text
+
+### Requirement: Client disconnect preserves admitted text work
+
+The daemon SHALL retain admitted text after its SignalR client disconnects.
+The disconnect SHALL NOT cancel the session's model task or discard the pending input.
+
+#### Scenario: Disconnect precedes the model request
+
+- **GIVEN** the daemon confirms text admission
+- **AND** the model request has not started
+- **WHEN** the client disconnects
+- **THEN** the daemon retains that input
+- **AND** the session can complete its turn or store an explicit terminal failure
+
+#### Scenario: Disconnect occurs during the model response
+
+- **GIVEN** the daemon confirms text admission and starts a model request
+- **WHEN** the client disconnects before the model response
+- **THEN** the session continues that turn independently of its subscriber
+- **AND** the durable result does not require the client's connection
+
+### Requirement: Text admission support is explicit
+
+The daemon SHALL expose explicit support for durable text admission through its compatibility contract.
+A client that depends on that support SHALL reject an unsupported daemon before it promises confirmed admission.
+
+#### Scenario: A compatible daemon permits reliable admission
+
+- **GIVEN** the daemon explicitly supports durable text admission
+- **WHEN** the client attaches before text dispatch
+- **THEN** the client can use the admission response contract
+
+#### Scenario: An old daemon cannot imply support
+
+- **GIVEN** the daemon lacks explicit durable text admission support
+- **WHEN** the new client attaches before text dispatch
+- **THEN** the client reports the unsupported daemon
+- **AND** it does not silently treat the old early response as durable admission

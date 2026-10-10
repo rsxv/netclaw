@@ -68,7 +68,7 @@ public sealed class ShellPolicyEvidenceFixtureTests(ShellApprovalMatrixFixture f
             expectedOutcomes.Add(ParseOutcome(policyCase.ExpectedFinal.Outcome));
             actualOutcomes.Add(observed.Outcome);
             Assert.Equal(
-                policyCase.ExpectedFinal.ApprovalCandidates,
+                ExpectedPromptCandidates(policyCase.ExpectedFinal.ApprovalCandidates, observed),
                 observed.Prompt?.CandidateVerbs);
             Assert.Equal(policyCase.ExpectedFinal.IsMessy, observed.Prompt?.IsMessy);
             Assert.Equal(
@@ -205,7 +205,7 @@ public sealed class ShellPolicyEvidenceFixtureTests(ShellApprovalMatrixFixture f
         var macHost = OperatingSystem.IsMacOS();
         List<string>? exactCandidates = policyCase.Id switch
         {
-            "L10" when windowsHost => ["dotnet test", "grep", sedRange],
+            "L10" when windowsHost => ["dotnet test", "grep FAIL", sedRange],
             "L10" when macHost => ["dotnet test > /tmp/test.log", sedRange],
             "L10" => ["dotnet test", sedRange],
             "L13" when windowsHost => ["cd", "ls -la \"$project\"", "head"],
@@ -238,13 +238,19 @@ public sealed class ShellPolicyEvidenceFixtureTests(ShellApprovalMatrixFixture f
         {
             "L12" => posixHost ? ["mkdir", "git clone"] : ["mkdir", "cd", "git clone"],
             "L14" => ["git remote", "git fetch origin", "git fetch upstream"],
-            "L15" => posixHost ? ["find"] : ["cd", "find", "head"],
+            "L15" => posixHost ? ["find f"] : ["cd", "find f", "head"],
             "L16" => ["git add", "git rebase"],
             "L17" => ["sort", "comm"],
             "L18" => ["cd", "ls", "head"],
-            "L21" => ["cd", "git log", "grep"],
+            "L21" => ["cd", "git log", "grep Marker"],
             "L22" => windowsHost ? ["cd", "python3"] : ["python3"],
             "L24" when posixHost => ["external-crm deals list"],
+            "L24" => ["external-crm deals list", "jq length"],
+            // The verb is the command words. The parser gives "-o" one value, so
+            // the second option value and the host are command words.
+            "L25" => ["ssh BatchMode=yes service.example.invalid"],
+            // A POSIX host allows L28 above. The Windows catalog has no grep entry.
+            "L28" => ["grep ApiMarker", "ls"],
             "L29" => ["docker compose config"],
             "L30" => ["sed"],
             "L32" => ["gh api"],
@@ -366,7 +372,9 @@ public sealed class ShellPolicyEvidenceFixtureTests(ShellApprovalMatrixFixture f
         Assert.Equal(
             ParseCorrection(policyCase.Expected.AgentCorrection),
             observed.AgentCorrection);
-        Assert.Equal(policyCase.Expected.ApprovalCandidates, observed.Prompt?.CandidateVerbs);
+        Assert.Equal(
+            ExpectedPromptCandidates(policyCase.Expected.ApprovalCandidates, observed),
+            observed.Prompt?.CandidateVerbs);
         Assert.Equal(policyCase.Expected.IsMessy, observed.Prompt?.IsMessy);
         Assert.Equal(policyCase.Expected.OptionKeys, observed.Prompt?.OptionKeys);
         Assert.Equal(policyCase.Expected.ActorCheckCount, observed.ApprovalChecks);
@@ -384,6 +392,16 @@ public sealed class ShellPolicyEvidenceFixtureTests(ShellApprovalMatrixFixture f
                 observed.TraceRows);
         }
     }
+
+    // The evidence records an empty candidate list for a prompt that names no
+    // command. Owner decision (October 2026): such a prompt shows its full
+    // command text as its one candidate.
+    private static IReadOnlyList<string>? ExpectedPromptCandidates(
+        IReadOnlyList<string>? expected,
+        ApprovalObservation observed)
+        => expected is { Count: 0 } && observed.Prompt is { Patterns.Count: 0 } prompt
+            ? [prompt.DisplayText]
+            : expected;
 
     private static void ApplyFileSystemFacts(
         PolicyAdversarialCase policyCase,
@@ -702,7 +720,6 @@ public sealed class ShellPolicyEvidenceFixtureTests(ShellApprovalMatrixFixture f
             null => null,
             "ManagedTemporaryDirectorySuggested" => ApprovalCorrection.ManagedTemporaryDirectory,
             "NativeToolSuggested" => ApprovalCorrection.NativeTool,
-            "ProjectDirectorySuggested" => ApprovalCorrection.ProjectDirectory,
             "ShellWorkingDirectorySuggested" => ApprovalCorrection.ShellWorkingDirectory,
             "ShellCommandWordsRewriteSuggested" => ApprovalCorrection.ShellCommandWords,
             _ => throw new InvalidDataException($"Unsupported fixture correction: {correction}.")

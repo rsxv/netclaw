@@ -199,11 +199,59 @@ A call in `Approval` mode runs without a prompt when every part of it is
 covered:
 
 - A grant that you saved (this chat, a folder, a repository, or everywhere)
-  covers the phrase.
+  covers the phrase. A shell grant of two or more words names a verb. It
+  covers its command words and any later command words, which are the
+  arguments of the verb. A shell grant of one word names only the program,
+  and it covers that word alone:
+
+  | Grant | Covers | Does not cover |
+  | --- | --- | --- |
+  | `git push` | `git push upstream`, `git push origin main` | `git pull` |
+  | `git push upstream` | `git push upstream feature-x` | `git push origin main` |
+  | `git push origin feature-x` | `git push origin feature-x --force-with-lease` | `git push origin main` |
+  | `dotnet package search` | `dotnet package search Dapper.AOT` | `dotnet package add` |
+  | `gh` | `gh --help` | `gh auth logout` |
+
+  A plain word after the program word can name a link in the command's
+  directory, for example `git add keylink`. Netclaw checks the link target
+  against the protected paths. A protected target denies the call, also under
+  a grant. A link to an ordinary file keeps the decision of the grant.
 - The command is an output command: `echo`, `printf`, `:`, `true`, or `false`.
-  This rule also applies after `cd dir && action;`. A dynamic operand, such as
-  `echo "head: $(git rev-parse HEAD)"`, is data. The command inside `$(...)`
-  still needs its own coverage, and a redirect target keeps its own check.
+  This rule also applies after `cd dir && action;`, where the directory is not
+  known: a data command with no redirect and proved data operands has no path
+  scope. A redirect or an unquoted unknown word (`echo $n`) keeps the exact
+  prompt there. A dynamic operand, such as
+  `echo "head: $(git rev-parse HEAD)"`, is data. A value from `$(...)` or
+  `read` in a word that the shell cannot glob, such as `n=$(cmd); echo "$n"`
+  or `echo pre"$n"`, is also data (ShellSyntaxTree 0.4.0-beta.19 reports
+  `MayPathnameExpand`). An unquoted word with such a value (`echo $n`) can
+  expand to file names, so it needs consent. For a program that can open
+  files, such as `cat /work/$f`, such a word gets one exact prompt that no
+  grant covers. A brace word or a loop over literal words in that place gets
+  a rewrite correction instead, and the call does not run. Netclaw sends a
+  correction only when the agent can make the rewrite: a word with a
+  run-time value (`$FOO`, `$(cmd)`, `$?`, a glob loop value) in a command-word
+  position gets a one-time prompt with `Once` and `Deny`. No grant covers it,
+  and an unattended run denies it. When the command
+  words are known and such a word after them is the only cause, as in
+  `git rev-list HEAD...origin/$(git branch --show-current)`, the agent gets a
+  quote correction: no prompt and no run. The quoted retry
+  (`"HEAD...origin/$(git branch --show-current)"`) has one unknown operand, so
+  a grant for anywhere covers it (decision D1). `exit` and `return`
+  need no approval. The command inside
+  `$(...)` still needs its own coverage, and a redirect target keeps its own
+  check.
+- In Bash, the command is a test builtin, `test` or `[`, and the parser proves
+  each operand value with no `[` in it. Examples: `[ 3 -gt 2 ]`,
+  `x=3; [ "$x" -gt 2 ]`, and `for d in a b; do [ "$d" = a ]; done`. A path
+  operand is not a scope, but a protected path is still denied. An operand with
+  `[` or a value from `$(...)` or `read` gets a one-time prompt, because a
+  `-v` subscript can run a command. A file name from a glob loop
+  (`for f in src/*; do [ -f "$f" ]; done`) and an environment value
+  (`[ -n "$FOO" ]`) also get a one-time prompt with `Once` and `Deny`. No
+  grant covers it. The agent cannot write a run-time value literally, so
+  Netclaw sends no rewrite correction for it. An unattended run denies the
+  call.
 - In an interactive session, the reviewed diagnostic catalog covers the
   phrase, and the audience profile lets a file tool read every path
   (`ReadFiles`). With the default Personal profile, that is every path except a
@@ -236,6 +284,32 @@ covered:
   the decision of the literal value. A name with a run-time value (`PID=$!`,
   `x=$(cmd)`, `read x`) is unknown. A command that reads it as a word gets
   `Once` and `Deny`.
+- A variable word has no path scope, also when the parser proves its value.
+  In `for d in ../x; do dotnet build "$d"; done` and in
+  `d=../x; dotnet build "$d"`, the value `../x` is outside the folder, but the
+  candidate keeps only the working directory scope. So the word is an unknown
+  operand (decision D1): a safe phrase or an `Always anywhere` grant covers the
+  command, and a folder, repository, or chat grant does not. The literal twin
+  `dotnet build ../x` keeps the scope of its path. A word that the parser
+  resolves as a path (`"$HOME/x"`) or types as a file value (`cat "$x"`) keeps
+  its scope. A data command (`echo "$f"`) and a protected path keep their own
+  rules.
+- An option value can name a path (0.27.2). In `dotnet build --output=../x`,
+  the value `../x` is outside the folder, so a folder or repository grant for
+  `dotnet build` does not cover the command. The same is true for
+  `--output=$HOME/x` (Bash and PowerShell), `--output\=../x`,
+  `--output'='../x`, `"--output=../x"`, and `-p:OutDir=../x`. A value inside
+  the folder (`--output=bin/x`, `--include=src/*.cs`), a value that is not a
+  path (`--configuration=Release`), and a URL keep the grant. A chat grant and
+  an `Always anywhere` grant cover the command. Free text that starts with
+  `../` or `/` also prompts, for example `--message="../x y"`.
+  These forms get no path scope, because no general parser fact splits them:
+  `-o../x`, `--data=@../x`, `--path=a:../b`, `--files=a,../b`,
+  `--output=file:///etc/x`, `make PREFIX=../x`, `dd of=../x`, and
+  `/p:OutDir=../x`, and a PowerShell value that is relative to a drive
+  (`--output=D:x`). The protected-path check still reads them. A glob value
+  with an expansion before the glob character (`--output=$HOME/*.x`) gets
+  `Once` and `Deny`, as its separate word does.
 - Each command inside `if`, `case`, `while`, `until`, or a background list
   (`server &`) gets its own decision.
 - A Bash redirect to `/dev/null` (for example `2>/dev/null`) writes no file,
@@ -278,8 +352,10 @@ netclaw approvals revoke --tool shell_execute --all --audience personal
 
 - `trust-verb` accepts one complete static phrase. It rejects a flag, a
   redirect, an assignment, a dynamic command name, and a compound command.
-- For a non-shell tool, use `--tool`. Do not use `--shell` with a non-shell
-  tool.
+- For a non-shell tool, use `--tool`, and give the tool name as the phrase:
+  `netclaw approvals trust-verb demo/calculate --tool demo/calculate`. Any
+  other phrase never matches a call, so the command refuses it. Do not use
+  `--shell` with a non-shell tool.
 - Use `netclaw approvals list` to copy the exact label of a repository grant
   before you revoke it.
 
@@ -294,8 +370,11 @@ The store keeps itself clean when it saves a grant:
   `netclaw approvals trust-verb` saves an "anywhere" grant with the exact
   phrase that the operator typed.
 - It does not save a grant that a stored grant already covers. A grant
-  covers another one when the tool, the shell, the words, and the assignment
-  digest are equal, and it applies "anywhere" or has the same scope. A folder
+  covers another one when the tool, the shell, and the assignment digest are
+  equal, its words cover the other words by the rule above, and it applies
+  "anywhere" or has the same scope. So a stored `git push` grant covers a new
+  `git push upstream` grant, and a stored `gh` grant does not cover a new
+  `gh auth logout` grant. A folder
   never covers another folder, and a repository never covers a folder: a link
   or a nested repository can put a directory outside the wider scope.
 - It never removes a stored grant when it saves one, so a later revoke keeps
@@ -305,9 +384,10 @@ The store keeps itself clean when it saves a grant:
 
 - On the first load of a version 2 file, Netclaw writes a byte-identical
   `tool-approvals.json.v2.bak` and converts the file. Old shell entries become
-  exact-phrase (`LegacyExact`) grants, so an upgrade adds no authority. A
-  legacy grant covers a call whose command words equal its phrase, as a new
-  grant for those words does. The text in the prompt does not count.
+  phrase (`LegacyExact`) grants. A legacy grant covers a call by the rule of
+  a new grant for the same words: a phrase of two or more words covers its
+  words and any later words, and a one-word phrase covers the program alone.
+  The text in the prompt does not count.
 - A word after the verb slot that names an existing file or folder in the
   command's directory is not a command word. A grant such as
   `dotnet build Phobos.slnx` from an earlier version stays in the store, but
@@ -331,13 +411,24 @@ Some commands and paths are always blocked, in every mode:
 | Self-destructive | `netclaw daemon stop`, `systemctl stop netclaw`, and a `kill`, `killall`, `pkill`, or `Stop-Process` whose operand names `netclaw` (for example `pkill netclawd`). Any other kill prompts, and a grant can cover it (owner decision D2). |
 | System-destructive | `rm -rf /`, `rm -rf ~/`, fork bombs, `mkfs` |
 | Privilege escalation | `sudo`, `su`, `doas`, and a PowerShell `-Verb RunAs` start |
-| Protected paths | `secrets.json`, key material, webhook secrets, the Netclaw database, and daemon lifecycle files. A write to any config file. |
+| Protected paths | `secrets.json`, webhook route files (they hold the verification secret), key material, the Netclaw database, and daemon lifecycle files. A write to any config file. |
 
-File tools can read `netclaw.json` and the grant store `tool-approvals.json`.
-They cannot write them. `secrets.json`, the `keys` directory, webhook
-secrets, `daemon.env`, `devices.json`, and `hard-deny-overrides.json` stay
-read-denied. A shell command that names the Netclaw config directory is
-denied, because shell text cannot show a read from a write.
+Owner decision D6: file tools can read each file under the config directory,
+for example `netclaw.json`, `tool-approvals.json`, and
+`hard-deny-overrides.json`. They cannot write them. Only `secrets.json`, the
+`webhooks` route files, and the `keys` directory stay read-denied. In the shell, a program that only reads its operands (`cat`,
+`head`, `tail`, `wc`, `grep`, `jq`, `diff`; policy data in
+`ShellVerbPolicyData.ReadOnlyOperandVerbs`) can read a config file by its
+exact path (decision D6). Every other shell command that names a config file
+meets write protection, because shell text cannot show a read from a write.
+A glob, a brace word (`{netclaw,secrets}.json`), an ANSI-C quoted word
+(`$'\x73ecrets.json'`), an unknown path value, or a
+directory operand that holds a read-denied path keeps write protection too. A
+`jq` filter with a brace (`jq '{a: .x}' file`) is not a read-only program, so
+use `cat file | jq '{a: .x}'`. Shell text that names the config directory in
+any other place, for example in a `jq` or `python3 -c` program, stays denied.
+This includes spellings with `//`, `/./`, `name/../`, or split quotes. A redirect that writes, such as `> copy.json`, gets the write
+check for its target only.
 
 Add your own command patterns with `HardDenyPatterns`. They add to the
 built-in list; they do not replace it:
@@ -399,8 +490,10 @@ Tool executed: {ToolName} ({Duration}ms, {ResultLength} chars) authorizationAtte
 ```
 
 - A `Denied` line is a warning and includes `reason=`, for example
-  `hard_deny_self_destructive`, `tool_not_allowed_for_audience_profile`, or
-  `shell_path_outside_trust_zone`.
+  `hard_deny_self_destructive`, `tool_not_allowed_for_audience_profile`,
+  `shell_path_protected` (a shell path is a protected path), or
+  `shell_path_outside_trusted_roots` (a bounded `Roots` profile does not hold
+  the shell path).
 - An `Allowed` line is at debug level.
 - One `authorizationAttemptId` joins the decision, the prompt, your answer,
   and the retry of one call.

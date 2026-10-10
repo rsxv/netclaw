@@ -24,15 +24,16 @@ using Xunit;
 
 namespace Netclaw.Actors.Tests.Tools;
 
-public partial class DispatchingToolExecutorTests
+public partial class DispatchingToolExecutorTests : IDisposable
 {
+    private readonly DisposableTempDir _temp = new();
+    private string BoundSessionDirectory => _temp.Path;
+
+    public void Dispose() => _temp.Dispose();
+
     private const string MissingShellCommandError =
         "Error parsing arguments for tool 'shell_execute': Required parameter 'Command' is missing.";
     private static readonly ShellExecutionEnvironment ShellEnvironment = TestShellEnvironment.Current;
-    private static readonly string BoundSessionDirectory = Path.Combine(
-        Path.GetTempPath(),
-        "netclaw-dispatching-tool-tests",
-        Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
     private readonly DispatchingToolExecutor _executor;
     private readonly DispatchingToolExecutor _restrictedExecutor;
 
@@ -137,6 +138,53 @@ public partial class DispatchingToolExecutorTests
         {
             Directory.Delete(sessionDir, recursive: true);
         }
+    }
+
+    [Theory]
+    [InlineData(0, false)]
+    [InlineData(7, false)]
+    [InlineData(0, true)]
+    [InlineData(7, true)]
+    public async Task Oversized_shell_output_retains_exit_status_and_only_the_tail(int exitCode, bool stream)
+    {
+        const string head = "OUTPUT-HEAD";
+        const string tail = "OUTPUT-TAIL";
+        var output = head + new string('x', 3000) + tail;
+        var callId = $"call-exit-status-{exitCode}-{stream}";
+        var call = CreateToolCall(callId, "shell_execute",
+            ToolInput.Create("Command", $"echo '{output}'; exit {exitCode}"));
+        var context = TestToolExecutionContext.CreateBound(
+            "signalr/exit-status", BoundSessionDirectory, TrustAudience.Personal);
+
+        string? result = null;
+        if (stream)
+        {
+            await foreach (var update in _executor.ExecuteStreamAsync(call, context, TestContext.Current.CancellationToken))
+            {
+                if (update is ToolCompletedUpdate completed)
+                    result = completed.Result;
+            }
+        }
+        else
+        {
+            result = await _executor.ExecuteAsync(call, context, TestContext.Current.CancellationToken);
+        }
+
+        Assert.NotNull(result);
+        Assert.Contains($"Exit code: {exitCode}", result, StringComparison.Ordinal);
+        Assert.StartsWith(BoundedOutputReader.Separator, result, StringComparison.Ordinal);
+        Assert.DoesNotContain(head, result, StringComparison.Ordinal);
+        Assert.Contains(tail, result, StringComparison.Ordinal);
+        Assert.Contains($"tool_output_read using CallId='{callId}'", result, StringComparison.Ordinal);
+
+        var inline = result[..result.IndexOf("[output truncated", StringComparison.Ordinal)];
+        Assert.EndsWith($"Exit code: {exitCode}", inline.TrimEnd(), StringComparison.Ordinal);
+        Assert.True(ToolOutputSpillLocation.TryResolve(BoundSessionDirectory, callId, out _, out var spill));
+        var retained = await File.ReadAllTextAsync(spill, TestContext.Current.CancellationToken);
+        Assert.StartsWith($"Exit code: {exitCode}{Environment.NewLine}", retained, StringComparison.Ordinal);
+        Assert.Contains(output, retained, StringComparison.Ordinal);
+        if (exitCode != 0)
+            Assert.DoesNotContain("Exit code: 0", result, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -430,7 +478,7 @@ public partial class DispatchingToolExecutorTests
             "call-2", "file_read",
             ToolInput.Create("Path", missingPath));
 
-        var context = TestToolExecutionContext.CreateBound("signalr/thread-1", Path.GetTempPath(), new TestToolExecutionContextOptions
+        var context = TestToolExecutionContext.CreateBound("signalr/thread-1", _temp.Path, new TestToolExecutionContextOptions
         {
             Audience = TrustAudience.Personal,
             Boundary = TrustBoundary.TrustedInstance,
@@ -1339,7 +1387,7 @@ public partial class DispatchingToolExecutorTests
             TestContext.Current.CancellationToken);
 
         Assert.Equal(ToolAuthorizationOutcome.Denied, decision.Outcome);
-        Assert.Equal("shell_path_outside_trust_zone", decision.DenyReason);
+        Assert.Equal("shell_path_outside_trusted_roots", decision.DenyReason);
         Assert.Equal(0, approvalService.RequestCount);
     }
 
@@ -1387,7 +1435,7 @@ public partial class DispatchingToolExecutorTests
             TestContext.Current.CancellationToken);
 
         Assert.Equal(ToolAuthorizationOutcome.Denied, decision.Outcome);
-        Assert.Equal("shell_path_outside_trust_zone", decision.DenyReason);
+        Assert.Equal("shell_path_outside_trusted_roots", decision.DenyReason);
         Assert.Equal(0, approvalService.RequestCount);
     }
 
@@ -2097,7 +2145,7 @@ public partial class DispatchingToolExecutorTests
                 $"call-{toolName}-deny", toolName,
                 buildArgs(filePath));
 
-            var sessionDir = Path.Combine(Path.GetTempPath(), $"netclaw-{toolName}-session-{Guid.NewGuid():N}");
+            var sessionDir = Path.Combine(_temp.Path, $"{toolName}-session");
             Directory.CreateDirectory(sessionDir);
 
             var context = TestToolExecutionContext.CreateBound("slack/thread-1", sessionDir, new TestToolExecutionContextOptions
@@ -2137,7 +2185,7 @@ public partial class DispatchingToolExecutorTests
                 "call-3", "file_write",
                 ToolInput.Create("Path", filePath, "Content", "dispatch test"));
 
-            var sessionDir = Path.Combine(Path.GetTempPath(), $"netclaw-dispatch-session-{Guid.NewGuid():N}");
+            var sessionDir = Path.Combine(_temp.Path, "dispatch-session");
             Directory.CreateDirectory(sessionDir);
 
             var context = TestToolExecutionContext.CreateBound("signalr/thread-1", sessionDir, new TestToolExecutionContextOptions
@@ -2213,7 +2261,7 @@ public partial class DispatchingToolExecutorTests
             new ToolPathPolicy([]));
 
         var registry = new ToolRegistry();
-        var paths = new NetclawPaths(Path.Combine(Path.GetTempPath(), $"netclaw-{audience}-tools-{Guid.NewGuid():N}"));
+        var paths = new NetclawPaths(Path.Combine(_temp.Path, $"{audience}-tools"));
         paths.EnsureDirectoriesExist();
         registry.WithFirstPartyTools(policy, webhookRouteStore: new WebhookRouteStore(paths));
         // set_webhook and delete_webhook ask WebhookRouteActor. This test reads
@@ -2642,7 +2690,7 @@ public partial class DispatchingToolExecutorTests
         var registry = new ToolRegistry();
         registry.WithFirstPartyTools(TestToolAccessPolicy.Create(config));
 
-        var tempFile = Path.GetTempFileName();
+        var tempFile = Path.Combine(_temp.Path, "tool-approvals.json");
         var system = ActorSystem.Create($"tool-approval-audit-{Guid.NewGuid():N}");
         try
         {
@@ -4021,7 +4069,7 @@ public partial class DispatchingToolExecutorTests
                 InteractiveApproval = TestToolExecutionContext.InteractiveApproval(true)
             });
 
-    private static ToolExecutionContext CreateInteractivePersonalExecutionContext(string sessionId)
+    private ToolExecutionContext CreateInteractivePersonalExecutionContext(string sessionId)
         => TestToolExecutionContext.CreateBound(
             sessionId,
             BoundSessionDirectory,

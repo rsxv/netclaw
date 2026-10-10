@@ -595,6 +595,127 @@
       "renamedFrom": "unassigned-operand-unattended-denies",
       "negativeControl": "unattended-cd-semicolon-without-grant-denies",
       "approvedBy": "Aaron Stannard (owner), decision D2 (an unattended run uses the audience policy of a chat), 2026-10-04"
+    },
+    {
+      "section": "Fresh Personal approval matrix",
+      "id": "echo-substitution-data-allows-reviewed-inner-command",
+      "renamedFrom": "echo-substitution-data-prompts-for-inner-command",
+      "from": "RequiresApproval",
+      "to": "Allowed",
+      "reason": "Approval taxonomy D4 adds git merge-base to the reviewed catalog. It only reads commits and has no write, code, or network mode. An unreviewed command in the substitution still prompts (see echo-substitution-data-prompts-for-unreviewed-inner-command).",
+      "negativeControl": "unsafe-catalog-find-exec-prompts",
+      "approvedBy": "Aaron Stannard (owner), approval taxonomy D4 (one reviewed batch of read-only commands, plan page approval-taxonomy.html), 2026-10-05"
+    },
+    {
+      "section": "Fresh Personal approval matrix",
+      "id": "unattended-brace-program-word-denies",
+      "renamedFrom": "unattended-brace-program-word-gets-rewrite-advice",
+      "from": "RequiresAgentCorrection",
+      "to": "Denied",
+      "reason": "ShellSyntaxTree 0.4.0-beta.18 rejects a brace word in the command name, because Bash expands it to another program and its operands (#227). The unparsed call is denied in an unattended run. Neither outcome runs the call; the agent no longer gets the rewrite advice.",
+      "approvedBy": "Aaron Stannard (owner), confirmed for #2349, 2026-10-05"
+    },
+    {
+      "section": "Fresh Personal approval matrix",
+      "id": "brace-credential-keys-gets-rewrite-correction",
+      "renamedFrom": "brace-credential-keys-needs-exact-consent",
+      "from": "RequiresApproval",
+      "to": "RequiresAgentCorrection",
+      "reason": "The brace word is the only cause that makes the command exact, so the agent gets the rewrite correction (#2349 review comment 4187346461). Neither outcome runs the call, and no grant covers the candidate."
+    },
+    {
+      "section": "Fresh Personal approval matrix",
+      "id": "unattended-brace-credential-keys-gets-rewrite-correction",
+      "renamedFrom": "unattended-brace-credential-keys-denies",
+      "from": "Denied",
+      "to": "RequiresAgentCorrection",
+      "reason": "The brace word is the only cause that makes the command exact, so the agent gets the rewrite correction in place of the unattended denial (#2349 review comment 4187346461). Neither outcome runs the call; the rewritten literal credential paths are denied.",
+      "approvedBy": "Aaron Stannard (owner), confirmed 2026-10-06"
+    },
+    {
+      "section": "Fresh Personal approval matrix",
+      "id": "loop-outside-operand-prompts-with-chat-grant",
+      "from": "RequiresApproval",
+      "to": "Allowed",
+      "reason": "Owner decision F1: each literal twin gets the decision of the typed literal. The twin 'dotnet build ../outside/x.slnx' keeps its path scope, and a chat grant for 'dotnet build' covers the typed literal (literal-outside-operand-uses-chat-grant), so it covers the twin. A folder grant still does not cover the path outside the folder.",
+      "negativeControl": "loop-outside-operand-prompts-with-folder-grant",
+      "approvedBy": "owner (2026-10-06, F1 loop values)"
+    },
+    {
+      "section": "Fresh Personal approval matrix",
+      "id": "unquoted-status-output-redirect-remains-complex",
+      "from": "RequiresAgentCorrection",
+      "to": "RequiresApproval",
+      "reason": "Owner rule: send a correction only when a rewrite that the agent can make removes the cause. '$?' has a run-time value, so the agent cannot write the word literally. The call gets the normal prompt for the external redirect. Neither outcome runs the call without consent.",
+      "approvedBy": "owner (2026-10-07, satisfiable corrections only)"
+    },
+    {
+      "section": "Fresh Personal approval matrix",
+      "id": "control-flow-fails-closed",
+      "from": "RequiresAgentCorrection",
+      "to": "RequiresApproval",
+      "reason": "Owner rule: send a correction only when a rewrite that the agent can make removes the cause. A file name from a glob loop is known only at run time, so the agent cannot write it literally. The call gets the normal one-time prompt for 'cat \"$f\"'; the 'cat' grant still does not cover it.",
+      "approvedBy": "owner (2026-10-07, satisfiable corrections only)"
+    },
+    {
+      "section": "Fresh Personal approval matrix",
+      "id": "echo-redirect-runs-no-program",
+      "renamedFrom": "echo-redirect-prompts",
+      "from": "RequiresApproval",
+      "to": "Allowed",
+      "reason": "Owner decision (2026-10-07): echo runs no program, so its only effect is the redirect. The file rules of the audience allow the write in the project, so the call needs no grant and no prompt. A program with a write redirect still prompts.",
+      "negativeControl": "workload-edit-search-pipeline-redirect-in-project-prompts-for-writer",
+      "approvedBy": "owner (2026-10-07, no prompt when nothing runs)"
+    },
+    {
+      "section": "Fresh Personal approval matrix",
+      "id": "echo-external-redirect-runs-no-program",
+      "renamedFrom": "echo-external-redirect-prompts",
+      "from": "RequiresApproval",
+      "to": "Allowed",
+      "reason": "Owner decision (2026-10-07): echo runs no program. The Personal profile may write the redirect target outside the project, so the file rules allow the call with no prompt. A protected or unwritable target is denied.",
+      "negativeControl": "workload-edit-search-pipeline-redirect-in-project-prompts-for-writer",
+      "approvedBy": "owner (2026-10-07, no prompt when nothing runs)"
+    },
+    {
+      "section": "Fresh Personal approval matrix",
+      "id": "workload-edit-printf-redirect-runs-no-program",
+      "renamedFrom": "workload-edit-printf-redirect-prompts",
+      "from": "RequiresApproval",
+      "to": "Allowed",
+      "reason": "Owner decision (2026-10-07): printf runs no program, so its only effect is the redirect into the project. The file rules allow it with no grant and no prompt.",
+      "negativeControl": "workload-edit-search-pipeline-redirect-in-project-prompts-for-writer",
+      "approvedBy": "owner (2026-10-07, no prompt when nothing runs)"
+    },
+    {
+      "section": "Fresh Personal approval matrix",
+      "id": "unquoted-status-output-redirect-runs-no-program",
+      "renamedFrom": "unquoted-status-output-redirect-remains-complex",
+      "from": "RequiresApproval",
+      "to": "Allowed",
+      "reason": "Owner decision (2026-10-07): echo runs no program, so it needs no command words and no grant. The file rules allow the write with no prompt. A program with a write redirect still prompts.",
+      "negativeControl": "workload-edit-search-pipeline-redirect-in-project-prompts-for-writer",
+      "approvedBy": "owner (2026-10-07, no prompt when nothing runs)"
+    },
+    {
+      "section": "Fresh Personal approval matrix",
+      "id": "inline-python-heredoc-uses-interpreter-grant",
+      "renamedFrom": "inline-python-heredoc-fails-closed",
+      "from": "RequiresApproval",
+      "to": "Allowed",
+      "reason": "Owner decision (heredoc parity): a heredoc with a quoted delimiter gives fixed text on stdin. The text is data, as the same text in 'python3 -c' is data. The command keeps its normal candidate, so the stored 'python3' grant covers it, as it covers 'python3 -c' (inline-python-interpreter-grant-currently-allows). An expanding heredoc and a shell receiver stay strict.",
+      "negativeControl": "here-string-interpreter-grant-prompts",
+      "approvedBy": "owner (2026-10-07, heredoc parity)"
+    },
+    {
+      "section": "Fresh Personal approval matrix",
+      "id": "here-string-cat-with-argument-uses-grant",
+      "renamedFrom": "here-string-cat-with-argument-prompts",
+      "from": "RequiresApproval",
+      "to": "Allowed",
+      "reason": "Owner decision (heredoc parity): a here string with a proved value gives fixed text on stdin. The command keeps its normal candidate, so the stored 'cat' grant covers 'cat -n', as it covers 'cat -n' with no here string. A here string with an unknown value stays strict (dynamic-here-string-cat-prompts).",
+      "negativeControl": "dynamic-here-string-cat-prompts",
+      "approvedBy": "owner (2026-10-07, heredoc parity)"
     }
   ]
 }

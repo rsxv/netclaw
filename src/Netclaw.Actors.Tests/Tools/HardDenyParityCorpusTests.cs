@@ -275,7 +275,18 @@ public sealed class HardDenyParityCorpusTests(ShellApprovalMatrixFixture fixture
         Deny("boundary-background-quoted-head", BoundaryTests, "'netclaw' daemon stop &", SelfDestructive),
         Deny("boundary-background-wrapper", BoundaryTests, "bash -c \"pkill netclawd\" &", SelfDestructive),
         Deny("boundary-background-sudo", BoundaryTests, "sudo rm -rf / &", PrivilegeEscalation),
-        Deny("boundary-background-protected", BoundaryTests, "cat ../netclaw/config/notes.txt &", ProtectedPath),
+        Deny("boundary-background-protected", BoundaryTests, "cat ../netclaw/config/secrets.json &", ProtectedPath),
+
+        // Owner decision (2026-10-07): ~/.ssh and ~/.aws are denied like the control plane.
+        Deny("credential-ssh-key", "Credential locations", "cat ~/.ssh/id_ed25519", ProtectedPath),
+        Deny("credential-ssh-list", "Credential locations", "ls ~/.ssh", ProtectedPath),
+        Deny("credential-aws-home-var", "Credential locations", "cat $HOME/.aws/credentials", ProtectedPath),
+        Deny("credential-aws-cd", "Credential locations", "cd ~/.aws && cat credentials", ProtectedPath),
+        Deny("credential-kube-config", "Credential locations", "cat ~/.kube/config", ProtectedPath),
+        Deny("credential-netrc", "Credential locations", "cat ~/.netrc", ProtectedPath),
+        Deny("credential-gh-hosts", "Credential locations", "cat $HOME/.config/gh/hosts.yml", ProtectedPath),
+        Control("credential-docker-contexts-control", "Credential locations", "cat ~/.docker/contexts/meta.json"),
+        Control("credential-neighbour-control", "Credential locations", "cat ~/.bashrc"),
     ];
 
     public static IEnumerable<TheoryDataRow<string>> BashRows
@@ -294,7 +305,8 @@ public sealed class HardDenyParityCorpusTests(ShellApprovalMatrixFixture fixture
             .Where(static testCase => testCase.Expected.Outcome == ApprovalOutcome.Denied)
             .Where(static testCase => testCase.Expected.DenyReason
                 is not ("shell_working_directory_outside_trust_zone"
-                    or "shell_path_outside_trust_zone"
+                    or "shell_path_outside_trusted_roots"
+                    or "shell_path_protected"
                     or ToolAuthorizer.UnattendedApprovalRequired))
             .Where(static testCase => IsPosix || testCase.Invocation.Host is not (ShellApprovalHost.Bash or ShellApprovalHost.Bash52))
             .Select(static testCase => new TheoryDataRow<string>(testCase.Id));
@@ -388,13 +400,14 @@ public sealed class HardDenyParityCorpusTests(ShellApprovalMatrixFixture fixture
         }
     }
 
-    // Unparseable input can ask for one exact retry. It never offers a reusable grant.
+    // Unparseable input can ask for one exact retry. It never offers a reusable
+    // grant. The prompt shows the full command text.
     private static void AssertExactConsentOnly(ApprovalObservation observation)
     {
         Assert.Equal(ApprovalOutcome.RequiresApproval, observation.Outcome);
         var prompt = Assert.IsType<ApprovalPromptObservation>(observation.Prompt);
         Assert.True(prompt.IsMessy);
-        Assert.Empty(prompt.CandidateVerbs);
+        Assert.Equal(prompt.Patterns.Count > 0 ? [] : [prompt.DisplayText], prompt.CandidateVerbs);
         Assert.All(
             prompt.OptionKeys,
             key => Assert.Contains(key, new[] { ObservedOptionKeys.ApproveOnce, ObservedOptionKeys.Deny }));

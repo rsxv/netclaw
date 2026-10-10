@@ -5,6 +5,7 @@
 // -----------------------------------------------------------------------
 using Microsoft.Extensions.AI;
 using Netclaw.Actors.Authorization.Consent;
+using Netclaw.Actors.Protocol;
 using Netclaw.Actors.Tools;
 using Netclaw.Configuration;
 using Netclaw.Security;
@@ -77,10 +78,12 @@ internal sealed class ToolAuthorizer
         if (_registry.GetByName(call.Name) is not { } tool)
             return AuthorizationDecision.From(ToolAuthorizationDecision.Deny("tool_not_found"), analysis: null);
 
-        var decision = string.Equals(tool.Name, ShellTool.ToolName, StringComparison.Ordinal)
+        var isShell = string.Equals(tool.Name, ShellTool.ToolName, StringComparison.Ordinal);
+        var decision = isShell
             ? await AuthorizeShellAsync(new ShellCall(this, tool, call, context), ct)
             : AuthorizationDecision.From(await DecideOtherAsync(new OtherCall(this, tool, call, context), ct), analysis: null);
-        return DenyConsentWhenUnattended(decision, context);
+        decision = DenyConsentWhenUnattended(decision, context);
+        return isShell ? CorrectCommandTooLongToShow(ShowFullCommandText(decision)) : decision;
     }
 
     /// <summary>
@@ -108,6 +111,62 @@ internal sealed class ToolAuthorizer
                 + "audience (for example with /run-reminder), then run it again.",
                 consent.Trace)
             : decision;
+
+    // The operator must see what they approve. A shell consent request with no
+    // candidate and no pattern names nothing: the source did not parse, or no
+    // command has a proved program word. Owner decision (October 2026): such a request is
+    // never blank. Its one display candidate is the full command text, with
+    // only "Once" and "Deny". The one-time key reads the candidates and the
+    // patterns, not this display list, so a "Once" answer still matches the
+    // retry. A command that runs no program never reaches this rule: the file
+    // rules allow or deny it.
+    internal static AuthorizationDecision ShowFullCommandText(AuthorizationDecision decision)
+    {
+        // A request with patterns already shows them (a PowerShell statement list).
+        if (decision is not AuthorizationDecision.NeedsConsent
+            {
+                Request: { CandidateVerbs.Count: 0, Patterns.Count: 0 }
+            } consent)
+        {
+            return decision;
+        }
+
+        return consent with
+        {
+            Request = consent.Request with
+            {
+                CandidateVerbs = [consent.Request.DisplayText],
+                IsMessy = true,
+                Options = ToolAccessPolicy.OneShotApprovalOptions,
+            }
+        };
+    }
+
+    // The operator must see the full command that they approve. A shell prompt
+    // whose text does not fit on every channel becomes a correction: the call
+    // does not run and does not prompt. This rule runs after the unattended
+    // denial, so only an attended consent request reaches it. Allowed, denied,
+    // and unattended calls do not change. The same long call gets the same
+    // correction again, never a prompt. The trace keeps the policy result, as
+    // for the unattended denial.
+    private static AuthorizationDecision CorrectCommandTooLongToShow(AuthorizationDecision decision)
+    {
+        if (decision is not AuthorizationDecision.NeedsConsent consent)
+            return decision;
+
+        // The display text holds the full command. An exact candidate verb can
+        // also be the full command text, and the header and verb list show it.
+        var length = consent.Request.CandidateVerbs
+            .Select(static verb => verb.Length)
+            .Append(consent.Request.DisplayText.Length)
+            .Max();
+        return length > ApprovalOptionKeys.MaxCommandTextChars
+            ? new AuthorizationDecision.CorrectionRequired(
+                new ToolCorrectionCollection([new ToolCorrection.ShellCommandTooLongToShow(length)]),
+                consent.Matches,
+                consent.Trace)
+            : decision;
+    }
 
     private async Task<AuthorizationDecision> AuthorizeShellAsync(ShellCall call, CancellationToken ct)
     {
@@ -139,6 +198,8 @@ internal sealed class ToolAuthorizer
     // projected candidates) precede the covering grant. An attended and an
     // unattended call use the same rules (D2). The only difference comes after
     // this method: the session denies a consent request that nobody can answer.
+    // An attended consent request with a command too long to show then becomes
+    // a correction (CorrectCommandTooLongToShow).
     // ---------------------------------------------------------------------
     private async Task<ToolAuthorizationDecision> DecideShellAsync(ShellCall call, CancellationToken ct)
     {
@@ -148,13 +209,17 @@ internal sealed class ToolAuthorizer
         decision ??= ProtectedPath(call);
         decision ??= WorkingDirectoryParentSegment(call);
         decision ??= DirectoryProofScreen(call);
+        decision ??= LiteralTwinScreen(call);
         decision ??= TrustedRoot(call);
         decision ??= ApprovalModeDenial(call);
+        decision ??= await FileToolGrantsAsync(call, ct);
         decision ??= NativeToolAdvice(call);
         decision ??= AutomaticApprovalMode(call);
+        decision ??= NoCommand(call);
         decision ??= CallWithoutCommandText(call);
         decision ??= MissingProjection(call);
         decision ??= ProjectedTrustedRoot(call);
+        decision ??= NoProgramRedirects(call);
         decision ??= UnresolvedInput(call);
         decision ??= await CoveringGrantAsync(call, ct);
         return decision ?? UncoveredCandidates(call, ct);
@@ -203,6 +268,12 @@ internal sealed class ToolAuthorizer
             ? call.Finish(_policy.ScreenDirectoryScopes(proof, call.Context))
             : null;
 
+    // Prohibition and filesystem authority for each literal twin, as for a typed command (F1).
+    private ToolAuthorizationDecision? LiteralTwinScreen(ShellCall call)
+        => call.LiteralTwins is { } twins
+            ? call.Finish(_policy.ScreenLiteralTwins(twins, call.Context))
+            : null;
+
     // Filesystem authority: the working directory and every known path must be inside a trusted root.
     private ToolAuthorizationDecision? TrustedRoot(ShellCall call)
         => call.Analysis is { } analysis
@@ -212,6 +283,37 @@ internal sealed class ToolAuthorizer
     // Admission: a Deny consent mode.
     private static ToolAuthorizationDecision? ApprovalModeDenial(ShellCall call)
         => call.Finish(ToolAccessPolicy.ScreenApprovalModeDenial(call.Mode));
+
+    // Owner decision (October 2026): a source with no command (x=1, a comment)
+    // runs no program, so nothing can prompt. The screens above still apply.
+    // With no grant store, the rule does not apply, as for the exemption.
+    private ToolAuthorizationDecision? NoCommand(ShellCall call)
+        => _approvalService is not null && call.Analysis is { ProvesNoCommand: true }
+            ? call.Finish(ToolAuthorizationDecision.Allow(ToolAllowReason.ApprovalExemptShellCandidates))
+            : null;
+
+    // Consent: a redirect of a command that runs no program gets the decision
+    // of its file tool, with the stored grants of that tool. This rule only
+    // records which file tool calls a grant covers. It never decides.
+    private async Task<ToolAuthorizationDecision?> FileToolGrantsAsync(ShellCall call, CancellationToken ct)
+    {
+        if (_approvalService is null || call.CommandApproval is not { } approval)
+            return null;
+
+        foreach (var fileCall in _policy.GetRedirectsThatNeedConsent(approval, call.Context))
+        {
+            var check = await StoredGrantCheck.RunAsync(
+                _approvalService,
+                new ToolName(fileCall.Tool),
+                _policy.BuildFileToolConsentRequest(fileCall, call.Context),
+                call.Context,
+                ct);
+            if (check.AllCovered)
+                call.GrantedFileToolCalls.Add(fileCall);
+        }
+
+        return null;
+    }
 
     // Advice: a native tool replaces the shell call. Shell consent cannot authorize that replacement.
     private static ToolAuthorizationDecision? NativeToolAdvice(ShellCall call)
@@ -259,8 +361,19 @@ internal sealed class ToolAuthorizer
     // Filesystem authority: every candidate path again, including the intent view of a causal list.
     private ToolAuthorizationDecision? ProjectedTrustedRoot(ShellCall call)
         => call.Finish(_policy.EnforceProjectedShellFileProtection(
-            call.Evaluation.CandidateStates.Select(static state => state.PathFacts).ToArray(),
+            call.Evaluation.CandidateStates
+                .Select(static state => (state.PathFacts, state.Candidate.SourceOccurrence))
+                .ToArray(),
+            call.CandidateAnalyses,
             call.Context.Invocation));
+
+    // Filesystem authority and admission for each redirect of a command that
+    // runs no program: a proved target, the file_read rules for an input
+    // redirect, and no Deny mode of the file tool.
+    private ToolAuthorizationDecision? NoProgramRedirects(ShellCall call)
+        => call.Finish(_policy.ScreenNoProgramRedirects(
+            call.Evaluation.CandidateStates.Select(static state => (state.Candidate.Candidate, state.PathFacts)),
+            call.Context));
 
     // Unresolved input: syntax without reusable candidates gets one exact retry, advice, or a Once-only prompt.
     private static ToolAuthorizationDecision? UnresolvedInput(ShellCall call)
@@ -380,6 +493,7 @@ internal sealed class ToolAuthorizer
         private Lazy<ShellCommandAnalysis?>? _analysis;
         private Lazy<ShellApprovalAnalysis?>? _parsedApproval;
         private Lazy<BashDirectoryScopeProjection?>? _directoryProof;
+        private Lazy<BashLiteralTwinSlices?>? _literalTwins;
         private Lazy<ToolApprovalMode>? _mode;
         private Lazy<ShellPolicyPreflightResult>? _preflight;
         private Lazy<ToolCorrectionCollection?>? _corrections;
@@ -416,14 +530,45 @@ internal sealed class ToolAuthorizer
                 : null)).Value;
 
         /// <summary>
-        /// The consent candidates: from the directory proof when one applies,
-        /// else one candidate set for each command.
+        /// The literal twins of the Bash commands, or null when no command has
+        /// twins. A directory proof already gives each command its exact
+        /// directory, so a call with one gets no twins.
         /// </summary>
-        internal ShellApprovalAnalysis? Approval => DirectoryProof is { } proof
+        internal BashLiteralTwinSlices? LiteralTwins => (_literalTwins ??= new(() =>
+            DirectoryProof is null
+            && Analysis is { } analysis
+            && authorizer._policy.TryProjectLiteralTwins(analysis, out var twins)
+                ? twins
+                : null)).Value;
+
+        /// <summary>
+        /// The consent candidates: from the directory proof when one applies,
+        /// else one candidate set for each command, with the candidates of the
+        /// literal twins in place of their source command. A command that
+        /// runs no program keeps a prompt when its file tool needs consent.
+        /// </summary>
+        internal ShellApprovalAnalysis? Approval => CommandApproval is { } approval
+            ? authorizer._policy.WithFileToolConsent(approval, context, GrantedFileToolCalls)
+            : null;
+
+        /// <summary>The file tool calls of redirects that a stored grant of the file tool covers.</summary>
+        internal HashSet<FileToolCall> GrantedFileToolCalls { get; } = [];
+
+        internal ShellApprovalAnalysis? CommandApproval => DirectoryProof is { } proof
             ? ToolAccessPolicy.WithDirectoryScopes(ParsedApproval!, proof)
             : ParsedApproval is { } parsed
-                ? ToolAccessPolicy.WithCommandCandidates(parsed)
+                ? WithLiteralTwins(ToolAccessPolicy.WithCommandCandidates(parsed))
                 : null;
+
+        /// <summary>The analyses that own the candidate occurrences: the call and each literal twin.</summary>
+        internal IReadOnlyList<ShellCommandAnalysis> CandidateAnalyses =>
+        [
+            .. Analysis is { } analysis ? [analysis] : Array.Empty<ShellCommandAnalysis>(),
+            .. LiteralTwins?.Slices.Select(static slice => slice.Analysis) ?? []
+        ];
+
+        private ShellApprovalAnalysis WithLiteralTwins(ShellApprovalAnalysis approval)
+            => LiteralTwins is { } twins ? ToolAccessPolicy.WithLiteralTwins(approval, twins) : approval;
 
         internal ToolApprovalMode Mode => (_mode ??= new(() =>
             authorizer._policy.GetShellApprovalMode(_toolName, context, call.Arguments, Analysis))).Value;

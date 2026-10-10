@@ -92,6 +92,22 @@ durable:   a stored tool-role chat message
 ephemeral: the ToolInvocationReceipt for that tool call
 ```
 
+### Text admission
+
+Text admission occurs when the daemon journal stores an `InputAdmitted` record.
+It preserves the input and its original authority before the model completes a turn.
+It does not grant tool permission or confirm model completion.
+
+**Code anchors:** `LlmSessionActor.AdmitInput`, `SessionRegistry.SendMessageAsync`
+
+### Delivery unconfirmed
+
+Delivery is unconfirmed when a dispatched request has no reliable admission response.
+The input may already exist in the daemon journal.
+The client must check the session before it resends that input.
+
+**Code anchors:** `ChatClientActor`, `ChatCloseReceipt`
+
 ### Local-control proof
 
 A local-control proof shows that a process can use the Netclaw host key ring.
@@ -714,14 +730,16 @@ terms. Specifications and operator prose must use the canonical terms here.
 
 ### Ordinary configuration
 
-Ordinary configuration is the non-secret persisted configuration in
-`netclaw.json` and the grant store `tool-approvals.json`. It can be read through structured file tools when normal roots,
-audience policy, and operation permissions allow it. Read authority does not
-grant write, attach, or shell authority.
+Ordinary configuration is each file under the config directory except
+`secrets.json` and the webhook route files, for example `netclaw.json` and the grant store
+`tool-approvals.json` (owner decision D6). It can be read through structured file tools when normal roots,
+audience policy, and operation permissions allow it. A shell program that
+only reads its operands can read it by its exact path (decision D6). Read
+authority does not grant write, attach, or other shell authority.
 
-Secret configuration belongs in protected stores such as
-`secrets.json`, key storage, OAuth credential files, or webhook secret files.
-Those stores and control-plane state remain read-denied.
+Secret configuration belongs in protected stores such as `secrets.json`,
+webhook route files, and key storage. Those stores and the database and process-control state remain
+read-denied.
 
 ### Canonical path
 

@@ -263,3 +263,117 @@ mode='one'; inspect item
 'my tool' --version
 "/opt/My App/bin/tool" -v
 "echo x" hi
+bash {K}/.server-feeds/team/disk-cleanup/scripts/audit.sh
+sh {K}/.server-feeds/team/disk-cleanup/scripts/audit.sh
+{K}/.server-feeds/team/disk-cleanup/scripts/audit.sh
+ls {K}/.system/
+ls -la {K}/.server-feeds/team/disk-cleanup
+find {K}/.system -name SKILL.md
+cat {K}/.system/netclaw-operations/SKILL.md
+touch {K}/.system/netclaw-operations/added.md
+echo x > {K}/.server-feeds/team/disk-cleanup/notes.md
+cp {P}/notes.txt {K}/.system/netclaw-operations/notes.md
+echo x > {C}/netclaw.json
+touch {C}/tool-approvals.json
+cp {P}/notes.txt {C}/secrets.json
+echo x | tee {C}/webhooks/route.json
+sed -i s/a/b/ {C}/netclaw.json
+for n in 8250 8244; do gh api -X PATCH repos/o/r/issues/$n -f milestone=157 >/dev/null && echo "moved $n"; done
+for n in 8250 8244; do gh api repos/o/r/issues/$n; done
+for f in notes.txt ~/.netclaw/config/secrets.json; do cat "$f"; done
+for f in a.txt b.txt ~/.netclaw/keys/key-1.xml; do head -n 1 "$f"; done
+for d in ../outside/x.slnx; do dotnet build "$d"; done
+for d in a.slnx ../outside/x.slnx; do make "$d"; done
+for n in $(gh issue list); do gh api x/$n; done
+for n in $(gh issue list); do gh api "x/$n"; done
+for p in /bin/rm; do $p x; done
+for v in status log; do git $v; done
+for v in push fetch; do git $v origin; done
+for f in a.txt b.txt; do rm "$f"; done
+for f in a.txt /etc/hosts; do cat "$f"; done
+d=../outside/x.slnx; make "$d"
+x=1; for n in a b; do gh api x/$n; done
+x=1; export x; for n in a b; do gh api x/$n; done
+b=$(git branch --show-current); git log origin/$b..HEAD
+b=$(git branch --show-current); git log "origin/$b..HEAD"
+b=$(git branch --show-current); git fetch origin
+b=$(git branch --show-current); git push origin "$b"
+st=$(git status --short); echo "$st"
+b=1; git status
+b=1; export b; git status
+b=1 git status
+set -a; b=1; git status
+GIT_DIR=/tmp/x; git status
+d=key; echo ../netclaw/"${d}s"/*
+d=key; ls ../netclaw/"${d}s"/*
+cat ~/.ssh/id_ed25519
+cat ~/.ssh/id_ed25519.pub
+ls ~/.ssh
+ls -la ~/.aws
+cat ~/.aws/credentials
+cat $HOME/.aws/credentials
+cat ${HOME}/.ssh/config
+cat "$HOME/.ssh/id_rsa"
+cat ~/.s*/id_ed25519
+cd ~/.ssh && cat id_ed25519
+cd ~ && cat .ssh/id_ed25519
+cd ~/.aws; cat credentials
+head -n1 ~/.ssh/known_hosts
+echo hi > ~/.ssh/authorized_keys
+cp key ~/.ssh/id_ed25519
+tee ~/.aws/config
+ssh-keygen -y -f ~/.ssh/id_ed25519
+ssh-add ~/.ssh/id_ed25519
+ssh -i ~/.ssh/id_ed25519 host
+scp ~/.ssh/id_ed25519.pub host:
+docker run -v $HOME/.aws:/root/.aws:ro alpine ls
+aws s3 ls
+ssh host uptime
+git fetch
+ssh -V
+cat ~/.bashrc
+cat ~/projects/app/.aws/config
+cat infra/.ssh/config
+cat .devcontainer/.aws/config
+cd app && cat .aws/config
+git diff -- infra/.ssh/config
+grep -rn '\.ssh' .
+sed 's/\.ssh//' f
+grep -c 'docs\.aws\.amazon\.com' README.md
+grep -rn "/.aws" .
+git log --grep="/.ssh"
+git commit -m "docs: explain the /.aws mount"
+curl https://raw.githubusercontent.com/x/dotfiles/main/.ssh/config
+curl https://docs.aws.amazon.com/cli/latest/userguide/
+git clone https://github.com/example/dotfiles.ssh.git
+cat notes.ssh.md
+cat ~/.kube/config
+kubectl --kubeconfig ~/.kube/config get pods
+cat ~/.netrc
+cat ~/.git-credentials
+cat ~/.docker/config.json
+gpg --homedir ~/.gnupg --list-keys
+cat ~/.config/gh/hosts.yml
+ls ~/.config/gcloud
+cat ~/.azure/accessTokens.json
+cat $HOME/.kube/config
+cat ${HOME}/.netrc
+Get-Content ~\.ssh\id_ed25519
+gc $HOME\.aws\credentials
+cat $env:USERPROFILE\.kube\config
+cat ~/.sshrc
+cat ~/.awsome/x
+cat ~/.netrc-example.md
+cat ~/.docker/contexts/meta.json
+cat ~/.config/git/config
+cat tsconfig.json
+cat infra/.kube/config
+git push origin main
+gh pr list
+kubectl get pods
+docker pull alpine
+gcloud auth list
+az account show
+gpg --sign file
+curl -n https://example.com/x
+Select-String '\.ssh' *

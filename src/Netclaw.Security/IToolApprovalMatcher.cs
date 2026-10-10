@@ -15,8 +15,12 @@ using ShellSyntaxTree;
 namespace Netclaw.Security;
 
 /// <summary>
-/// One approval candidate extracted from a tool invocation. The verb is the
-/// command head plus subcommand chain (e.g., <c>find</c>, <c>git status</c>).
+/// One approval candidate extracted from a tool invocation. For a shell
+/// command with known command words, the verb is the phrase text of
+/// <see cref="VerbTokens"/> (e.g., <c>git status</c>,
+/// <c>pipedrive dealFields list</c>). The prompt shows it, and a grant from
+/// the prompt saves those words. A command with unknown command words keeps
+/// its policy verb, and an exact candidate keeps its source text.
 /// The directory identifies a path operand, a redirect parent, or an inherited
 /// shell directory. A null directory uses the spawned process cwd.
 /// One shell clause can produce multiple candidates when it accesses multiple
@@ -60,6 +64,22 @@ public sealed record ApprovalCandidate(
     internal ShellUnresolvedPart Unresolved { get; init; }
 
     /// <summary>
+    /// True when the candidate is exact only because a word can glob with an
+    /// unknown value. A rewrite of the words can then resolve the command, so
+    /// the coordinator can give the rewrite correction. It grants no authority.
+    /// </summary>
+    internal bool WordRewriteCanResolve { get; init; }
+
+    /// <summary>
+    /// True when the command of this candidate runs no program
+    /// (<see cref="ShellCommandAnalysis.RunsNoProgram"/>): a command with only
+    /// redirects, or a data command such as <c>printf</c> or <c>:</c>. No grant
+    /// covers such a candidate and no prompt names it. The file rules of the
+    /// audience judge its redirect targets.
+    /// </summary>
+    internal bool RunsNoProgram { get; init; }
+
+    /// <summary>
     /// Parser source metadata does not change occurrence identity.
     /// </summary>
     public bool Equals(ApprovalCandidate? other) =>
@@ -72,6 +92,8 @@ public sealed record ApprovalCandidate(
         other is not null &&
         Equals(other) &&
         Unresolved == other.Unresolved &&
+        WordRewriteCanResolve == other.WordRewriteCanResolve &&
+        RunsNoProgram == other.RunsNoProgram &&
         AssignmentDigest == other.AssignmentDigest &&
         Shell == other.Shell &&
         HasSameVerbTokens(other.VerbTokens);
@@ -273,7 +295,8 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
     public IReadOnlyList<string> ExtractCandidateVerbs(ToolName toolName, IDictionary<string, object?>? arguments)
         => ExtractCandidates(toolName, arguments)
             .Select(c => c.Verb)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Distinct(ApprovalPatternMatching.VerbTextComparer(
+                Environment.Grammar == ShellGrammar.Bash ? ApprovalShell.Bash : ApprovalShell.PowerShell))
             .ToList();
 
     public IReadOnlyList<ApprovalCandidate> ExtractCandidates(ToolName toolName, IDictionary<string, object?>? arguments)
@@ -318,10 +341,10 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
 
         foreach (var occurrence in result.Commands)
         {
-            var occurrenceCandidates = ExtractCandidatesForOccurrence(
+            var occurrenceCandidates = ExtractProvedCandidates(
+                result,
                 occurrence,
                 workingDirectory,
-                resolveUnknownPathsFromEffectiveValues: false,
                 hostLinks);
             if (occurrenceCandidates is null)
                 return [];
@@ -330,6 +353,83 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
         }
 
         return candidates;
+    }
+
+    /// <summary>
+    /// Returns the candidates of one command that the parser proves. A command
+    /// that runs no program gets candidates with
+    /// <see cref="ApprovalCandidate.RunsNoProgram"/>. A command with only
+    /// redirects has no command word, so its candidate verb is its source text.
+    /// </summary>
+    private IReadOnlyList<ApprovalCandidate>? ExtractProvedCandidates(
+        ShellCommandAnalysis result,
+        CommandOccurrence occurrence,
+        string? workingDirectory,
+        LinkRule hostLinks)
+    {
+        if (!result.RunsNoProgram(occurrence))
+        {
+            return ExtractCandidatesForOccurrence(
+                occurrence,
+                workingDirectory,
+                resolveUnknownPathsFromEffectiveValues: false,
+                hostLinks);
+        }
+
+        var redirectLinks = NoProgramLinks(result, occurrence, hostLinks);
+        var candidates = ShellCommandAnalysis.IsRedirectOnlyCommand(occurrence)
+            ? ExtractRedirectOnlyCandidates(result.Source, occurrence, workingDirectory, redirectLinks)
+            : ExtractCandidatesForOccurrence(
+                occurrence,
+                workingDirectory,
+                resolveUnknownPathsFromEffectiveValues: false,
+                redirectLinks);
+        return candidates?
+            .Select(static candidate => candidate with { RunsNoProgram = true })
+            .ToArray();
+    }
+
+    // A command that runs no program has no grant scope: the file rules judge
+    // its target, and they resolve each link. Thus the platform temporary
+    // alias (macOS /tmp -> /private/tmp, R7) is a valid target for it. Each
+    // other command keeps the caller's link rule.
+    private static LinkRule NoProgramLinks(
+        ShellCommandAnalysis result,
+        CommandOccurrence occurrence,
+        LinkRule hostLinks)
+        => hostLinks == LinkRule.FromVolumeRoot && result.RunsNoProgram(occurrence)
+            ? LinkRule.FromVolumeRootExceptTemporaryAlias
+            : hostLinks;
+
+    // A command with only redirects gets one candidate for each redirect
+    // folder, as a data command does. The verb is the source text, so a prompt
+    // that shows the candidate never shows an empty name.
+    private IReadOnlyList<ApprovalCandidate>? ExtractRedirectOnlyCandidates(
+        string source,
+        CommandOccurrence occurrence,
+        string? workingDirectory,
+        LinkRule hostLinks)
+    {
+        var directories = ResolveCommandDirectories(
+            occurrence,
+            verb: string.Empty,
+            isSideEffectVerb: true,
+            workingDirectory,
+            Environment.PathStyle,
+            resolveUnknownPathsFromEffectiveValues: false,
+            hostLinks,
+            fileWords: []);
+        if (directories is null)
+            return null;
+
+        var text = ExactCommandText(source, occurrence);
+        return directories
+            .Select(directory => new ApprovalCandidate(text, directory)
+            {
+                Shell = ApprovalShell.Bash,
+                SourceOccurrence = occurrence,
+            })
+            .ToArray();
     }
 
     /// <summary>
@@ -362,15 +462,23 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
             // SECURITY: after an unproved directory change (cd "$x", pushd,
             // popd, a failed cd), the parser has no exact directory for the
             // command. The call's directory would be a wrong scope, so the
-            // command stays exact as a whole.
+            // command stays exact as a whole. A data command with no redirect
+            // and proved data operands is the exception: it has no path scope,
+            // so the directory changes nothing that it can reach. It keeps its
+            // normal candidate and its approval exemption. Its other facts
+            // (program word, structure) still come from the analysis.
             var part = occurrence.WorkingDirectory is ShellValueDomain.Exact
+                       || IsScopeFreeDataCommand(
+                           occurrence,
+                           ApprovalShell.Bash,
+                           NormalizedVerb(occurrence, ApprovalShell.Bash))
                 ? result.GetUnresolvedPart(occurrence)
                 : ShellUnresolvedPart.Command;
             if (part == ShellUnresolvedPart.None
-                && ExtractCandidatesForOccurrence(
+                && ExtractProvedCandidates(
+                    result,
                     occurrence,
                     result.WorkingDirectory,
-                    resolveUnknownPathsFromEffectiveValues: false,
                     hostLinks) is { } resolved)
             {
                 candidates.AddRange(resolved);
@@ -380,10 +488,67 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
             if (CreateExactCandidate(result.Source, occurrence, part) is not { } exact)
                 return [];
 
-            candidates.Add(exact);
+            candidates.Add(exact with
+            {
+                WordRewriteCanResolve = occurrence.WorkingDirectory is ShellValueDomain.Exact
+                                        && result.IsUnresolvedOnlyByPathnameExpansion(occurrence)
+            });
         }
 
         return candidates;
+    }
+
+    /// <summary>
+    /// Gives the candidates of a literal twin the assignment digest of its
+    /// source command. Returns false when the source assignments have no
+    /// digest.
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: a twin text is one command with no assignment, but the
+    /// shell-state assignments that reach the source command reach each run
+    /// (<c>x=1; for n in a b; do gh api x/$n; done</c>). A candidate keeps that
+    /// qualification, so a grant without the same assignments cannot cover it.
+    /// An approval-exempt output candidate has no digest, as for a typed
+    /// command. When the method returns false, the source command keeps its own
+    /// candidates.
+    /// </remarks>
+    internal static bool TryQualifyTwinCandidates(
+        IReadOnlyList<ApprovalCandidate> twinCandidates,
+        CommandOccurrence source,
+        out IReadOnlyList<ApprovalCandidate> qualified)
+    {
+        ArgumentNullException.ThrowIfNull(twinCandidates);
+        ArgumentNullException.ThrowIfNull(source);
+        qualified = twinCandidates;
+        if (source.Assignments.Count == 0)
+            return true;
+
+        var result = new ApprovalCandidate[twinCandidates.Count];
+        for (var index = 0; index < twinCandidates.Count; index++)
+        {
+            var candidate = twinCandidates[index];
+            if (ApprovalPatternMatching.IsPureSideEffect(candidate))
+            {
+                result[index] = candidate;
+                continue;
+            }
+
+            if (!ShellAssignmentDigestFactory.TryCreate(
+                    ApprovalShell.Bash,
+                    QualifyingAssignments(
+                        source.Assignments,
+                        ApprovalShell.Bash,
+                        ApprovalPatternMatching.PolicyProgram(candidate)),
+                    out var digest))
+            {
+                return false;
+            }
+
+            result[index] = digest is null ? candidate : candidate with { AssignmentDigest = digest };
+        }
+
+        qualified = Array.AsReadOnly(result);
+        return true;
     }
 
     private ApprovalCandidate? CreateExactCandidate(
@@ -473,7 +638,7 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
         if (string.IsNullOrEmpty(verb))
             return null;
 
-        var isSideEffectVerb = ShellVerbPolicyData.SingleTokenSideEffectVerbs.Contains(verb);
+        var isSideEffectVerb = ShellVerbPolicyData.IsDataCommand(verb, shell);
         var clauseWorkingDirectory = GetClauseWorkingDirectory(
             occurrence,
             workingDirectory,
@@ -491,13 +656,8 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
         if (directories is null)
             return null;
 
-        if (!ShellAssignmentDigestFactory.TryCreate(
-                shell,
-                occurrence.Assignments,
-                out var assignmentDigest))
-        {
+        if (!TryCreateAssignmentDigest(occurrence, shell, verb, out var assignmentDigest))
             return null;
-        }
 
         var verbTokens = commandWords.Words;
         if (verbTokens is not null
@@ -506,15 +666,19 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
                 clauseWorkingDirectory,
                 out var programPath))
         {
-            verb = ReplaceProgram(
-                verb,
-                ShellCommandWordText.Quote(shell, clause.Verb.Tokens[0]),
-                ShellCommandWordText.Quote(shell, programPath));
             verbTokens = Array.AsReadOnly([programPath, .. verbTokens.Skip(1)]);
         }
 
+        // One grant identity: the prompt shows, the store saves, and a grant
+        // matches the same command words. The parser verb walk stops at a word
+        // such as "dealFields", so its text ("pipedrive") named a grant that
+        // the answer did not save. Unknown command words have no grant, so the
+        // policy verb only names the program.
+        var identity = verbTokens is null
+            ? verb
+            : ShellCommandWordText.FormatPhrase(shell, verbTokens);
         return directories
-            .Select(directory => new ApprovalCandidate(verb, directory)
+            .Select(directory => new ApprovalCandidate(identity, directory)
             {
                 AssignmentDigest = assignmentDigest,
                 VerbTokens = verbTokens,
@@ -572,7 +736,8 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
     /// (<c>bash deploy.sh</c>). A planted file named <c>push</c> must not change
     /// the identity of <c>git push</c>, and an interpreter grant must not cover
     /// each script. A link keeps its word, because the link target can be a
-    /// protected path. Each dropped word becomes a path scope of the candidate,
+    /// protected path; <see cref="ToolPathPolicy"/> checks that target for each
+    /// plain word. Each dropped word becomes a path scope of the candidate,
     /// the same as <c>./Phobos.slnx</c>, so the trusted-root and protected-path
     /// checks see it. When the occurrence directory is not known, no word drops.
     /// </para>
@@ -626,14 +791,6 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
                && !string.Equals(programPath, programWord, StringComparison.Ordinal);
     }
 
-    // The display verb starts with the parser's program word. A launcher value
-    // ($HOME/x) and a relative path both show the file that runs.
-    private static string ReplaceProgram(string verb, string parserProgram, string programPath)
-        => verb.StartsWith(parserProgram, StringComparison.Ordinal)
-           && (verb.Length == parserProgram.Length || verb[parserProgram.Length] == ' ')
-            ? programPath + verb[parserProgram.Length..]
-            : verb;
-
     /// <summary>
     /// Returns the rewrite that gives a command known command words, or null
     /// when no rewrite by the model can help (for example, a dynamic program
@@ -659,13 +816,20 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
             .Skip(1)
             .Where(static element => element.Role != ShellSyntaxTree.ClauseElementRole.Redirect)
             .ToArray();
-        if (words.Any(static element => element.Kind == ShellSyntaxTree.ArgKind.Glob && !element.Value.Contains('/', StringComparison.Ordinal)))
-            return ShellCommandWordsRewrite.UsePathGlob;
 
         // A PowerShell script block, subexpression, or array argument is normal
         // syntax that a rewrite cannot remove, so it keeps the one-time prompt.
         if (shell != ApprovalShell.Bash)
-            return null;
+            return words.Any(IsBareGlob) ? ShellCommandWordsRewrite.UsePathGlob : null;
+
+        // The first word that Bash can change is the cause that the model must
+        // remove first. A later run-time operand does not make the words
+        // unknown, so it does not decide.
+        var cause = words.FirstOrDefault(static element =>
+            IsBareGlob(element)
+            || element.Kind is ShellSyntaxTree.ArgKind.EnvVar or ShellSyntaxTree.ArgKind.DynamicSkip);
+        if (cause is not null && IsBareGlob(cause))
+            return ShellCommandWordsRewrite.UsePathGlob;
 
         // Without launch facts (a Bash host other than 5.2 or 5.3), ShellSyntaxTree
         // gives no value for a tilde in the program word, so "~/bin/tool" has no
@@ -674,20 +838,43 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
         if (clause.Elements[0].Raw.StartsWith("~/", StringComparison.Ordinal))
             return ShellCommandWordsRewrite.WriteProgramPathInFull;
 
-        // A name that the source assigns a runtime value ($!, $(...), or read)
-        // has no literal spelling, so the model cannot write the word. The
-        // command keeps its one-time prompt.
-        if (occurrence.Assignments.Any(static assignment =>
-                assignment.Scope == ShellSyntaxTree.ShellVariableAssignmentScope.ShellState
-                && assignment.EffectiveValue is ShellSyntaxTree.ShellValueDomain.Unknown))
-        {
-            return null;
-        }
+        if (cause is null)
+            return ShellCommandWordsRewrite.RunCommandsSeparately;
 
-        if (words.Any(static element => element.Kind is ShellSyntaxTree.ArgKind.EnvVar or ShellSyntaxTree.ArgKind.DynamicSkip))
-            return ShellCommandWordsRewrite.WriteWordsLiterally;
+        // Owner decision (2026-10-07): send a correction only when a rewrite
+        // that the model can make removes the cause. A word with a run-time
+        // value has no literal spelling, so the advice would repeat with no
+        // way out. The command keeps its one-time prompt or unattended denial.
+        return HoldsRunTimeValue(occurrence, cause) ? null : ShellCommandWordsRewrite.WriteWordsLiterally;
+    }
 
-        return ShellCommandWordsRewrite.RunCommandsSeparately;
+    private static bool IsBareGlob(ShellSyntaxTree.ClauseElement element)
+        => element.Kind == ShellSyntaxTree.ArgKind.Glob
+           && !element.Value.Contains('/', StringComparison.Ordinal);
+
+    /// <summary>
+    /// Returns true when the word reads a value that Bash knows only at run
+    /// time (an environment value, a <c>$(...)</c> result, a glob match), so
+    /// the model cannot write the word literally.
+    /// </summary>
+    /// <remarks>
+    /// ShellSyntaxTree gives no typed fact for an expansion in a word, so the
+    /// check reads <c>$</c> and the backtick in the raw word. A wrong match
+    /// only keeps the prompt.
+    /// SECURITY: the result selects advice or a prompt. It grants no authority.
+    /// </remarks>
+    private static bool HoldsRunTimeValue(
+        ShellSyntaxTree.CommandOccurrence occurrence,
+        ShellSyntaxTree.ClauseElement element)
+    {
+        var argument = occurrence.Arguments.FirstOrDefault(argument => ReferenceEquals(argument.Element, element));
+        // A proved authored value is text that the source holds, glob
+        // character or not: for f in '*.cs' has the literal form '*.cs'.
+        if (argument?.AuthoredValue is ShellValueDomain.Exact or ShellValueDomain.FiniteSet)
+            return false;
+
+        return element.Raw.Contains('$', StringComparison.Ordinal)
+               || element.Raw.Contains('`', StringComparison.Ordinal);
     }
 
     private static IReadOnlyList<string?>? ResolveCommandDirectories(
@@ -722,46 +909,31 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
         {
             foreach (var arg in clause.Args)
             {
-                if (arg.IsCwdAttribution
-                    || !IsAuthorizationPathArg(arg, clauseWorkingDirectory, pathStyle))
-                    continue;
-
-                if (arg.Kind == ShellSyntaxTree.ArgKind.Glob)
-                {
-                    var coveringDirectory = ResolveGlobCoveringDirectory(
+                if (!arg.IsCwdAttribution
+                    && !TryAddPathWordScopes(
                         occurrence,
+                        verb,
                         arg,
                         clauseWorkingDirectory,
-                        pathStyle);
-                    if (coveringDirectory is null)
-                        return null;
-
-                    directories.Add(coveringDirectory);
-                    continue;
-                }
-
-                if (ResolveControlCharacterScope(arg, pathStyle) is { } textScope)
+                        pathStyle,
+                        resolveUnknownPathsFromEffectiveValues,
+                        directories))
                 {
-                    directories.Add(textScope);
-                    continue;
-                }
-
-                var resolvedPaths = ResolveArgumentPaths(
-                    occurrence,
-                    arg,
-                    clauseWorkingDirectory,
-                    pathStyle,
-                    resolveUnknownPathsFromEffectiveValues);
-                if (resolvedPaths is null)
                     return null;
-
-                directories.AddRange(resolvedPaths.Select(resolved =>
-                    ResolveAuthorizationScope(verb, arg, resolved, pathStyle)));
+                }
             }
 
             // A file word that left the command words is a path operand.
             foreach (var fileWord in fileWords)
                 directories.Add(ResolveAuthorizationScope(verb, fileWord.Word, fileWord.Path, pathStyle));
+
+            // A plain word that names a link stays a command word. It gets the
+            // same two scopes as a path word that names the link.
+            foreach (var link in ToolPathPolicy.FindLinkWords(occurrence, clauseWorkingDirectory))
+            {
+                if (!TryAddLinkScopes(link, pathStyle, directories, out _))
+                    return null;
+            }
 
             foreach (var argument in occurrence.Arguments)
             {
@@ -777,6 +949,35 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
                     return null;
 
                 directories.AddRange(authoredDirectories);
+            }
+
+            // SECURITY: an option value can name a path for the program
+            // (--output=../x). The parser gives an inline option two arguments
+            // of one element, and it types the value as a path only from its
+            // own option tables. Netclaw has no option tables, so a value that
+            // can leave the working directory gets the scope of a path word
+            // with the same text (#2364). A value that the parser already
+            // types as a path is in the loop above.
+            for (var index = 1; index < occurrence.Arguments.Count; index++)
+            {
+                var value = occurrence.Arguments[index];
+                var option = occurrence.Arguments[index - 1];
+                if (value.Argument.IsPath || !ReferenceEquals(value.Element, option.Element))
+                    continue;
+
+                var words = ResolveOptionValuePathWords(option, value, clauseWorkingDirectory, pathStyle);
+                if (words is null
+                    || words.Any(word => !TryAddPathWordScopes(
+                        occurrence,
+                        verb,
+                        word,
+                        clauseWorkingDirectory,
+                        pathStyle,
+                        resolveUnknownPathsFromEffectiveValues,
+                        directories)))
+                {
+                    return null;
+                }
             }
         }
 
@@ -823,6 +1024,68 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
         }
 
         return directories.Distinct(StringComparer.Ordinal).ToList();
+    }
+
+    /// <summary>
+    /// Adds the two scopes of a word that names a link (issue #2375): the folder
+    /// that holds the link, and the final target of the link chain. Returns false
+    /// when the target is not known. <paramref name="isLink"/> is false when the
+    /// path names no link; the caller then gives the word its lexical scope.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// SECURITY: a program that opens the word reads or writes the target, so the
+    /// target is a scope. A grant must cover every scope, so a folder or repository
+    /// grant covers the word only when it covers the link folder and the target.
+    /// The link walk of the grant still checks the target scope, so a directory
+    /// link in the target path is refused. A missing target (a dangling link)
+    /// has the scope of the folder that its link text names.
+    /// </para>
+    /// <para>
+    /// Each spelling of one link gets the same pair of scopes: <c>ext.txt</c>,
+    /// <c>./extlink</c>, and the plain word <c>extlink</c>.
+    /// </para>
+    /// <para>
+    /// The check reads the disk at authorization time. A link that the same
+    /// command creates or changes before the program runs is a run-time effect
+    /// that the check cannot see. A path in another host style, or a path that
+    /// is not a full host path, names no host link.
+    /// </para>
+    /// <para>
+    /// A platform temporary alias, such as macOS <c>/tmp</c>, is an OS alias and
+    /// not a link to another place (R7). The word keeps its one lexical scope.
+    /// </para>
+    /// </remarks>
+    private static bool TryAddLinkScopes(
+        string path,
+        ShellPathStyle pathStyle,
+        List<string?> directories,
+        out bool isLink)
+    {
+        isLink = false;
+        if (!CanonicalPath.TryCreate(path, relativeBase: null, pathStyle, out var canonical)
+            || !canonical.IsHostStyle
+            || FileSystemAuthority.IsBelowTemporaryAlias(canonical))
+        {
+            return true;
+        }
+
+        // The canonical form has no trailing separator. With one, the OS reads
+        // the target and not the link.
+        var link = canonical.Value;
+        switch (FileSystemAuthority.FollowLinkChain(link, out var target))
+        {
+            case LinkChainEnd.NotALink:
+                return true;
+            case LinkChainEnd.Target:
+                isLink = true;
+                directories.Add(Path.GetDirectoryName(link) ?? link);
+                // A file or a missing target has the scope of its folder.
+                directories.Add(Directory.Exists(target) ? target : Path.GetDirectoryName(target) ?? target);
+                return true;
+            default:
+                return false;
+        }
     }
 
     /// <summary>
@@ -1008,6 +1271,151 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
 
         return resolved;
     }
+
+    /// <summary>
+    /// Adds the scopes of one path word. Returns false when the word has no
+    /// fixed scope, so the occurrence is unresolved.
+    /// </summary>
+    private static bool TryAddPathWordScopes(
+        CommandOccurrence occurrence,
+        string verb,
+        Arg arg,
+        string? workingDirectory,
+        ShellPathStyle pathStyle,
+        bool resolveUnknownPathsFromEffectiveValues,
+        List<string?> directories)
+    {
+        if (!IsAuthorizationPathArg(arg, workingDirectory, pathStyle))
+            return true;
+
+        if (arg.Kind == ArgKind.Glob)
+        {
+            var coveringDirectory = ResolveGlobCoveringDirectory(
+                occurrence,
+                arg,
+                workingDirectory,
+                pathStyle);
+            if (coveringDirectory is null)
+                return false;
+
+            directories.Add(coveringDirectory);
+            return true;
+        }
+
+        if (ResolveControlCharacterScope(arg, pathStyle) is { } textScope)
+        {
+            directories.Add(textScope);
+            return true;
+        }
+
+        var resolvedPaths = ResolveArgumentPaths(
+            occurrence,
+            arg,
+            workingDirectory,
+            pathStyle,
+            resolveUnknownPathsFromEffectiveValues);
+        if (resolvedPaths is null)
+            return false;
+
+        foreach (var resolved in resolvedPaths)
+        {
+            if (!TryAddLinkScopes(resolved, pathStyle, directories, out var isLink))
+                return false;
+
+            if (!isLink)
+                directories.Add(ResolveAuthorizationScope(verb, arg, resolved, pathStyle));
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Returns a path word for each text of an option value that can leave the
+    /// working directory. Returns null when a text has no location.
+    /// </summary>
+    /// <remarks>
+    /// A text that stays in the working directory gives no word: the working
+    /// directory scope covers it. A text that is not a path of the shell's
+    /// path style (a URL on PowerShell) gives no word. A glob value uses its
+    /// text before the first glob character. A "~" in the text is a name:
+    /// Bash expands no "~" after the "=" of an option.
+    /// See docs/architecture/tool-authorization.md, section 6.4.
+    /// </remarks>
+    private static IReadOnlyList<Arg>? ResolveOptionValuePathWords(
+        AnalyzedArgument option,
+        AnalyzedArgument value,
+        string? workingDirectory,
+        ShellPathStyle pathStyle)
+    {
+        var isGlob = value.Argument.Kind == ArgKind.Glob;
+        var words = new List<Arg>();
+        foreach (var whole in isGlob ? [value.Element.Value] : BoundedValues(value.Value))
+        {
+            // The element text, and a PowerShell value with an expansion,
+            // hold the whole word. The value is the text after the option.
+            var name = option.Argument.Raw;
+            var text = whole.StartsWith(name, StringComparison.Ordinal)
+                       && whole.AsSpan(name.Length).IndexOfAny('=', ':') == 0
+                ? whole[(name.Length + 1)..]
+                : whole;
+            var segments = pathStyle == ShellPathStyle.Windows ? text.Split('/', '\\') : text.Split('/');
+            var leaves = segments.Contains("..", StringComparer.Ordinal);
+            var anchor = isGlob ? text.Split('*', '?', '[')[0] : text;
+            var placed = TryCreateLocation(anchor, workingDirectory, pathStyle, out var location, out var cwd);
+
+            // A glob with a ".." or with an expansion before its first glob
+            // character has no fixed anchor. The path word rule decides.
+            if (!isGlob || !leaves && !anchor.Contains('$', StringComparison.Ordinal))
+            {
+                if (placed && StaysInWorkingDirectory(location, cwd))
+                    continue;
+
+                // A text that the path style cannot place: a ".." has no
+                // fixed scope, and a rooted text ("/etc/x" on PowerShell) is
+                // its own scope. Other text (a URL, a date) is not a path.
+                if (!placed && leaves)
+                    return null;
+
+                if (!placed && (segments[0].Length > 0 || text.Length == 0))
+                    continue;
+            }
+
+            words.Add(new Arg
+            {
+                Raw = text,
+                Resolved = isGlob ? null : placed ? location.Value : text,
+                Kind = isGlob ? ArgKind.Glob : ArgKind.Literal,
+                IsPath = true
+            });
+        }
+
+        return words;
+    }
+
+    private static bool TryCreateLocation(
+        string text,
+        string? workingDirectory,
+        ShellPathStyle pathStyle,
+        out CanonicalPath location,
+        out CanonicalPath cwd)
+    {
+        location = default;
+        return CanonicalPath.IsHostPathStyle(pathStyle)
+            ? CanonicalPath.TryCreateHost(workingDirectory, relativeBase: null, out cwd)
+              && CanonicalPath.TryCreateHost(text, cwd.Value, out location)
+            : CanonicalPath.TryCreate(workingDirectory, relativeBase: null, pathStyle, out cwd)
+              && CanonicalPath.TryCreate(text, cwd.Value, pathStyle, out location);
+    }
+
+    /// <summary>
+    /// Returns true when a location is below the working directory with no
+    /// link on the way. Such a path word or option value adds no scope. A
+    /// path of another style than the host gets the lexical check only.
+    /// </summary>
+    private static bool StaysInWorkingDirectory(CanonicalPath location, CanonicalPath cwd)
+        => FileSystemAuthority.EvaluateMembership(
+            location,
+            [new PathBoundary.Folder(cwd, LinkRule.BelowRoot)]) is PathDecision.Allowed;
 
     private static IReadOnlyList<string>? ResolveAuthoredFileSystemDirectories(
         ShellValueDomain domain,
@@ -1240,9 +1648,7 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
 
         return !CanonicalPath.TryCreateHost(arg.Resolved, relativeBase: null, out var resolved)
                || !CanonicalPath.TryCreateHost(workingDirectory, relativeBase: null, out var cwd)
-               || FileSystemAuthority.EvaluateMembership(
-                   resolved,
-                   [new PathBoundary.Folder(cwd, LinkRule.BelowRoot)]) is not PathDecision.Allowed;
+               || !StaysInWorkingDirectory(resolved, cwd);
     }
 
     /// <summary>
@@ -1790,9 +2196,10 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
             : ApprovalShell.PowerShell;
 
         if (analysis.Commands.Any(command =>
-                !ShellAssignmentDigestFactory.TryCreate(
+                !TryCreateAssignmentDigest(
+                    command,
                     shell,
-                    command.Assignments,
+                    NormalizedVerb(command, shell),
                     out _)))
         {
             return true;
@@ -1817,7 +2224,7 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
                     workingDirectory,
                     Environment.PathStyle,
                     resolveUnknownPathsFromEffectiveValues: false,
-                    hostLinks,
+                    NoProgramLinks(analysis, command, hostLinks),
                     // A file word adds a known scope. It never makes a scope unresolved.
                     fileWords: []) is null))
         {
@@ -1875,7 +2282,76 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
     }
 
     private static bool IsSideEffectCommand(ShellSyntaxTree.CommandOccurrence occurrence, ApprovalShell shell)
-        => ShellVerbPolicyData.SingleTokenSideEffectVerbs.Contains(NormalizedVerb(occurrence, shell));
+        => ShellVerbPolicyData.IsDataCommand(NormalizedVerb(occurrence, shell), shell);
+
+    /// <summary>
+    /// Returns the assignment digest of a command. A Bash data command with no
+    /// redirect and with proved data operands
+    /// (<see cref="IsScopeFreeDataCommand"/>) gets no digest.
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: a Bash data command is a builtin, so an assignment cannot
+    /// change the program. An assignment can change only the operands. When
+    /// <see cref="ShellCommandAnalysis.HasProvedDataOperands"/> proves each
+    /// operand is data, the command has no path scope and no stored grant, so
+    /// <c>n=$(cmd); echo "$n"</c> needs no exact candidate. An unquoted word
+    /// with an unknown value can expand to the names in any folder, and a test
+    /// operand with <c>[</c> can run code. Such a command keeps its digest, and
+    /// so does a command with a redirect.
+    /// </remarks>
+    private static bool TryCreateAssignmentDigest(
+        ShellSyntaxTree.CommandOccurrence occurrence,
+        ApprovalShell shell,
+        string verb,
+        out ApprovalAssignmentDigest? digest)
+    {
+        if (IsScopeFreeDataCommand(occurrence, shell, verb))
+        {
+            digest = null;
+            return true;
+        }
+
+        return ShellAssignmentDigestFactory.TryCreate(
+            shell,
+            QualifyingAssignments(occurrence.Assignments, shell, verb),
+            out digest);
+    }
+
+    /// <summary>
+    /// Returns the assignments that qualify a grant for a command.
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: owner decision F3 skips an assignment that stays in the shell,
+    /// because Bash passes it to no program. A Bash data command keeps every
+    /// assignment: it reads no environment, so its digest guards only operands
+    /// that are not proved data (<c>d=key; echo ../x/"${d}s"/*</c>), and the
+    /// digest keeps such a command from the approval exemption.
+    /// </remarks>
+    private static IReadOnlyList<ShellSyntaxTree.ShellVariableAssignment> QualifyingAssignments(
+        IReadOnlyList<ShellSyntaxTree.ShellVariableAssignment> assignments,
+        ApprovalShell shell,
+        string verb)
+        => ShellVerbPolicyData.IsDataCommand(verb, shell)
+            ? assignments
+            : ShellAssignmentDigestFactory.ReachingProgram(shell, assignments);
+
+    /// <summary>
+    /// Returns true when a Bash data command has no redirect and each operand
+    /// is proved data
+    /// (<see cref="ShellCommandAnalysis.HasProvedDataOperands"/>). Such a
+    /// command touches no path, so neither an assignment nor the working
+    /// directory can change what it can reach.
+    /// </summary>
+    private static bool IsScopeFreeDataCommand(
+        ShellSyntaxTree.CommandOccurrence occurrence,
+        ApprovalShell shell,
+        string verb)
+        => shell == ApprovalShell.Bash
+           && ShellVerbPolicyData.IsDataCommand(verb, shell)
+           && occurrence.Redirects.Count == 0
+           && ShellCommandAnalysis.HasProvedDataOperands(
+               occurrence,
+               isTestBuiltin: ShellVerbPolicyData.BashTestBuiltins.Contains(verb));
 
     // SECURITY: the phrase quotes a word with whitespace, so the program
     // "echo x" never reads as the side-effect verb echo.
@@ -1884,7 +2360,7 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
         var clause = occurrence.Clause;
         var parsedVerb = clause.Verb.CanonicalVerb
             ?? ShellCommandWordText.FormatPhrase(shell, TrimTrailingValueTokens(clause.Verb.Tokens));
-        return ShellVerbPolicyData.ApplyVerbShortCircuit(parsedVerb);
+        return ShellVerbPolicyData.ApplyVerbShortCircuit(parsedVerb, shell);
     }
 
     public string FormatForDisplay(ToolName toolName, IDictionary<string, object?>? arguments)

@@ -30,7 +30,8 @@
 ## Focused Mutation Tests
 
 All focused gates run in one job definition, `mutation-gates` in `pr_validation.yml`, on each pull request, merge group, and `dev` push.
-The job has three Linux matrix groups that run in parallel with the normal test matrix.
+The job has four Linux matrix groups that run in parallel with the normal test matrix.
+The groups hold about 13 to 14 minutes of gates each. The sum of all gates is about 59 minutes of runner time. The job timeout is 25 minutes.
 Each group runs its gates in sequence after one checkout and tool restore, and it reports every failed gate.
 To add a gate, add its script name (`scripts/run-<name>-mutations.sh`) to the lightest group. Do not add a new job.
 
@@ -48,14 +49,17 @@ coverage. They do not replace positive and negative behavior tests.
 | `ShellGrantCandidateResult.IsFor` | Approval evidence keeps the requested candidate facts | 1 killed | `./scripts/run-tool-authorization-mutations.sh` |
 | `ShellPolicyEvaluation.CandidateState.ValidateActorEvidence` | Actor evidence cannot replace existing candidate coverage (`Coverage != null`) | 1 killed | `./scripts/run-tool-authorization-mutations.sh` |
 | `ToolAuthorizer` shell rule order (hard deny, trusted root, covering grant) | No rule can move ahead of an earlier rule: hard deny and today's trusted-root check precede a covering grant | 3 killed | `./scripts/run-tool-authorizer-order-mutations.sh` |
-| Shell analysis, denial-only, tree effects, and reviewed-safe gates | Parser-proved regions and authored diagnostic syntax preserve hard denials; only bounded audited non-path values and consistent non-link-following tree facts can use reusable approval; a control-character word gets only the ancestor scope of its clean text; only a word below an absent top-level directory loses its path scope; an unresolved command is one exact candidate, and only decision D1 (an unknown operand with a safe phrase or a grant for anywhere, attended or not) covers it; a glob word gets the decision of each protected path that it can match (D5), and its link walk stays inside the covering directory; a bound value gets the hard-deny decision of its literal twin | 193 killed | `./scripts/run-shell-command-analysis-mutations.sh` |
-| Shell assignment identity, wrapper fallback, wrapper child source, hard-deny screen, syntax reconciliation, host mode, prompt rollback, and Bash sanitation | Reusable grants require exact facts, fallback wrappers and wrappers with an assignment prefix must stay one-time, a wrapper child source is the decoded argument value, unresolved Bash source and each list element meet the hard-deny screen, versioned prompts must fail closed, and strong modes require the reviewed launch contract | 71 killed | `./scripts/run-shell-assignment-mutations.sh` |
-| Filesystem authority folder membership, repository identity, repository persistence, and the folder of a new grant | Folder and repository grants require candidate scope, identity, registration, and containment; a folder grant trusts its own root and refuses a link below it; a `..` after a link makes the shell scope unresolved; a new folder grant uses the directory where its occurrence runs | 18 killed | `./scripts/run-approval-directory-mutations.sh` |
+| Shell analysis, denial-only, tree effects, and reviewed-safe gates | Parser-proved regions and authored diagnostic syntax preserve hard denials; only bounded audited non-path values and consistent non-link-following tree facts can use reusable approval; a control-character word gets only the ancestor scope of its clean text; only a word below an absent top-level directory loses its path scope; an unresolved command is one exact candidate, and only decision D1 (an unknown operand with a safe phrase or a grant for anywhere, attended or not) covers it; a glob word gets the decision of each protected path that it can match (D5), and its link walk stays inside the covering directory; a bound value gets the hard-deny decision of its literal twin; a Bash test builtin is data only with proved operand values without `[`; a data command keeps its assignment digest unless each operand is proved data, and only such a data command with no redirect keeps its normal candidate after an unknown directory; a variable word that is not a path word is an unknown operand, so a folder grant cannot cover a loop or an assignment value outside the folder; an option value that the parser splits from its option (`--name=value`, `-p:Name=value`) and that can leave the working directory gets the scope of a path word with the same text, so a folder or repository grant cannot cover it; fixed text on stdin (a quoted heredoc or a proved here string) is data only on stdin and only for a receiver that is not a shell and has no argument that can name one | 330 killed | `./scripts/run-shell-command-analysis-mutations.sh` |
+| Shell assignment identity, wrapper fallback, wrapper child source, hard-deny screen, syntax reconciliation, host mode, prompt rollback, and Bash sanitation | Reusable grants require exact facts, fallback wrappers and wrappers with an assignment prefix must stay one-time, a wrapper child source is the decoded argument value, unresolved Bash source and each list element meet the hard-deny screen, versioned prompts must fail closed, and strong modes require the reviewed launch contract; only an assignment that can reach the program qualifies a grant, a Bash data command keeps every assignment, and the parser names are the names of the one environment snapshot that each process receives (F3) | 81 killed | `./scripts/run-shell-assignment-mutations.sh` |
+| Filesystem authority folder membership, repository identity, repository persistence, the folder of a new grant, and the link target scope | Folder and repository grants require candidate scope, identity, registration, and containment; a folder grant trusts its own root and refuses a link below it; a `..` after a link makes the shell scope unresolved; a word that names a link also has the scope of its final target, and a target after a `..` that leaves a link is unknown (#2375); a new folder grant uses the directory where its occurrence runs | 24 killed | `./scripts/run-approval-directory-mutations.sh` |
 | `ReminderManagerActor.HandleExecutionOutcomeAsync` | Only the current attempt can settle; the manager replies after settlement | 2 killed | `./scripts/run-reminder-execution-mutations.sh` |
 | `ActiveExecutionTracker.TryRemove` | Only the current owner can remove its guard; cleanup removes that guard | 2 killed | `./scripts/run-reminder-execution-mutations.sh` |
 | `McpArtifactMaterializer.TryAdmit` | Scanner approval and verified MIME both precede MCP artifact storage | 4 killed | `./scripts/run-mcp-artifact-admission-mutations.sh` |
 | `SkillManageTool.GuardMutationTarget` and the filesystem authority link and protection results | A skill mutation cannot follow a link, write a protected path, or skip the atomic-write temp file | 5 killed | `./scripts/run-skill-manage-guard-mutations.sh` |
-| `ApprovalPatternMatching.VerbChainEquals`, `ShellPolicyCoordinator.SelectCommandWordsCorrection`, `ShellApprovalMatcher.TryResolveProgramPath`, `ShellProgramPath.MatchesLegacyRelative`, `ShellApprovalMatcher.ProjectCommandWords`, and `ShellGrantFileWords.NamesEntry` | A shell grant covers exactly its command words; a `gh` grant does not cover `gh auth logout`; Unknown command words get a rewrite correction; a program path names its file (R1), so a `./tool` grant does not cover another file named `tool` or `mytool`; a word after the verb slot that names an existing file or directory leaves the command words and becomes a path scope, while the program word, the verb slot, a link, a word without a file, and a word that is not one entry of the directory stay; the store and the doctor use the same rule | 32 detected | `./scripts/run-exact-verb-chain-mutations.sh` |
+| `ToolAccessPolicy.ReadOnlyOccurrences`, the read relaxation in `ToolAccessPolicy.EnforceKnownShellPaths`, `PathAccessPolicy.EvaluateShellReadPath`, `FileSystemAuthority.HoldsReadProtectedPath`, and the read-operand exemption of the `ToolPathPolicy` text screen | Decision D6: a read-only shell program (`cat`, `head`, `tail`, `wc`, `grep`, `jq`, `diff`) with bounded arguments can read one exact config file; only a write-protected path gets read protection; a redirect that writes keeps write protection; a directory operand that holds a read-protected path, a plain word that names an entry, a glob, a brace or `$'...'` word, a `..`, the config directory itself, and program text that names it in any spelling (`//`, `/./`, `name/../`, split quotes) stay denied | 58 killed | `./scripts/run-shell-config-read-mutations.sh` |
+| `ToolApprovalEntryComparer.CoversCommandWords`, `ShellPolicyCoordinator.SelectCommandWordsCorrection`, `ShellApprovalMatcher.TryResolveProgramPath`, `ShellProgramPath.MatchesLegacyRelative`, `ShellApprovalMatcher.ProjectCommandWords`, `ShellGrantFileWords.TryFindEntry`, and `ToolPathPolicy.PlainWordLinkReachesDeniedPath` | A verb grant (two or more words) covers its command words and any later words, and a program-only grant covers its word alone, so a `gh` grant does not cover `gh auth logout`; an empty grant covers nothing; the matcher and the store hygiene use this one rule; Unknown command words get a rewrite correction; a program path names its file (R1), so a `./tool` grant does not cover another file named `tool` or `mytool`; a word after the verb slot that names an existing file or directory leaves the command words and becomes a path scope, while the program word, the verb slot, a link, a word without a file, and a word that is not one entry of the directory stay; a plain word that names a link to a protected path is denied, command word or argument; the store and the doctor use the same rule | 53 detected | `./scripts/run-exact-verb-chain-mutations.sh` |
+| `ShellCommandAnalysis.IsPlainFileTarget` and `ToolAccessPolicy.ScreenNoProgramRedirects` | Owner decision (October 2026): a command that runs no program gets no prompt only when each redirect target is one plain file (`/dev/null` is the only path below `/dev/`, so `/dev/tcp` keeps a prompt); a redirect target that is not proved, an input redirect that the `file_read` rules refuse, and a `Deny` mode of the file tool deny the call | 20 killed | `./scripts/run-no-program-mutations.sh` |
+| `BashLiteralTwinSlices.Apply` and the denial check of `ToolAccessPolicy.ScreenScopedSlices` | Decision F1: the strictest literal twin result decides a call. The candidates of every twin replace the candidates of their source command, an unresolved source keeps its exact answer, twins without their source command fail loudly, and one denied twin denies the call | 9 killed | `./scripts/run-literal-twin-mutations.sh` |
 
 Run the path-access check locally:
 
@@ -75,6 +79,28 @@ A cold CI runner should take two to four minutes.
 
 The harness uses xUnit 2 because Stryker's VSTest adapter does not support xUnit 3 correctly.
 The script requires `perl` and `jq`, which the Linux CI image supplies.
+
+### No Program Gate
+
+Run the gate for commands that run no program:
+
+```bash
+./scripts/run-no-program-mutations.sh
+```
+
+The script runs Stryker two times. The first run selects the target check of
+`ShellCommandAnalysis.IsPlainFileTarget` (5 mutants). A mutant that drops the
+`/dev/` check lets `printf x > /dev/tcp/host/port` run with no prompt. The
+second run selects the redirect checks of
+`ToolAccessPolicy.ScreenNoProgramRedirects` (15 mutants). A mutant
+there lets `: < /etc/passwd` run for an audience that may not read that path,
+or lets a redirect run when `file_write` has the `Deny` mode.
+`NoProgramMutationTests` must kill all of them. A missing or duplicated span
+fails before Stryker starts.
+
+The local run took about 4 minutes after package restore, while another build
+ran. CI runs it in the `approval-and-authorization` group of the
+`mutation-gates` job. Its report directory is `artifacts/stryker/no-program`.
 
 ### MCP Artifact Admission Gate
 
@@ -165,7 +191,7 @@ under a bounded profile, and a protected path with a grant.
 
 The tests pick the host shell and a temporary root without links, so they also
 pass in the normal Windows and macOS test jobs. The local run took about
-2 minutes after package restore. CI runs it in the `authorization` group of the
+2 minutes after package restore. CI runs it in the `shell-analysis` group of the
 `mutation-gates` job. Its report directory is
 `artifacts/stryker/tool-authorizer-order`.
 
@@ -177,23 +203,35 @@ Run the exact verb chain gate:
 ./scripts/run-exact-verb-chain-mutations.sh
 ```
 
-The script runs Stryker four times. The first run selects the length check in
-`ApprovalPatternMatching.VerbChainEquals`: `!=` to `==` and `return false` to
-`return true`. The `==` mutant restores prefix matching for a longer candidate,
-so a `gh` grant would cover `gh auth logout`. The second run selects the return
-of `ShellPolicyCoordinator.SelectCommandWordsCorrection` (three mutants). A
+The script runs Stryker seven times. The first run selects the length checks in
+`ToolApprovalEntryComparer.CoversCommandWords` (11 mutants). A verb grant (two
+or more words) covers its words and any later words, and a program-only grant
+covers its word alone. A mutant that drops the one-word check lets a `gh` grant
+cover `gh auth logout`. A mutant of the shorter-list check lets a grant cover
+fewer words than it names, and a mutant of the empty check lets an empty grant
+cover any call. The approval matcher and the store hygiene share this rule. The
+second run selects the return of
+`ShellPolicyCoordinator.SelectCommandWordsCorrection` (three mutants). A
 mutant that drops the rewrite correction turns a bare-glob call back into a
 prompt or a denial. The third run selects the return of
 `ShellApprovalMatcher.TryResolveProgramPath` (four mutants). A mutant that
 skips the join with the working directory lets a `./tool` grant cover any file
 named `tool`. The fourth run selects the `/` boundary of
 `ShellProgramPath.MatchesLegacyRelative` (one mutant). Without it, an older
-`./tool` grant covers `mytool`. `ExactVerbChainMutationTests` and
-`ToolAuthorizerOrderMutationTests` must detect all ten. A missing or
+`./tool` grant covers `mytool`. The fifth run selects
+`ShellApprovalMatcher.ProjectCommandWords` (six mutants): a file word leaves
+the command words, and a link word stays. The sixth run selects
+`ShellGrantFileWords.TryFindEntry` (16 mutants). The seventh run selects
+`ToolPathPolicy.PlainWordLinkReachesDeniedPath` and
+`ToolPathPolicy.FindLinkWords`, the one loop that the screen shares with the
+link scopes of #2375 (12 mutants): a plain
+word that names a link to a protected path is denied, command word or
+argument, and the program word does not count. `ExactVerbChainMutationTests` and
+`ToolAuthorizerOrderMutationTests` must detect all of them. A missing or
 duplicated span fails before Stryker starts.
 
 The local run took about 1 minute after package restore. CI runs it in the
-`approval-and-execution` group of the `mutation-gates` job. Its report
+`verb-chain-and-reminder` group of the `mutation-gates` job. Its report
 directory is `artifacts/stryker/exact-verb-chain`.
 
 ### Approval Directory Gate
@@ -205,7 +243,7 @@ Run the approval directory gate:
 ```
 
 The script reuses the xUnit 2 harness.
-It selects eight security source regions, three approval actor conditions, and the folder rule of the grant builder.
+It selects thirteen security source regions, three approval actor conditions, and the folder rule of the grant builder.
 Folder containment and link checks are in the filesystem authority
 (`src/Netclaw.Security/Authorization/Filesystem`). Bash and PowerShell grants use
 the same containment rule and the same link walker, so one containment target
@@ -219,6 +257,11 @@ replaces the two shell-specific targets.
 | Candidate repository scope and identity | 3 killed: force a result or relax the identity check |
 | Parent segment after a link, matcher gate (`ShellApprovalMatcher`) | 1 killed: negate the condition |
 | Parent segment after a link, link test (`FileSystemAuthority`) | 2 killed: negate the test or include the anchor |
+| Link scopes of a path word (`ShellApprovalMatcher.TryAddLinkScopes`, #2375) | 1 killed: remove the logical negation |
+| Lexical scope of a path word that names no link (`ShellApprovalMatcher`) | 1 killed: remove the logical negation |
+| Link scopes of a plain link word (`ShellApprovalMatcher`) | 1 killed: remove the logical negation |
+| Link folder scope (`ShellApprovalMatcher.TryAddLinkScopes`) | 2 killed: remove the statement or use the link itself as the folder |
+| Unknown target after a `..` that leaves a link (`FileSystemAuthority.FollowLinkChain`) | 1 killed: negate the test |
 | Common identity across candidates (`RepositoryIdentity`) | 1 killed: remove the logical negation |
 | Reciprocal worktree registration (`RepositoryIdentity`) | 1 killed: remove the logical negation |
 | Persistence candidate resolution | 1 killed: remove the logical negation |
@@ -226,15 +269,16 @@ replaces the two shell-specific targets.
 | Persistence worktree root | 1 killed: remove the logical negation |
 | Folder of a new grant (`GrantBuilder`, `candidate.Directory ?? workingDirectory`) | 3 killed: swap the operands or keep only one side |
 
-The script requires these counts at their exact source locations and 18 tested mutants overall (12 Security, 6 Actors).
+The script requires these counts at their exact source locations and 24 tested mutants overall (18 Security, 6 Actors).
 It fails if a target is absent, survives, exceeds its time limit, or cannot compile.
 The source selector rejects an absent or duplicate boundary before Stryker starts.
 This protects the gate when the authorization code and diagnostic code contain similar conditions.
 
-Twenty-two cases exercise the approval matcher and persistence gate with real directories and links.
+Twenty-three cases exercise the approval matcher and persistence gate with real directories and links.
 They cover the grant root, normal descendants, sibling prefixes, traversal, relative paths, and candidate scope that differs from cwd.
 One case proves that a grant root which is itself a link still covers its children (R3).
 One case proves that a `..` after a link voids the grant, and that a `..` after a real directory or below a root alias keeps it.
+One case proves that a folder grant covers a link word only when it covers the link folder and the final target (#2375). It uses a path word, with and without a file extension, on every host and a plain word on POSIX hosts.
 The repository cases cover candidate resolution, mixed identities, reciprocal registration, and a nested registered worktree.
 The link cases prove that the link reaches the sibling directory before they require denial.
 Windows path cases cover case rules, drive boundaries, and traversal on every host.
@@ -349,9 +393,9 @@ Run the shell analysis gate:
 ./scripts/run-shell-command-analysis-mutations.sh
 ```
 
-The script tests 193 mutants across execution-region accounting, denial-only
+The script tests 330 mutants across execution-region accounting, denial-only
 matching, tree traversal and root correspondence, bounded non-filesystem
-values, data operands of output commands, candidate extraction, approval
+values, data operands of output commands and test builtins, candidate extraction, approval
 mode, path facts, and reviewed-safe policy. The job fails unless every mutant
 dies.
 
@@ -420,6 +464,55 @@ attended-only condition of `ToolAccessPolicy.WithCommandCandidates`, and with it
 one Actors mutant. `PerCommandJudgmentMutationTests` now shows that an
 unattended call gets the D1 decision of a chat, and is denied where a chat
 would prompt. The gate now kills 166 Security and 27 Actors mutants.
+
+The test builtin rule extends two targets, `HasOnlyDataOperands` and
+`ClassifyUnresolvedPart`. It adds four targets: `HasTestBuiltinVerb`,
+`HasBoundedNameSafeValue` with `HasNoSubscript`,
+`ShellVerbPolicyData.IsDataCommand`, and
+`ShellApprovalMatcher.TryCreateAssignmentDigest`.
+`Test_builtin_operand_is_data_only_with_a_bounded_value_without_a_subscript`
+kills them: a proved operand without `[` is data, and an operand with `[`, an
+unknown value, or a glob file name is not. A data command with a redirect keeps
+its assignment digest. `Power_shell_test_word_is_not_a_data_command` kills the
+Bash condition. The gate now kills 183 Security and 27 Actors mutants. The local
+run took 9 minutes 45 seconds.
+
+The review of #2344 adds `HasProvedDataOperands` and `IsOneDoubleQuotedWord`.
+A Bash data command keeps its assignment digest unless each operand has a
+proved value or is one double-quoted raw word (a test operand needs a proved
+value without `[`). `Test_builtin_operand_is_data_only_with_a_bounded_value_without_a_subscript`
+and `One_double_quoted_word_has_no_unescaped_inner_quote` kill the new mutants.
+The gate now kills 211 Security and 27 Actors mutants.
+
+The ShellSyntaxTree 0.4.0-beta.19 update replaces `IsOneDoubleQuotedWord` with
+the parser fact `MayPathnameExpand`, and it adds `HasUnboundedPathnameExpansion`
+and `HasGlobFreeAuthoredValue` as targets. `Unknown_word_that_can_glob_is_not_data`
+kills their mutants: a quoted or glob-free word is data or keeps decision D1,
+and an unknown word that can glob makes its command one exact candidate.
+`Glob_free_authored_value_has_nothing_to_expand` kills the mutants of the glob
+character check. An output operand no longer needs the separate proved-value
+test, because a proved value without a glob character already passes. Owner
+decision (#2349) exempts Bash data commands (`echo`, `printf`, `test`, `[`)
+from the exact-candidate rule; the `echo` rows and the `git log -n $?` rows
+kill the new mutants. `IsProvedValueDenied` is also a target:
+`Decoded_word_gets_the_decision_of_its_proved_value` kills its mutants with
+decoded ANSI-C paths. The gate now kills 214 Security and 27 Actors mutants.
+
+The heredoc parity change (owner decision 2026-10-07) adds five targets (24
+mutants): the heredoc and here-string arms of `HasUnresolvedRedirect`,
+`HasFixedTextStdin` with `CanTakeFixedStdinText` and `HasShellReceiver`,
+`MayNameScriptShell`, the expansion-mode check of `HasLiteralHereDocument`, and
+`ShellVerbPolicyData.IsScriptShellProgram`. A quoted heredoc or a proved here
+string on stdin is data. These forms stay unresolved:
+
+- an expanding heredoc, an unknown here string, and another descriptor;
+- a command with Unknown command words;
+- a shell receiver, by the file name of each verb word;
+- an argument with a part that is a shell file name, or with no proved value.
+
+`Fixed_stdin_text_is_data_only_for_a_receiver_that_is_not_a_shell` and
+`Fixed_stdin_text_fails_closed_for_an_argument_that_can_name_a_shell` kill the
+mutants. The gate now kills 303 Security and 27 Actors mutants.
 
 The script groups targets by source project. Stryker analyzes each source project once.
 The local run on 2026-09-24 took under four minutes.
@@ -601,7 +694,10 @@ Use it for each slice that moves authorization code. Zero differences against
 ```bash
 python3 scripts/authorization-corpus/run.py --base upstream/dev                 # HEAD against dev
 python3 scripts/authorization-corpus/run.py --base upstream/dev --quick         # 3 states, a few minutes
+python3 scripts/authorization-corpus/run.py --base upstream/dev --jobs 1        # one decision lane
 python3 scripts/authorization-corpus/run.py --base upstream/dev --head-adapter authorizer
+python3 scripts/authorization-corpus/run.py --base upstream/dev --keep          # keep the head output and worktrees
+python3 scripts/authorization-corpus/run.py --base REV --head REV --fresh-head  # two probes of one revision
 ```
 
 How it works:
@@ -611,28 +707,88 @@ How it works:
    revision (`--corpus-revision`, default `4244eaed5`), plus
    `extra-commands.txt`. Each literal also runs after four compound prefixes
    (`cd` lists, an external directory, and the temporary root). The default
-   corpus has 54,909 shell inputs.
+   corpus has 55,004 shell inputs.
 2. For each revision, the script makes a disposable `git worktree`, copies the
    probe (`probe/AuthorizationCorpusProbe.cs`) and one adapter into
    `Netclaw.Actors.Tests`, builds, and runs the probe. The `gate` adapter reads
    `EvaluateAuthorizationResultAsync` (revisions up to authorization PR 6c).
    The `authorizer` adapter reads `ToolAuthorizer`. `auto` picks the
    production path of the revision.
-3. The probe evaluates 16 shell states (Bash: 3 grant states, interactive or
-   unattended, Approval or Auto; PowerShell 7: 2 grant states, Approval or Auto)
-   and 24 tool states (3 audiences, interactive or unattended, 4 consent modes)
+3. The probe evaluates 21 shell states (Bash: 3 grant states, interactive or
+   unattended, Approval or Auto; Bash 5.2: 5 Approval states, see below;
+   PowerShell 7: 2 grant states, Approval or Auto) and 24 tool states (3 audiences, interactive or unattended, 4 consent modes)
    with the 62 tool inputs of the differential test. After a consent request,
    it also evaluates the retry with a "Once" answer. After a tool consent
-   request, it records a chat grant and evaluates the call again.
+   request, it records a chat grant and evaluates the call again. The probe
+   decides the shell inputs in parallel lanes (see "Parallel lanes" below).
 4. The script compares the two outputs and writes a report with the outcome
    transitions and the first differences.
 
 Each line holds the outcome, reason, advice, consent request, matched grants,
 coverage trace, store lookups, and the analysis that the process may execute.
 The probe replaces run-specific paths with placeholders (`{P}`, `{S}`, `{X}`,
-`{R}`, `{T}`, `{REPOSITORY}`, and the GUID of the fake Windows root). The
-compare step also replaces the parent of the private temporary root, which a
-`..` path can reach. Grant timestamps compare by presence only.
+`{R}`, `{T}`, `{REPOSITORY}`, and the GUID of the fake Windows root). It also
+replaces the GUID in the `netclaw-approval-matrix-<GUID>` harness folder and
+in the `netclaw-testrun-<GUID>` temporary folder of the test process with
+`{GUID}`. A `..` path or a basename can show these names. Grant timestamps
+compare by presence only.
+
+A `..` path can also reach the folders above the test process temporary root.
+These folders hold the revision hash (the first 12 characters), so they differ
+for each revision. The probe replaces the revision folder name with
+`{REVISION}`, also when a basename shows it alone. The probe fails when the
+folder name of `NETCLAW_CORPUS_REPOSITORY` is not a 12-character hash. The
+compare step then replaces the paths with fixed tokens before it compares two
+lines:
+
+| Text in the line | Token |
+|------------------|-------|
+| `<out>/worktrees/{REVISION}` (the revision worktree root) | `{REVISION_ROOT}` |
+| `<out>/run/{REVISION}` (the parent of the private temporary root) | `{RUN_ROOT}` |
+| `<out>` (the work directory) | `{WORK_ROOT}` |
+
+Two revisions with the same behavior therefore give the same lines. The
+report shows the tokens, never a revision hash.
+
+Bash 5.2 states:
+
+- The `bash` states use a Bash host with no proved version, so the parser
+  state is `Unknown`. A production daemon on Bash 5.2 or 5.3 has the fresh
+  no-startup state. Only that state gives literal twins (F1) and the complete
+  launch environment (F3).
+- The `bash52` states use the Bash 5.2 host: no grant, a grant for anywhere, a
+  folder grant in the project, and a chat grant, each interactive, plus an
+  unattended folder grant. Use them for a change to twins, assignments, or
+  launch facts:
+
+```bash
+python3 scripts/authorization-corpus/run.py --base upstream/dev \
+  --states bash52-none-i-approval,bash52-anywhere-i-approval,bash52-project-i-approval,bash52-chat-i-approval,bash52-project-u-approval
+```
+
+Parallel lanes:
+
+- `--jobs N` sets the number of decision lanes in the probe. The default is
+  the CPU count minus 1. `--jobs 1` decides one input at a time, as before.
+- The probe uses Akka.Streams: `Source.From(inputs)`, then an ordered
+  `SelectAsync(N, decide)`, then one `FileIO.ToFile` sink. The ordered stage
+  keeps the input order, and the file sink is the only writer of the output.
+- Each lane owns one harness, with its own grant store, store lookup count,
+  and folders. A lane decides one input at a time. A shell decision reads only
+  its own input and the fixed state of the harness, so the lane count does not
+  change a line.
+- A tool state stays in one lane. Its chat grants stay in the harness for the
+  next inputs, so the input order changes the result.
+- The probe fails when a decision fails, when the sink reports an error, when
+  the element count is not the input count, or when the sink did not write
+  every byte. The script keeps a failed output as `.partial` and never reuses
+  it.
+- The output for one revision is the same, byte for byte, for each lane
+  count. The parallelism is therefore not part of the output name.
+- The script prints the line count and the current state every minute.
+- On an 8-core machine that also ran other jobs, the probe for one revision
+  took 84 minutes with one lane and 25 minutes with 7 lanes. The output was
+  byte-identical.
 
 Caution: the probe runs with a private temporary root (`TMPDIR`, `TMP`, and
 `TEMP` point into the work directory). The corpus replaces the literal `/tmp`
@@ -644,7 +800,43 @@ Notes:
 - The script tests committed revisions only. Commit the work before a run.
 - The work directory is `artifacts/authorization-corpus` (`--out` changes it).
   The script reuses an output when the `src/` tree, adapter, probe, corpus,
-  and states are the same. A full output is about 600 MB.
+  and states are the same. A full output (a `src-*.tsv` file) is about
+  650 MB. A `--quick` output is about 90 MB.
+- The report (`report-*.txt` in the work directory) is the durable output.
+  Unless `--keep` is set, the script deletes the head output after the
+  compare. It also deletes each worktree with its build output (`bin` and
+  `obj`) and a failed probe's `.partial` output. The `.log` file stays.
+- The base output is the cache. It stays in the work directory, so the next
+  run against the same base skips the build and the probe for the base. A
+  self-compare (same `src/` tree on both sides) keeps its one output for the
+  same reason. The script prints the number and size of the cached outputs.
+  Each new base adds one output, so delete old ones, or run with
+  `--prune-cache` to delete every output except the current base output.
+- `--fresh-head` probes the head again even when an output exists, and writes
+  it to its own file. With the same revision for `--base` and `--head`, zero
+  differences shows that two probes of one revision agree.
+- Before a full run, check `df -h /` and `uptime`. A full run holds the base
+  output (650 MB), the head output (650 MB), and one worktree with its build
+  output at a time. Other jobs on the machine slow the build and the probe.
+- Each run records its own speed. The script prints a timing block and writes
+  it into the report, before the examples. This block comes from a `--quick`
+  self-compare on 8 CPUs, with a load average near 90 from other jobs:
+
+```text
+timing:
+  lanes: 7
+  cpus: 8
+  load average at the end (1 min): 90.9
+  corpus: 0m 10s (10 s)
+  build base: 8m 38s (518 s)
+  probe base: 23m 16s (1396 s)
+  build head: 4m 33s (273 s)
+  probe head: 21m 28s (1288 s)
+  compare: 0m 45s (45 s)
+  total: 59m 04s (3544 s)
+```
+
+  A phase that reuses a cached output shows `cache hit (not run)`.
 - Bash states need POSIX filesystem semantics. On Windows, the probe runs the
   PowerShell and tool states only.
 - Exit status 0 means no difference. Exit status 1 means at least one
@@ -690,12 +882,21 @@ TUI code SHOULD run the harness before declaring a change done.
 | `./scripts/smoke/run-smoke.sh full` | Full suite (placeholder: identical to light until backfilled) |
 | `./scripts/smoke/run-smoke.sh <name>` | Single tape or scenario, e.g. `init-wizard` (fastest inner loop) |
 | `./scripts/smoke/run-smoke.sh skill-sync` | Live daemon and RFC feed proof for immediate skill updates |
+| `./scripts/smoke/run-smoke.sh config-retention` | Native retention editor: first key, Backspace, paste, save, and re-entry |
 | `./scripts/smoke/run-smoke.sh screenshots` | Screenshot regression: capture + byte-compare against baselines |
 | `./scripts/smoke/install-vhs.sh` | Idempotent VHS install (Linux/x86_64 + macOS via Homebrew) |
 
 `run-smoke.sh` publishes the binary (or uses `NETCLAW_SMOKE_CLI` /
 `NETCLAW_SMOKE_DAEMON` if exported), installs `vhs`, starts a native
 `ollama serve`, and pulls the smoke models automatically.
+
+Local runs with limited disk space can share one binary extraction directory across tape homes.
+Set `DOTNET_BUNDLE_EXTRACT_BASE_DIR` to an absolute directory that the smoke run owns.
+Remove that directory after all smoke processes exit.
+For an active run, remove only completed tapes' `.net` directories after confirmation that no process uses those homes.
+Retain the tape logs and session data for review.
+After a tape completes, confirm that its daemon exits before you remove that tape's downloaded model cache.
+Retain its config, logs, and session data.
 
 Config-writing flow tapes (`init-wizard`, `provider-add`, `provider-rename`,
 and `config-*`) must have executable semantic assertion scripts under

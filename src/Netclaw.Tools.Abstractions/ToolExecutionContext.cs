@@ -37,7 +37,8 @@ internal enum ToolRemediationCode
     UseNativeTool,
     BreakToolCycle,
     UseShellWorkingDirectory,
-    RewriteShellCommandWords
+    RewriteShellCommandWords,
+    ShortenShellCommand
 }
 
 internal enum ToolFileActivityKind
@@ -104,6 +105,18 @@ internal abstract class ToolInvocationReceipt
                 throw new ArgumentOutOfRangeException(nameof(category));
             if (category is ToolInvocationOutcomeCategory.Success or ToolInvocationOutcomeCategory.RecoverableCorrection)
                 throw new ArgumentException("This outcome requires its dedicated receipt case.", nameof(category));
+        }
+    }
+
+    /// <summary>
+    /// The call was refused by authorization (policy, hard deny, a consent that nobody can give, or a path
+    /// rule). It is <see cref="ToolInvocationOutcomeCategory.AccessDenied"/>, kept apart from an operating
+    /// system refusal such as a file permission error, which is an ordinary tool failure.
+    /// </summary>
+    internal sealed class AuthorizationDenied : ToolInvocationReceipt
+    {
+        public AuthorizationDenied() : base(ToolInvocationOutcomeCategory.AccessDenied)
+        {
         }
     }
 

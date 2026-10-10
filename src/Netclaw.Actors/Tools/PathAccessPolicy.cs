@@ -240,22 +240,67 @@ internal sealed class PathAccessPolicy
     }
 
     /// <summary>Applies file protection to one parser-canonical shell path.</summary>
-    public PathAccessDecision EvaluateShellPath(
+    /// <param name="path">The parser-canonical path.</param>
+    /// <param name="context">The invocation that supplies the audience profile.</param>
+    /// <param name="operation">
+    /// <see cref="FileOperation.Write"/> for the shell trust zone.
+    /// <see cref="FileOperation.Read"/> for the input redirect of a command
+    /// that runs no program: the <c>file_read</c> rules, as an extra check.
+    /// </param>
+    internal PathAccessDecision EvaluateShellPath(
         CanonicalPath path,
-        ToolInvocationContext context)
+        ToolInvocationContext context,
+        FileOperation operation)
     {
         if (path.IsHostStyle)
-            return Evaluate(path.Value, context, FileOperation.Write);
+            return Evaluate(path.Value, context, operation);
 
         // Cross-platform parser tests can supply paths from another host style.
         // Only an explicit All profile has enough authority without a host
         // filesystem relationship check. Bounded profiles fail closed.
-        return HasUnrestrictedFileAccess(context, FileOperation.Write)
+        return HasUnrestrictedFileAccess(context, operation)
             ? PathAccessDecision.Allow(path.Value)
             : PathAccessDecision.Deny(
                 "Error: Path relationship could not be verified on this host.",
                 PathAccessFailure.AccessDenied,
                 path.Value);
+    }
+
+    /// <summary>
+    /// Applies read protection to one path of a shell program that only reads its
+    /// operands (owner decision D6). The agent may read its own configuration,
+    /// but not its secrets.
+    /// </summary>
+    /// <remarks>
+    /// The caller uses this decision only after <see cref="EvaluateShellPath"/>
+    /// denies the path. SECURITY: it applies only to a write-protected path, so
+    /// a read never escapes the trusted roots of the shell. An operand must also
+    /// hold no read-protected path: a program can read below a directory operand
+    /// (<c>grep -r</c>). A scope, such as the working directory or the folder of
+    /// a file operand, is not read below.
+    /// </remarks>
+    /// <param name="path">The parser-canonical shell path.</param>
+    /// <param name="context">The invocation that supplies the read roots.</param>
+    /// <param name="isOperand">True for a path that the program reads, false for a scope.</param>
+    public PathAccessDecision EvaluateShellReadPath(
+        CanonicalPath path,
+        ToolInvocationContext context,
+        bool isOperand)
+    {
+        if (!path.IsHostStyle || !_fileSystem.IsProtected(path.Value, PathOperation.Write))
+        {
+            return PathAccessDecision.Deny(
+                "Error: Only a write-protected path can get read protection in the shell.",
+                PathAccessFailure.AccessDenied,
+                path.Value);
+        }
+
+        var read = Evaluate(path.Value, context, FileOperation.Read);
+        return read is PathAccessDecision.Allowed
+               && isOperand
+               && _fileSystem.HoldsReadProtectedPath(path.Value)
+            ? DenyProtected(path.Value, FileOperation.Read)
+            : read;
     }
 
     /// <summary>
@@ -273,18 +318,10 @@ internal sealed class PathAccessPolicy
     /// <param name="canonicalPath">The parser-resolved path to evaluate.</param>
     /// <param name="context">The invocation that supplies session and project roots.</param>
     /// <param name="pathStyle">The path syntax reported by the shell parser.</param>
-    /// <param name="proposedProjectRoot">
-    /// A project root that passed declaration policy but is not active yet.
-    /// </param>
-    /// <param name="includeRootInLinkCheck">
-    /// Whether a link at the trusted root itself makes the relationship unsafe.
-    /// </param>
     public PathAccessDecision EvaluateReviewedShellPath(
         string canonicalPath,
         ToolInvocationContext context,
-        ShellPathStyle pathStyle,
-        string? proposedProjectRoot = null,
-        bool includeRootInLinkCheck = true)
+        ShellPathStyle pathStyle)
     {
         // A reviewed diagnostic can read each path that the audience profile
         // lets a file tool read, attended or not (decision D2). The read
@@ -292,19 +329,16 @@ internal sealed class PathAccessPolicy
         if (IsReadableByAudience(canonicalPath, context, pathStyle))
             return PathAccessDecision.Allow(canonicalPath);
 
-        // Otherwise a reviewed diagnostic can read only session roots and an
-        // admitted project root. It cannot inherit the global read-root catalog.
+        // Otherwise a reviewed diagnostic can read only session roots and the
+        // declared project root. It cannot inherit the global read-root catalog.
         var roots = new List<string>();
         AddSessionRoots(roots, context);
-        if (context.Audience != TrustAudience.Public)
+        if (context.Audience != TrustAudience.Public
+            && !string.IsNullOrWhiteSpace(context.ProjectDirectory))
         {
-            if (!string.IsNullOrWhiteSpace(context.ProjectDirectory))
-                roots.Add(context.ProjectDirectory);
-            if (!string.IsNullOrWhiteSpace(proposedProjectRoot))
-                roots.Add(proposedProjectRoot);
+            roots.Add(context.ProjectDirectory);
         }
 
-        var links = includeRootInLinkCheck ? LinkRule.IncludingRoot : LinkRule.BelowRoot;
         foreach (var root in roots.Distinct(PathComparer))
         {
             // Compare with the parser-declared shell style first. This supports
@@ -326,7 +360,7 @@ internal sealed class PathAccessPolicy
             }
 
             // Shell protected-path policy ran before this bounded-root check.
-            switch (FileSystemAuthority.EvaluateMembership(path, [new PathBoundary.Folder(rootPath, links)]))
+            switch (FileSystemAuthority.EvaluateMembership(path, [new PathBoundary.Folder(rootPath, LinkRule.IncludingRoot)]))
             {
                 case PathDecision.Allowed:
                     return PathAccessDecision.Allow(path.Value);

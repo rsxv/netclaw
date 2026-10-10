@@ -30,7 +30,7 @@ namespace Netclaw.Actors.Tests.Reminders;
 /// <see cref="ReminderManagerActorTests"/> for actor-level coverage of that check.
 /// </summary>
 [Collection(ReminderActorTestCollection.Name)]
-public class GetReminderHistoryToolTests : TestKit, IDisposable
+public class GetReminderHistoryToolTests : TestKit, IAsyncDisposable
 {
     private readonly DisposableTempDir _dir = new();
     private readonly TestShardRegionResolver _sharedResolver = new();
@@ -39,9 +39,19 @@ public class GetReminderHistoryToolTests : TestKit, IDisposable
 
     public GetReminderHistoryToolTests(ITestOutputHelper output) : base(output: output) { }
 
-    void IDisposable.Dispose()
+    // TestKit stops the actor system only after AfterAllAsync returns. An actor can
+    // still write into the directory until then. Delete the directory after TestKit
+    // has disposed, and not in AfterAllAsync.
+    async ValueTask IAsyncDisposable.DisposeAsync()
     {
-        _dir.Dispose();
+        try
+        {
+            await base.DisposeAsync();
+        }
+        finally
+        {
+            _dir.Dispose();
+        }
     }
 
     protected override void ConfigureAkka(AkkaConfigurationBuilder builder, IServiceProvider provider)
@@ -162,7 +172,7 @@ public class GetReminderHistoryToolTests : TestKit, IDisposable
             new Dictionary<string, object?> { ["ReminderId"] = "daily-summary" }, CreateContext(), TestContext.Current.CancellationToken);
 
         Assert.Contains("daily-summary", result);
-        Assert.Contains("True", result);
+        Assert.Contains("status:      ok", result);
         Assert.Contains("4200", result);
         Assert.Contains("reminder/daily-summary/1741993200000", result);
     }
@@ -207,8 +217,28 @@ public class GetReminderHistoryToolTests : TestKit, IDisposable
         var result = await tool.ExecuteAsync(
             new Dictionary<string, object?> { ["ReminderId"] = "failing-job" }, CreateContext(), TestContext.Current.CancellationToken);
 
-        Assert.Contains("False", result);
+        Assert.Contains("status:      failed", result);
         Assert.Contains("Notification tool returned an unspecified error.", result);
+    }
+
+    [Fact]
+    public async Task Denied_run_is_shown_as_denied()
+    {
+        var tool = await GetToolAsync();
+        var id = new ReminderId("denied-job");
+        SaveDefinition("denied-job");
+        await _historyStore.AppendAsync(id, new HistoryRecord(
+            FiredAt: DateTimeOffset.UtcNow,
+            Success: false,
+            DurationMs: 5,
+            SessionId: "reminder/denied-job/5",
+            ErrorMessage: "Tool call denied (shell_execute): needs approval",
+            ToolDenied: true));
+
+        var result = await tool.ExecuteAsync(
+            new Dictionary<string, object?> { ["ReminderId"] = "denied-job" }, CreateContext(), TestContext.Current.CancellationToken);
+
+        Assert.Contains("status:      denied", result);
     }
 
     /// <summary>

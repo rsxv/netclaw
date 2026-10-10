@@ -3,6 +3,8 @@
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
 // -----------------------------------------------------------------------
+using Netclaw.Configuration;
+
 namespace Netclaw.Security;
 
 /// <summary>
@@ -48,6 +50,49 @@ internal static class ShellVerbPolicyData
     };
 
     /// <summary>
+    /// Bash builtins that only test their operands and set the exit status.
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: these builtins can read an operand as a variable name. Bash
+    /// evaluates an array subscript in that name as arithmetic, and the
+    /// arithmetic runs a command substitution: <c>[ -v 'a[$(cmd)]' ]</c> runs
+    /// <c>cmd</c>. Thus an operand is data only when the parser proves a bounded
+    /// value with no <c>[</c>. See <c>ShellCommandAnalysis.HasOnlyDataOperands</c>.
+    /// In PowerShell, <c>test</c> is not a builtin, so the list is Bash only.
+    /// </remarks>
+    internal static readonly HashSet<string> BashTestBuiltins = new(StringComparer.Ordinal)
+    {
+        "test", "["
+    };
+
+    /// <summary>
+    /// Bash control-transfer builtins. They change only which statement runs
+    /// next, as <c>:</c> and <c>true</c> change nothing. They are shell control
+    /// facts, not program grammar.
+    /// </summary>
+    /// <remarks>
+    /// ShellSyntaxTree 0.4.0-beta.18 parses <c>break</c> and <c>continue</c> with no
+    /// operand or one decimal level, and <c>exit</c> and <c>return</c> with no
+    /// operand or one bounded status. It joins the flow state at each one. Any
+    /// other form is unparseable. A redirect or a substitution keeps its own
+    /// checks. In PowerShell they are keywords, so the list is Bash only.
+    /// </remarks>
+    internal static readonly HashSet<string> BashControlTransferBuiltins = new(StringComparer.Ordinal)
+    {
+        "break", "continue", "exit", "return"
+    };
+
+    /// <summary>
+    /// Returns true when the verb is a data command: an output command, or in
+    /// Bash a test builtin or a control-transfer builtin. A data command has no path scope, and with no
+    /// redirect it needs no approval.
+    /// </summary>
+    internal static bool IsDataCommand(string verb, ApprovalShell? shell)
+        => SingleTokenSideEffectVerbs.Contains(verb)
+           || shell == ApprovalShell.Bash
+              && (BashTestBuiltins.Contains(verb) || BashControlTransferBuiltins.Contains(verb));
+
+    /// <summary>
     /// Single-token commands with no subcommand grammar. Each operand is call-specific.
     /// </summary>
     /// <remarks>
@@ -76,6 +121,23 @@ internal static class ShellVerbPolicyData
     };
 
     /// <summary>
+    /// Bash programs that only read their operands and have no option that
+    /// writes a file or runs a command. Policy data for decision D6: such a
+    /// program may read a path that is write-protected but readable, for
+    /// example <c>cat ~/.netclaw/config/netclaw.json</c>.
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: a listed program must never write a file that it names. A
+    /// program with an output option (<c>sort -o</c>, <c>uniq in out</c>), a
+    /// preprocessor (<c>rg --pre</c>), or a shell escape does not belong here.
+    /// A redirect is a shell fact, not an operand, so it keeps write protection.
+    /// </remarks>
+    internal static readonly HashSet<string> ReadOnlyOperandVerbs = new(StringComparer.Ordinal)
+    {
+        "cat", "head", "tail", "wc", "grep", "jq", "diff"
+    };
+
+    /// <summary>
     /// POSIX shells that Netclaw expands when a wrapper form falls outside
     /// the ShellSyntaxTree wrapper contract, for example <c>bash -lc</c>.
     /// </summary>
@@ -87,17 +149,54 @@ internal static class ShellVerbPolicyData
     };
 
     /// <summary>
-    /// Keeps only the first token of a parser verb chain when that token is a
-    /// path-aware verb, a side-effect verb, or a single-token command.
+    /// File names of programs that read stdin as a script: POSIX shells,
+    /// <c>fish</c>, C shells, <c>cmd</c>, and PowerShell. Policy data for the
+    /// fixed stdin text rule (<c>ShellCommandAnalysis.HasShellReceiver</c>).
+    /// A name has no <c>.exe</c> end: <see cref="IsScriptShellProgram"/>
+    /// removes it.
     /// </summary>
-    internal static string ApplyVerbShortCircuit(string? parsedVerb)
+    /// <remarks>
+    /// This list is wider than <see cref="PosixShellInvokers"/>. That list
+    /// selects the <c>-c</c> wrappers whose child source Netclaw parses as
+    /// POSIX shell text, so a shell with another grammar must not join it.
+    /// A list cannot be complete: a shell that is not here gets the result
+    /// of its <c>-c</c> form.
+    /// </remarks>
+    internal static readonly HashSet<string> ScriptShellNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "bash", "sh", "dash", "ash", "ksh", "mksh", "zsh", "fish", "csh", "tcsh",
+        "rbash", "rksh", "ksh93", "posh", "yash",
+        "cmd", "powershell", "pwsh"
+    };
+
+    /// <summary>
+    /// Returns true when the file name of a program word is a script shell.
+    /// The path and a <c>.exe</c> end do not matter: <c>bash</c>,
+    /// <c>./bash</c>, <c>/usr/local/bin/bash</c>, and <c>bash.exe</c> name
+    /// the same kind of program.
+    /// </summary>
+    internal static bool IsScriptShellProgram(string word)
+    {
+        var program = LegacyShellTextScan.TrimShellPunctuation(word);
+        var name = program[(program.LastIndexOfAny(['/', '\\']) + 1)..];
+        if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            name = name[..^4];
+
+        return ScriptShellNames.Contains(name);
+    }
+
+    /// <summary>
+    /// Keeps only the first token of a parser verb chain when that token is a
+    /// path-aware verb, a data command, or a single-token command.
+    /// </summary>
+    internal static string ApplyVerbShortCircuit(string? parsedVerb, ApprovalShell shell)
     {
         if (string.IsNullOrEmpty(parsedVerb))
             return string.Empty;
 
         var firstSpace = parsedVerb.IndexOf(' ', StringComparison.Ordinal);
         var firstToken = firstSpace < 0 ? parsedVerb : parsedVerb[..firstSpace];
-        return HasSingleTokenVerbChain(firstToken)
+        return HasSingleTokenVerbChain(firstToken) || IsDataCommand(firstToken, shell)
             ? firstToken
             : parsedVerb;
     }

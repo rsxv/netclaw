@@ -173,19 +173,205 @@ shell rules, in order:
 1. Admission: audience, then shell capability.
 2. Prohibition: hard deny, then protected shell text.
 3. Filesystem authority: a `..` in the working directory, then each slice of a
-   `cd` directory proof.
+   `cd` directory proof, then each literal twin (decision F1, below).
 4. Filesystem authority: the working directory and the known paths must be in
    a trusted root of the audience profile. A protected path stays denied.
 5. Admission: a Deny consent mode.
-6. Advice: a native tool, then Auto mode with its directory advice.
-7. A call without command text, the projected trusted-root check, and unresolved
-   input: one-time consent or a Once-only request. Since approval taxonomy
+6. Advice: a native tool, then Auto mode with its directory advice. Then a
+   Bash source with no command is allowed: it runs no program (owner decision,
+   October 2026, below). Before the advice, the authorizer asks the grant store
+   for the file tool grants of the redirects that need consent.
+7. A call without command text, the projected trusted-root check, the
+   redirect checks of a command that runs no program, and unresolved input:
+   one-time consent or a Once-only request. Since approval taxonomy
    PR 5, a Bash call splits an unresolved source into commands: each
    unresolved command is one exact candidate, and the other commands go to
    rule 8 with their own candidates. Decision D1 lets a safe phrase or a grant
    for anywhere cover an exact candidate whose only unknown part is an operand.
-8. Consent: a covering grant (stored grant, side-effect exemption, reviewed-safe
-   policy), then the uncovered candidates.
+   A variable word (`"$d"`) is an unknown operand unless the parser resolves
+   it as a path, or types its value as a filesystem value or as data. A loop
+   or assignment value that names a path does not give the candidate a scope.
+   Owner decision F1 (0.27.2): when the parser gives the literal twins of a
+   command, the twin candidates replace the candidates of that command (see
+   "Literal twins" below).
+8. Consent: a covering grant (stored grant, the exemption of a side effect
+   and of a command that runs no program, reviewed-safe policy), then the
+   uncovered candidates.
+
+Literal twins (owner decision F1, October 2026). ShellSyntaxTree
+0.4.0-beta.23 writes each Bash command whose changeable words have a proved
+finite set of values as one literal command for each combination of values
+(`BashParser.TryProjectLiteralTwins`). Netclaw judges each twin as if the
+operator typed it. `BashLiteralTwinSlices` (`Netclaw.Actors/Tools`) owns the
+judgment. Its data is call-local.
+
+```text
+schematic: one shell call, after the parse
+twins = TryProjectLiteralTwins(source)      # none under an Unknown initial state
+for each command that has twins:
+    for each twin:
+        analysis = analyze(twin.Source, twin.WorkingDirectory)   # never run it
+        require: one complete command, with the facts of twin.Occurrence
+        candidates = normal candidates of the analysis
+        add the assignment digest of the source command
+    any twin that fails -> the command keeps its own candidates
+screen each twin: hard deny, protected text, trusted root      # rule 3
+replace the candidates of each twinned command with the union of its twins
+cover each candidate as usual                                   # rule 8
+```
+
+- The strictest twin result wins. One denied twin denies the call. One
+  uncovered twin candidate prompts, with the union of the uncovered
+  candidates. The call runs with no prompt only when each twin candidate is
+  covered.
+- Example: `for n in 8250 8244; do gh api -X PATCH repos/o/r/issues/$n -f
+  milestone=157; done` gives the twins `gh api -X PATCH repos/o/r/issues/8250
+  ...` and `... 8244 ...`. A chat or folder grant for `gh api` covers them,
+  and a prompt offers the normal choices.
+- Negative example: `for d in ../outside/x.slnx; do dotnet build "$d"; done`
+  gives the twin `dotnet build ../outside/x.slnx`. A folder grant for
+  `dotnet build` does not cover the path outside the folder.
+- A command without twins keeps its earlier rule. Examples: a value from
+  `$(...)` (`for n in $(gh issue list); do gh api "x/$n"; done`), a program
+  word from a value (`for p in /bin/rm; do $p x; done`), and any source on a
+  Bash host without a proved fresh state.
+- A twin keeps the shell-state assignments of its source command as an
+  assignment digest, so a grant without the same assignments does not cover
+  it (`x=1; for n in a b; do gh api x/$n; done`).
+- `ShellProcessLaunch` screens each twin again for hard deny and protected
+  text, and it rechecks the paths of each twin before the process starts.
+- A call with a `cd` directory proof gets no twins: the proof already gives
+  each command its exact directory.
+
+Assignments that stay in the shell (owner decision F3, October 2026). A Bash
+shell-state assignment qualifies a grant with an assignment digest, because an
+exported variable can change what a program does. ShellSyntaxTree
+0.4.0-beta.24 proves that an assignment reaches no program when the caller
+declares the complete names of the launch environment
+(`ShellLaunchEnvironment.WithCompleteEnvironmentNames`).
+
+- `ShellExecutionEnvironment` takes one snapshot of the daemon environment
+  when the daemon creates it, as it does for `HOME`.
+  `CreateChildEnvironment` removes the Bash startup overrides and adds the
+  launch variables. `CreateProcessStartInfo` copies that environment to each
+  process, and `GetCompleteEnvironmentNames` gives its names to the parser,
+  plus `PWD` and the temporary variable names that the launcher adds. The
+  launcher and the parser read one snapshot, so they cannot drift. A later
+  change to the daemon process environment reaches no shell process.
+- The names never carry a value, and Netclaw never shows them to the model.
+- `ShellAssignmentDigestFactory.ReachingProgram` skips a Bash `ShellState`
+  assignment with `MayAffectProcessEnvironment == false`. A Bash data command
+  (`echo`, `printf`, `test`) keeps every assignment: it reads no environment,
+  and its digest keeps an operand that is not proved data
+  (`d=key; echo ../x/"${d}s"/*`) out of the approval exemption.
+- A read of the variable is an argument with its own value facts: an unknown
+  value is an unknown operand (D1), and a known value gets its literal twin
+  (F1).
+- Fail closed: a Bash host without a proved fresh state, a decoded `bash -c`
+  child, and PowerShell keep every assignment. `set -a`, `declare -x`, and
+  `eval` make the source unresolved.
+
+Example: `b=$(git branch --show-current); git fetch origin` with a chat grant
+for `git fetch` runs with no prompt. Negative example: with `GIT_DIR` in the
+daemon environment, `GIT_DIR=/tmp/x; git status` keeps its digest, so a plain
+`git status` grant does not cover it.
+
+Commands that run no program (owner decision, October 2026). Approval of `:`
+means nothing, because no program runs. The only effect of such a command
+outside the shell is its redirects, and the file rules own that question.
+
+A command occurrence runs no program when the parser proves one of these
+shapes (`ShellCommandAnalysis.RunsNoProgram`, `ProvesNoCommand`):
+
+- a Bash source that parses with no command: an assignment (`x=1`), a
+  comment, an empty `case` (`case x in x) ;; esac`), or an empty subshell
+  (`()`);
+- a command with only redirects (`> file`, `< file`), with no assignment;
+- a Bash data command from the existing policy data
+  (`ShellVerbPolicyData.IsDataCommand`). When a shell-state assignment reaches
+  it, each operand must be proved data, as for the approval exemption (F3).
+
+Each redirect must be a proved file redirect with one exact absolute target,
+or a descriptor copy, move, or close (`2>&1`). Bash gives `/dev/tcp/...`,
+`/dev/udp/...`, and `/dev/fd/N` a meaning that is not a file, so below `/dev/`
+only `/dev/null` qualifies. A data command with another target is exact: its
+prompt shows its full text. The rule composes general shell facts. It adds no
+program grammar.
+
+```text
+schematic: the rules for a command that runs no program
+source has no command (x=1)                    -> rule 6: Allowed
+mark each candidate of such a command          # ShellApprovalMatcher, call-local
+file tool of a redirect has mode Approval,
+  and no grant of that tool covers the path    -> the candidate becomes exact:
+                                                  "write <file>", "read <file>"
+screen as usual: hard deny, protected text, trust zone (write rules)  # rules 2 to 4, 7
+for each redirect of a marked candidate:       # rule 7
+    target not proved                          -> Denied shell_redirect_unproved
+    input redirect and the read rules refuse   -> Denied shell_redirect_read_denied
+    file tool has mode Deny or is not admitted -> Denied shell_redirect_file_tool_denied
+cover each marked candidate that is not exact  # rule 8, Coverage.Exempt
+all covered -> Allowed; else prompt for the other candidates only
+```
+
+- Owners: `ShellCommandAnalysis` proves the shape. `ShellApprovalMatcher`
+  marks the candidate. `ToolAccessPolicy` judges the targets
+  (`ScreenNoProgramRedirects`, `WithFileToolConsent`) with
+  `PathAccessPolicy` and the consent mode of the file tool. `ToolAuthorizer`
+  owns the order. Each fact is call-local. Such a command never creates a
+  grant.
+- A redirect gets the decision of the file tool for the audience and the
+  path. A write target gets the path rules of `file_write` (the shell trust
+  zone) and the consent mode of `file_write`. An input target gets the trust
+  zone, the path rules of `file_read`, and the consent mode of `file_read`.
+  Mode `Auto` runs with no prompt. Mode `Deny` denies. With mode `Approval`,
+  a stored grant of the file tool covers the redirect, as it covers the tool
+  (`StoredGrantCheck` with the consent request of the tool). With no such
+  grant, one prompt names each write and read that needs consent, with `Once`
+  and `Deny`. That prompt cannot save a grant: answer a `file_write` prompt
+  with a saved choice, or set the mode to `Auto`, to stop it. Each redirect of
+  the command gets every check before the prompt, so one denied redirect
+  denies the call.
+- The managed temporary directory advice replaces a prompt. A command that
+  runs no program has no prompt, so it gets no such advice: `: > /tmp/x` and
+  `cd /tmp && : > x` both run when the rules allow the path.
+- An attended and an unattended call get the same result. An unattended call
+  denies each case that keeps a prompt.
+- Example: `printf 'a\n' > drafts/h.tsv && : > drafts/h.json` runs with no
+  prompt and no grant. `x=1; : > drafts/y` runs too.
+- Negative example: `: > ~/.netclaw/config/secrets.json` is denied. A bounded
+  write profile denies `printf a > ../outside/x`, and a bounded read profile
+  denies `: < /etc/passwd`.
+- Negative example: a program still prompts. `date > out.txt` prompts for
+  `date`, and `echo $(rm -rf x) > f` prompts for `rm`.
+
+Limits: these forms run no program but keep a prompt that shows their text,
+because the parser gives no proved target or no parse for them.
+
+- `cd dir; : > f` and `(cd dir; : > f)`: after a `cd` that can fail, the
+  target has no exact value. `cd dir && : > f` runs.
+- A redirect target with a loop variable (`for n in 1 2; do : > f$n; done`),
+  a glob, or another unproved value.
+- The operators `>|`, `>&`, and `<>`.
+- Several assignments in one statement (`x=1 y=2`), an array assignment, and
+  `x+=1`.
+- A target behind a link. On macOS, `/var` and the default `TMPDIR` are
+  behind a link. The platform temporary alias (`/tmp`) is not a limit.
+- A data command with an assignment whose operand is not proved data
+  (`d=key; echo ../x/"${d}s"/* > out.txt`).
+- With mode `Approval`, the redirect gets no managed temporary directory
+  advice, but the file tool does.
+
+A prompt never names nothing. When a shell consent request has no candidate
+and no pattern (a source that does not parse, `$cmd > x`, `eval x`,
+`x=1 > f`), `ToolAuthorizer.ShowFullCommandText` makes the full command text
+its one display candidate, with only `Once` and `Deny`. A request with
+patterns (a PowerShell statement list) keeps them. Slack and Discord show the
+command in the request line, so their header for such a request is "Approve
+this command in <folder>?". The one-time key reads the
+candidates and the patterns, not the display list, so a "Once" answer still
+matches the retry. The 900-character rule below applies after it. The test
+harness fails each test that observes a prompt with no display candidate.
 
 Decision D2 (October 2026): an attended and an unattended call use the same
 rules above. The file reach of an unattended call is the reach of its audience
@@ -195,6 +381,13 @@ bridge), the authorizer turns a consent request into the denial
 `approval_required_unattended`. D2 removed the unattended-only trust zone, the
 unattended unresolved-input denial, and the PR 6e rule that let a stored grant
 replace a trusted-root denial for an unattended call.
+
+After the unattended denial, an attended shell consent request whose command
+text is longer than `ApprovalOptionKeys.MaxCommandTextChars` (900) becomes the
+correction `shorten_shell_command`. The operator must see the full command
+that they approve, and 900 characters is the command length that a Discord
+prompt (2,000 characters) can show in full. The call does not run, and a
+resend of the same call gets the same correction.
 
 Each context below lists its question, the classes that answer it today, its
 published contract today, what it must not know, and where its data lives.
@@ -229,24 +422,78 @@ Leaks today:
 | Item | Current state |
 | --- | --- |
 | Question | What does this command do, in general shell terms? |
-| Classes | ShellSyntaxTree through [`ShellCommandAnalysis`](../../src/Netclaw.Security/ShellCommandAnalysis.cs); candidate extraction in `ShellApprovalMatcher` ([`IToolApprovalMatcher.cs`](../../src/Netclaw.Security/IToolApprovalMatcher.cs)); [`ShellTokenizer`](../../src/Netclaw.Security/ShellTokenizer.cs) and [`ShellApprovalSemantics`](../../src/Netclaw.Security/ShellApprovalSemantics.cs) (legacy parser); [`BashDirectoryScopeProjection`](../../src/Netclaw.Actors/Tools/BashDirectoryScopeProjection.cs) (the directory of each occurrence after a Bash `cd`); [`ShellPolicyPathFacts`](../../src/Netclaw.Actors/Tools/ShellPolicyPathFacts.cs); [`ShellFileSystemTreeAccessPolicy`](../../src/Netclaw.Security/ShellFileSystemTreeAccessPolicy.cs) |
+| Classes | ShellSyntaxTree through [`ShellCommandAnalysis`](../../src/Netclaw.Security/ShellCommandAnalysis.cs); candidate extraction in `ShellApprovalMatcher` ([`IToolApprovalMatcher.cs`](../../src/Netclaw.Security/IToolApprovalMatcher.cs)); [`ShellTokenizer`](../../src/Netclaw.Security/ShellTokenizer.cs) and [`ShellApprovalSemantics`](../../src/Netclaw.Security/ShellApprovalSemantics.cs) (legacy parser); [`BashDirectoryScopeProjection`](../../src/Netclaw.Actors/Tools/BashDirectoryScopeProjection.cs) (the directory of each occurrence after a Bash `cd`); [`BashLiteralTwinSlices`](../../src/Netclaw.Actors/Tools/BashLiteralTwinSlices.cs) (the literal twins of a Bash command, F1); [`ShellPolicyPathFacts`](../../src/Netclaw.Actors/Tools/ShellPolicyPathFacts.cs); [`ShellFileSystemTreeAccessPolicy`](../../src/Netclaw.Security/ShellFileSystemTreeAccessPolicy.cs) |
 | Published contract | `ShellCommandPolicy.Analyze(...)` returns a `ShellCommandAnalysis`. `ShellApprovalMatcher.AnalyzeInvocation(...)` returns candidates and an "unresolved" flag (`IsMessy` in code). |
 | Must not know | Grants, audience, the private grammar of an executable. |
 | Data | Call-local. |
 | Rules | [TA-7](../../openspec/specs/tool-authorization/spec.md#requirement-ta-7-shell-analysis-uses-general-syntax-facts) |
 
+Fixed text on stdin (owner decision 2026-10-07, heredoc parity):
+
+- A heredoc with a quoted delimiter and a here string with a proved value
+  give fixed text on stdin. Netclaw treats the text as it treats text from a
+  pipe: it reads no path and no command from it.
+- The command keeps its normal candidate. A grant for `python3` covers
+  `python3 - <<'EOF'` as it covers `python3 -c '...'`. Each interpreter rule
+  of the argument form also applies to the stdin form.
+- These forms stay unresolved (one exact candidate, "Once" only):
+  - an unquoted delimiter (ShellSyntaxTree marks it `Expand`);
+  - a here string with an unknown value;
+  - a descriptor other than stdin;
+  - a command with Unknown command words, for example `python3 - "$f"` in a
+    loop, because a literal twin cannot carry a heredoc;
+  - a shell receiver. The file name of each verb word decides: `bash`,
+    `./bash`, `/usr/local/bin/bash`, `bash.exe`, `env sh`, `xargs bash`,
+    `pwsh`, `cmd`. An argument counts too when a part of its proved value
+    between white space is a shell file name (`timeout 5 /opt/x/bash`,
+    `env -S 'bash -s'`, `ssh host 'bash -s'`), or when it has no proved value
+    (`env "$tool"`, a glob).
+- Netclaw analyzes the script of `bash -c` as child commands. It does not
+  analyze the text of a heredoc or a here string as a script. Thus a grant for
+  a shell does not cover such text. Text from a pipe (`printf ... | bash`) is
+  outside this rule.
+- Fixed text on stdin opens no file. A data command with such text
+  (`: <<'EOF'`, `echo x <<< 'y'`) still runs no program and needs no prompt,
+  and the file rules judge each file redirect of the command. A program with
+  such text and a write redirect (`python3 - > out.txt <<'EOF'`) keeps its
+  normal candidate and the write scope.
+- Known limits:
+  - A program that reads paths from stdin gets its normal candidate. A folder
+    grant for `xargs cat` covers `xargs cat <<< /etc/passwd`, as it covers
+    `printf /etc/passwd | xargs cat`.
+  - Netclaw does not read the private grammar of a program. It tests each
+    part of an argument value, so a shell name in a data argument makes the
+    call exact (`grep bash <<'EOF'`, `grep 'run bash now' <<'EOF'`). This is
+    the safe direction (owner decision 2026-10-08).
+  - The shell names are a list, and a list cannot be complete. A shell that
+    is not in the list (`elvish`, `nu`, `xonsh`) gets the result of its `-c`
+    form. A program that gives stdin text to `sh` (`at now`, `batch`,
+    `crontab -`, `parallel`) gets the result of its pipe form.
+  - ShellSyntaxTree 0.4.0-beta.24 does not parse source after the heredoc
+    operator on its line (`cat <<'EOF' > out.txt`, `python3 - <<'EOF' | head`).
+    Such a call keeps the "Once" prompt. A redirect before the operator
+    (`cat > out.txt <<'EOF'`) gets the normal candidate.
+- Owner: `ShellCommandAnalysis.HasFixedTextStdin`. The shell names are policy
+  data in `ShellVerbPolicyData.ScriptShellNames`. The data is call-local.
+
 Leaks today:
 
 - Two parsers read one command: ShellSyntaxTree and the legacy tokenizer.
   Hard deny and the protected-path check use both.
-- Two projections produce candidates for one compound Bash command: the
-  matcher candidates of the full parse, and the directory proof for a list
-  with an exact `cd`. The directory proof also marks the diagnostics of a
+- Three projections produce candidates for one compound Bash command: the
+  matcher candidates of the full parse, the directory proof for a list with
+  an exact `cd`, and the literal twins of a command with proved finite values
+  (`BashLiteralTwinSlices`). The directory proof also marks the diagnostics of a
   causal list (`cd dir && action; diagnostic`) for the reviewed-safe intent
   rule. That rule and the headless denial of a causal list stay until the
   owner changes the outcomes that they protect. The side-effect exemption
   (`echo`, `printf`, `:`, `true`, `false`) applies in a causal list too: the
-  exempt command has no directory, so the list role does not change it.
+  exempt command has no directory, so the list role does not change it. The
+  exemption of a command that runs no program does not read the role either.
+  After a directory change that can fail, the directory of a later command is
+  not known, and an unresolved call makes that command exact. A data command
+  with no redirect and proved data operands is the exception (0.27.1): it has
+  no path scope, so it keeps its normal candidate and its exemption.
 - `ResolveAuthorizationScope` in `IToolApprovalMatcher.cs` names `find`, `cd`,
   `pushd`, and `Set-Location`. This conflicts with the Shell Approval
   Abstraction Rule in [`AGENTS.md`](../../AGENTS.md).
@@ -303,6 +550,56 @@ Leaks today:
   that reads a binding (`x=/; rm -rf "$x"`). The hard-deny list also checks
   each proved value, and each value of a loop variable, so the bound form gets
   the decision of its literal twin. More than 256 value combinations deny.
+- Since ShellSyntaxTree 0.4.0-beta.18, a bounded `$((...))` is data: never a
+  path and never a command word. Arithmetic that reads a command substitution
+  or a variable without a proved integer value, and an arithmetic command
+  `((...))`, stay unresolved, because Bash evaluates those values as code. A
+  brace word (`{a,b}`) has an unknown value and no path, and a brace word in
+  the program word is unresolved. A bounded `break`, `continue`, `exit`, or
+  `return` in a loop no longer makes the source unresolved; all four are data
+  commands.
+- Since ShellSyntaxTree 0.4.0-beta.19, an ANSI-C word (`$'\x6beys'`) has its
+  decoded value, and each proved path value also gets the default credential
+  store text hints. For a program that can open files, a word that Bash can
+  glob (`MayPathnameExpand`) with an unknown value is not covered by decision
+  D1: the command is one exact candidate with `Once` and `Deny` only. When
+  this rule is the only cause and a rewrite of the words can remove the word,
+  the call gets the rewrite correction instead; the candidate stays exact.
+  When the command words are known, that correction is the quote correction
+  (`ShellWordQuoteSuggested`, 0.27.1): it names each such word
+  (`ShellCommandAnalysis.GetUnboundedPathnameExpansionWords`). In double
+  quotes, the word gets no pathname expansion, so the retry has one unknown
+  operand, and decision D1 applies. The
+  rule does not read `MayFieldSplit`: a word that can split but cannot glob
+  (`"$@"`, a bounded arithmetic word) keeps the check of a normal operand. A proved
+  glob scope keeps decision D5, and a proved authored value with no glob
+  character is exempt. Owner decision (#2349): `echo` and `printf` operands
+  stay data (the worst case is file names in the output), and `test` and `[`
+  keep the proved-value rule.
+- Since ShellSyntaxTree 0.4.0-beta.22, the parser shows three Bash forms that
+  it hid before. Netclaw needs no change for them: each hidden command is now a
+  candidate, or the source is unresolved.
+  - A line continuation inside an expansion (`echo "$\<LF>(touch x)"`) shows
+    `touch`.
+  - A `#` right after a quote is word text (`echo "a"# ; touch x`), so the
+    parser shows `touch`.
+  - A carriage return outside quotes, comments, and heredoc bodies makes the
+    source unresolved, as does a backslash before a CR in double quotes.
+  - A reserved word across a continuation is unresolved. An inline
+    `--name=value` value comes from the decoded word, else it is `Unknown`. A
+    `~` after `=` or `:` in an argument expands only in a proved non-POSIX
+    Bash with a launch-proved `HOME`, else it is `Unknown`.
+- Since ShellSyntaxTree 0.4.0-beta.24, an option word with a quoted or an
+  escaped `=` has the facts of the unquoted word. Netclaw needs no change.
+  - `tar --file'='../x` and `awk -F'[= ]' '{print $2}' f` were unparseable,
+    so they got only `Once` and `Deny`. They are now normal candidates.
+  - A fully quoted option word (`tar "--file=../x"`) had no path fact for its
+    value, so a folder `tar` grant covered a path outside the folder. The
+    value now has the path fact of `--file=../x`, and the call prompts.
+  - A `~` after a quoted `=` is text, as in Bash.
+  - An option word with an expansion and no proved value (`-o"$n"`,
+    `--$n=x`, `--$(cmd)=x`) has an `Unknown` value, so it is an unknown
+    operand (decision D1).
 - Owner decision D5 (option A): a glob word gets the decision of each literal
   protected path that its segments can match, or of a directory that contains
   one (`ToolPathPolicy.GlobMayReachDeniedPath`). The match is lexical: Netclaw
@@ -489,8 +786,8 @@ Translation at each seam:
 
 Words to avoid in new prose, with the replacement:
 
-- "trust zone": use "trusted root". The token stays in reason codes such as
-  `shell_path_outside_trust_zone`.
+- "trust zone": use "trusted root". The token stays only in the reason code
+  `shell_working_directory_outside_trust_zone`.
 - "messy": use "unresolved syntax". `IsMessy` stays as a code name.
 - "policy" for an evaluator class: name the context. Use "policy data" for
   configuration.
@@ -543,14 +840,19 @@ See the Shell Approval Abstraction Rule in [`AGENTS.md`](../../AGENTS.md) and
 
 - Follows: `git status` becomes a phrase from ShellSyntaxTree tokens. The
   reviewed-safe catalog lists that phrase as data.
-- Follows: a shell grant covers exactly its command words, the ShellSyntaxTree
-  `CommandWords` fact (0.4.0-beta.8 position rule). The words are the program,
-  the verb slot (the first word after the program and its options), and the
-  plain words after it. The arguments are free. `ApprovalPatternMatching.VerbChainEquals`
-  compares the stored tokens with the candidate's words, so `gh -R o/r pr view 1`
-  and `gh pr view 1 -R o/r` both match a `gh pr view` grant, a `gh` grant
-  covers `gh --help` but not `gh auth logout`, and a `git push origin feature-x`
-  grant does not cover `git push origin main`. Options, option values, paths,
+- Follows: a shell grant matches the ShellSyntaxTree `CommandWords` fact
+  (0.4.0-beta.8 position rule). The words are the program, the verb slot (the
+  first word after the program and its options), and the plain words after it.
+  `ToolApprovalEntryComparer.CoversCommandWords` is the one rule for the
+  approval matcher and the store hygiene (owner decision, 2026-10-05). A grant
+  of two or more words names a verb and covers the words that start with its
+  words: a `git push` grant covers `git push origin main`, and a
+  `dotnet package search` grant covers each package. A grant of one word names
+  only the program and covers that word alone: a `gh` grant covers
+  `gh --help` but not `gh auth logout`. A grant word is never free, so a
+  `git push origin feature-x` grant does not cover `git push origin main`.
+  `gh -R o/r pr view 1` and `gh pr view 1 -R o/r` both match a `gh pr view`
+  grant. Options, option values, paths,
   path patterns with `/`, words with a digit, quoted text with whitespace, and
   (after the verb slot) expansions and globs are arguments. So
   `dotnet build -c Release` gives `dotnet build`, and
@@ -560,17 +862,147 @@ See the Shell Approval Abstraction Rule in [`AGENTS.md`](../../AGENTS.md) and
   existing file or directory (not a link) in the occurrence directory is a
   path operand, not a command word: with `Phobos.slnx` on disk,
   `dotnet build Phobos.slnx` gives `dotnet build`, and the file gets a path
-  scope for the trusted-root and protected-path checks. The program word and
+  scope for the trusted-root and protected-path checks. A word that names a
+  link stays a command word. `ToolPathPolicy` checks the target of each plain
+  word after the program word that names a link, command word or argument, and
+  denies a protected target. The link and its final target are both scopes
+  of the candidate (see the link target item below).
+  The program word and
   the verb slot never drop, so a file named `push` does not change `git push`.
   ShellSyntaxTree is lexical, so `ShellApprovalMatcher.ProjectCommandWords`
   reads the disk once per word. An unknown occurrence directory drops no word,
   and an exact candidate keeps its words. The stored match kind keeps the name
-  `TokenPrefix`, so the version-3 store does not change. A legacy phrase must also equal the words.
-  Since approval taxonomy fix 5, the display verb does not count: the legacy
-  phrase `dotnet list package` covers `dotnet list package --vulnerable`, whose
-  prompt shows `dotnet list`. Policy data gives some programs a one-token chain
-  (`echo`, `which`, `jq`); a bare-program grant for them also covers their
-  plain words.
+  `TokenPrefix`, so the version-3 store does not change. A legacy phrase uses
+  the same rule for its words.
+  Policy data gives some programs a one-token chain (`echo`, `which`, `jq`); a
+  bare-program grant for them also covers their plain words.
+- Follows: a candidate has one grant identity. `ShellApprovalMatcher` owns it,
+  and the data is call-local. The candidate verb is the phrase text of the
+  command words, after the program path rule (R1) below. The prompt shows that
+  verb, the answer saves those words, and a grant matches those words.
+  `GrantIdentityApprovalTests` proves two facts. For each candidate of each
+  catalog command, the saved entry has the text of the candidate verb (chat,
+  folder, and everywhere scope). For the `pipedrive` command below, the saved
+  grant covers the next call through the approval actor.
+
+  The pseudocode is schematic. It omits hard deny, protected paths, the
+  reviewed-safe policy, and the link checks of a scope.
+
+  ```text
+  words    = CommandWords(occurrence) minus file words, with the program path
+  verb     = phrase(words)              # prompt, CandidateVerbs, "Saved" line
+  grant    = TokenPrefix(shell, words, digest, scope)   # the answer saves it
+  covered  = grant.shell == shell
+             and grant.digest == digest                 # assignment digest
+             and wordsCovered(grant.words, words)
+             and scopeCovers(grant.scope, directory)    # folder or repository
+  wordsCovered(g, w) =
+             g is a prefix of w and (g.Count >= 2 or w.Count == 1)
+             or g.Count == 1 and g[0] == w[0]
+                and policy data gives g[0] a one-token chain (grep, echo, jq)
+  word equality: with case for Bash, without case for PowerShell
+  ```
+
+  Positive example: `pipedrive dealFields list --custom-only --json` shows
+  `pipedrive dealFields list`. The answer "This chat" saves those words, and
+  the grant covers `pipedrive dealFields list --json`. Negative example: that
+  grant does not cover `pipedrive organizationFields list` or
+  `pipedrive deals delete 42`, and a program-only grant `pipedrive` covers
+  neither. In Bash it also does not cover `pipedrive dealfields list`. In
+  PowerShell it does, because PowerShell words compare without case. The
+  prompt removes equal verbs with the same case rule, so a Bash call with
+  both spellings shows two verbs. Before this rule, the verb came from the
+  ShellSyntaxTree verb walk (`Clause.Verb`). That walk stops at a word with an
+  uppercase letter, so the prompt showed `pipedrive` for a grant of three
+  words. The saved grant was already correct. The verb walk now serves policy
+  only: the data-command rule, the one-token chain data, the directory operand
+  verbs, reviewed-safe phrases, and hard deny. The approval exemption of a
+  data command reads the first command word
+  (`ApprovalPatternMatching.PolicyProgram`), not the verb text. Two candidates
+  keep another verb, because they save no grant from it: a command with
+  `Unknown` words keeps its policy verb, and an exact candidate keeps its
+  source text. The match label of a decision (`ToolApprovalMatch.Pattern`)
+  shows the verb of the covered candidate, not the words of the grant.
+- Follows: a word that names a link has two path scopes (#2375). This is a
+  general path fact, not a rule for one program.
+  - The scopes are the folder that holds the link and the final target of the
+    link chain. `ShellApprovalMatcher.TryAddLinkScopes` adds the two scopes.
+  - Each spelling of one link gets the same two scopes: a path word
+    (`cat ext.txt`, `mytool read ./extlink`, `node_modules/.bin/tsc`), a
+    plain word that names a link in the occurrence directory
+    (`mytool read extlink`, `gh api --input ext.txt x`), and an option value
+    (`mytool read --input=ext.txt`). An option value that names a link does
+    not stay in the working directory, so it is a path word
+    (`TryAddPathWordScopes`).
+    `ToolPathPolicy.FindLinkWords` is the one loop that finds the plain words,
+    for the protected-path screen and for the scopes.
+  - `FileSystemAuthority.FollowLinkChain` is the one reader of a final link
+    target for grant scopes and glob words. It reads the chain from the disk
+    at authorization time. A relative link text resolves against the lexical
+    directory of its link, so an alias above a grant root stays in the target.
+  - The protected-path screen (`FileSystemAuthority.IsProtected`) keeps the
+    host resolver, because its failures deny (R13), and that includes the
+    Windows drive root. The host resolver removes a `..` in a link text
+    lexically. So for a link that `FollowLinkChain` cannot name, the screen
+    also resolves the path as the OS does (`TryResolvePhysicalPath`) and
+    denies a protected result. Positive example: `keydd.txt` with the text
+    `ncdir/../keys/a.pem`, where `ncdir` is a link to the Netclaw `logs`
+    folder, is denied. Negative example: `dotdot.txt` with the same shape and
+    an ordinary target is not denied; it gets exact consent only.
+  - Each candidate scope needs coverage (TA-8). So a folder or repository
+    grant covers the word only when it covers the link folder and the target.
+    The link walk of the folder grant also checks the target scope, so a
+    directory link in the target path is refused.
+  - A grant without a folder and a chat grant cover the word, because they
+    also cover the target path.
+  - A dangling link gets the decision of the target path that its link text
+    states, because a write through the link creates the file there. A target
+    in the scope is covered. A target outside the scope is not covered.
+  - A link without a known target fails closed. A `..` in a link text that
+    leaves a link, or a rooted link text that is not a full path, makes the
+    occurrence unresolved. It gets exact consent only, also with a grant for
+    anywhere, unless the protected-path screen denies it first. The screen
+    cannot resolve a loop or a chain of more than 40 links, so it denies
+    those (R13).
+  - A glob word uses the same reader and is stricter. Each link entry of a
+    walked directory must have an existing final target in that same
+    directory (`HasOnlyContainedLinkEntries`). If not, the word is unresolved
+    and gets exact consent only. So a link to a sibling folder in the grant, a
+    link out of the folder, and a dangling entry each keep a literal word
+    covered or give it a folder prompt, but leave a glob word unresolved.
+  - A platform temporary alias, such as macOS `/tmp`, is an OS alias (R7).
+    The word `/tmp` keeps its one lexical scope.
+  - A word that is not a full host path of the shell's style names no host
+    link. It keeps its lexical scope.
+  - A data command (`echo`) gets no path scope, so the rule does not apply to it.
+  - Known limits. The rule does not reach these forms:
+    - A link that the same command creates or changes before the program runs
+      (`ln -s ../x y && cat y`). This is a run-time effect.
+    - A directory link in the middle of a path word (`current/app.js`,
+      `cd innerdir && ...`). The link rule below the grant root refuses it,
+      also when its target is in the folder.
+    - A value that the parser does not split from its word: a short option
+      with an attached value (`-iextlink`), a `key=value` word without a dash
+      (`if=ext.txt`), and text before the path (`@ext.txt`). Such a word has no
+      path scope today, also for a literal path outside the folder
+      (https://github.com/netclaw-dev/netclaw/issues/2383). A fix for that
+      issue must send each path that it adds through `TryAddPathWordScopes`,
+      which adds the link scopes.
+    - A redirect to a link (`> inner.txt`). It gets exact consent only, also
+      when the target is in the folder.
+    - A link as the program word (`./tool` that points to `/usr/bin/rm`). The
+      target of a program word is not a scope.
+    - A hard link. No path check can see it.
+    - A Windows junction or volume mount point. No test covers them, and the
+      grant tests with real links run on POSIX hosts only. The chain ends at a
+      reparse point that has no link text.
+    - A link text with a trailing separator before a second link
+      (`tsl -> innerdir/`). The chain stops there, so the word prompts also
+      when the target is in the folder.
+    - A link with an unknown target and an ordinary real target. The operator
+      sees only the word in the exact prompt, not the path that the OS opens.
+    - A change of the target between the decision and the launch. The launch
+      check does not read the target of a plain link word again.
 - Follows: a program path names a file, not a spelling (R1). When the
   program word has a slash, `ShellApprovalMatcher` replaces it with the
   lexical absolute path: it joins a relative path with the occurrence working
@@ -605,6 +1037,89 @@ See the Shell Approval Abstraction Rule in [`AGENTS.md`](../../AGENTS.md) and
   both shells; the other causes are correctable in Bash only. A dynamic program
   name or a PowerShell script block keeps the one-time prompt (an unattended
   run denies it).
+- Follows (owner, 2026-10-07): Netclaw sends a correction only when a rewrite
+  that the model can make removes the cause. The source holds the literal
+  words when the parser proves each authored value (`for v in push fetch`), or
+  when the word has no `$` and no backtick (a brace list `{push,fetch}`, a
+  glob). A word with a run-time value has no literal spelling: an environment
+  value (`[ -n "$FOO" ]`, `git "$FOO" origin`), a `$(...)` result
+  (`git $(cmd) origin`), `$?`, or a file name from a glob loop
+  (`for f in src/*; do [ -f "$f" ]; done`). Such a command gets a one-time
+  prompt with `Once` and `Deny`. No grant covers it, and an unattended run
+  denies it. The first word that Bash can change decides: in
+  `git {push,fetch} origin "$BRANCH"` the brace list is the cause, so the
+  correction stays, and in `git "$FOO" *.md` the run-time word is the cause,
+  so the call prompts.
+  `ShellApprovalMatcher.ClassifyUnknownCommandWords` owns this call-local
+  check. ShellSyntaxTree gives no typed fact for an expansion in a word, so
+  the check reads `$` and the backtick in the raw word. That is shell syntax,
+  not the grammar of a program. Each command-words and quote correction has a
+  test row that applies the rewrite and gets no correction on the retry
+  (`SubcommandEverywhereGrantTests.CorrectionRewrites`).
+- Follows: a test builtin with a run-time operand stays a prompt, not
+  approval-exempt data as `echo "$FOO"` is. Both rules ask one question: can
+  an operand value run code or reach a path? An `echo` operand only prints.
+  A `test` or `[` operand can be a `-v` name whose subscript runs a command,
+  and Netclaw does not parse the test operators to see which operand is the
+  operator.
+- Breaks: "a test builtin with a run-time operand is data". On Bash 5.2,
+  `x='a[$(cmd)]'; [ -v "$x" ]` runs `cmd`. Do not simplify the rule that way.
+- Breaks: `[ -n "$FOO" ]` gets `WriteWordsLiterally`. The model cannot write
+  the value of `FOO`, so it repeats the call or stops.
+- Follows: an option value can name a path (#2364, 0.27.2). The rule uses a
+  parser fact, not the `--name=value` shape: ShellSyntaxTree 0.4.0-beta.24
+  gives some elements two arguments, an option and a value. Examples are
+  `--output=../x`, `--output\=../x`, `--output'='../x`, `"--output=../x"`, and
+  `-p:OutDir=../x`. The parser types the value as a path only from its own
+  option tables. Netclaw has no option tables, so `ShellApprovalMatcher`
+  (`ResolveOptionValuePathWords`) reads each proved value as a possible
+  location. A value that can leave the working directory becomes a path word
+  with the same text, and the path word code gives its scope. Its data is
+  call-local.
+
+  ```text
+  schematic: one value argument of one occurrence
+  parser types the value as a path -> the path word rule already applies
+  value unproved (Bash)            -> no scope here; unknown operand (D1)
+  text = value after the option; for a glob, the text before the first
+         glob character ("~" is a name: Bash expands no "~" after "=")
+  glob with ".." or with "$" before the glob character -> the path word
+         rule decides (the command is exact)
+  text is not a path of the path style (URL, date) -> no scope
+  location below the working directory, no link    -> no scope
+  otherwise -> a path word with this text: file-parent rule, absent
+               top-level rule (API route), glob covering directory
+  ```
+
+  Positive: a folder or repository grant for `dotnet build` covers
+  `dotnet build --output=bin/x`, `--configuration=Release`, and
+  `dotnet format --include=src/*.cs`. Negative: it does not cover
+  `dotnet build --output=../x`, `--output=$HOME/x` (Bash and PowerShell),
+  `--output=/etc/x`, or `-p:OutDir=../x`. A chat grant and a grant for
+  anywhere have no path scope, so they cover all of these. The separate word
+  in `--output ../x` or `-o ../x` was already a path word. Free text that
+  starts with `../` or `/` also prompts (`--message="../x y"`), as its
+  separate word does.
+
+  Known limits. The parser gives no general fact for these forms, and a split
+  needs the grammar of the program, so they get no path scope
+  (https://github.com/netclaw-dev/netclaw/issues/2383):
+  - a short option with an attached value: `-o../x`, `-I/usr/include`;
+  - text before the path in a value: `--data=@../x`, `--path=a:../b`,
+    `--a=b=../x`, `--files=a,../b`, `"--logger=trx;LogFileName=../x.trx"`,
+    `--output=file:///etc/x`;
+  - a `name=value` word without a dash: `make PREFIX=../x`, `dd of=../x`,
+    `dd of=~/x`, `/p:OutDir=../x`.
+  - a PowerShell value that is relative to a drive: `--output=D:x`,
+    `--output=a:..\b`;
+  - a glob value in the folder whose match is a link to a file outside the
+    folder: `--output=lsrc/*.cs`.
+
+  A glob value with an expansion before its first glob character
+  (`--output=$HOME/*.x`) has no fixed anchor. It gets the result of its
+  separate path word: the command is exact.
+
+  The protected-path check still reads each of these words.
 - Breaks: `ResolveAuthorizationScope` treats the first operand of `find` and
   `cd` as a directory. That is private grammar of two executables.
 
@@ -725,7 +1240,8 @@ service calls, a compound or pipeline form of the same command, and a
 ### 7.5 Add a channel prompt
 
 1. Consent delivery: render the `ToolInteractionRequest` options with their
-   keys. Keep labels within `ApprovalOptionKeys.MaxLabelLength` (76).
+   keys. Keep labels within `ApprovalOptionKeys.MaxLabelLength` (76). Show a
+   command of `ApprovalOptionKeys.MaxCommandTextChars` (900) characters in full.
 2. Route the answer as a `ToolInteractionResponse` with the selected key.
 3. Check the requester through `ApprovalButtonValueCodec`. Do not invent a
    second rule.
@@ -782,7 +1298,7 @@ and the approval tooling is in
 | Hard deny runs before any grant lookup. | Catalog rows expect 0 approval service calls on deny |
 | Launch re-checks the exact call. | `DispatchingToolExecutorLaunchTests` |
 | A repository A grant never covers repository B. | `RepositoryWorktreeApprovalTests`; the approval directory mutation gate |
-| A folder grant stays inside its folder. | Catalog link rows; the approval directory mutation gate |
+| A folder grant stays inside its folder. | Catalog link rows; `LinkTargetScopeApprovalTests`; the approval directory mutation gate |
 | Audience and MCP allow lists deny before dispatch. | `McpToolAudienceGrantsTests`; the tool authorization mutation gate |
 | Session roots follow the audience. | `PathAccessPolicy` tests; the path access mutation gate |
 | Shell facts stay general. | The shell analysis and shell assignment mutation gates; `ShellPolicyEvidenceFixtureTests` |
@@ -791,6 +1307,8 @@ and the approval tooling is in
 | `skill_manage` mutations refuse links and protected paths. | `SkillToolTests`; the skill_manage guard mutation gate ([TOOLING.md § Skill Manage Guard Gate](../../TOOLING.md#skill-manage-guard-gate)) |
 | A shell grant never authorizes `file_read`. | No test yet. Consolidation PR 1b adds it. |
 | `ToolAuthorizer` gives the same decision as the gate on `dev`. | The corpus differential ([TOOLING.md § Authorization Corpus Differential](../../TOOLING.md#authorization-corpus-differential)) |
+| One denied literal twin denies the call, and every twin candidate needs coverage (F1). | `LiteralTwinApprovalTests`; catalog `loop-twin*` rows; the literal twin mutation gate |
+| A command that runs no program gets the decision of the file tool for each redirect. A prompt always names what it asks for. | `ShellNoProgramAuthorizationTests`; catalog `no-program-*` rows; the harness check in `ShellApprovalHarness.ObservePrompt`; the no program mutation gate ([TOOLING.md § No Program Gate](../../TOOLING.md#no-program-gate)) |
 | No `ToolAuthorizer` rule can move ahead of an earlier rule. | The tool authorizer order mutation gate ([TOOLING.md § Tool Authorizer Order Gate](../../TOOLING.md#tool-authorizer-order-gate)) |
 
 Model guidance (which tool the model should choose, and how it should declare

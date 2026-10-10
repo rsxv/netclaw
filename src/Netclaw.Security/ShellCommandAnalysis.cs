@@ -4,6 +4,8 @@
 // </copyright>
 // -----------------------------------------------------------------------
 using System.Collections.Immutable;
+using Netclaw.Configuration;
+using Netclaw.Security.Authorization.Filesystem;
 using Netclaw.Tools;
 using ShellSyntaxTree;
 
@@ -60,6 +62,7 @@ internal sealed class ShellCommandAnalyzer
         var knownRegionArguments = new HashSet<ClauseElement>(
             ReferenceEqualityComparer.Instance);
         var syntaxProofComplete = true;
+        var provesNoCommand = false;
         var failure = Analyze(
             command,
             workingDirectory,
@@ -68,7 +71,8 @@ internal sealed class ShellCommandAnalyzer
             commands,
             denyOnlyClauses,
             knownRegionArguments,
-            ref syntaxProofComplete);
+            ref syntaxProofComplete,
+            ref provesNoCommand);
         return new ShellCommandAnalysis(
             _environment,
             command,
@@ -80,6 +84,7 @@ internal sealed class ShellCommandAnalyzer
             syntaxProofComplete)
         {
             ManagedTemporary = temporary,
+            ProvesNoCommand = provesNoCommand,
             ScreenClauses = _screenState is null
                             && _environment.Grammar == ShellGrammar.Bash
                             && (failure != ShellAnalysisFailure.None || commands.Count == 0)
@@ -135,7 +140,8 @@ internal sealed class ShellCommandAnalyzer
         List<CommandOccurrence> commands,
         List<Clause> denyOnlyClauses,
         HashSet<ClauseElement> knownRegionArguments,
-        ref bool syntaxProofComplete)
+        ref bool syntaxProofComplete,
+        ref bool provesNoCommand)
     {
         if (depth > MaxWrapperDepth)
             return ShellAnalysisFailure.Unresolved;
@@ -170,7 +176,18 @@ internal sealed class ShellCommandAnalyzer
         }
 
         if (parsed.Commands.Count == 0)
+        {
+            // Owner decision (October 2026): a Bash source that parses with no
+            // command runs no program, for example an assignment (x=1) or a
+            // comment. The analysis stays unresolved for every other rule. Only
+            // the authorizer reads this fact. The caller of a wrapper child
+            // drops it. The hard-deny screen, PowerShell, and a blank source
+            // never get it.
+            provesNoCommand = _screenState is null
+                              && _environment.Grammar == ShellGrammar.Bash
+                              && !string.IsNullOrWhiteSpace(command);
             return ShellAnalysisFailure.Unresolved;
+        }
 
         if (_environment.Grammar == ShellGrammar.PowerShell)
         {
@@ -246,6 +263,7 @@ internal sealed class ShellCommandAnalyzer
             // SECURITY: the launcher sets the launch facts on the outer shell only. A child
             // shell can read startup files (bash -lc reads the login profile) that change
             // HOME or TMPDIR, so the child source gets no launch facts.
+            var childProvesNoCommand = false;
             var failure = Analyze(
                 exactSource.Source,
                 innerWorkingDirectory,
@@ -254,7 +272,8 @@ internal sealed class ShellCommandAnalyzer
                 commands,
                 denyOnlyClauses,
                 knownRegionArguments,
-                ref syntaxProofComplete);
+                ref syntaxProofComplete,
+                ref childProvesNoCommand);
             if (failure != ShellAnalysisFailure.None)
                 return failure;
 
@@ -561,14 +580,29 @@ public sealed record ShellCommandAnalysis
         SyntaxProofComplete = syntaxProofComplete;
         var unresolvedParts = new Dictionary<CommandOccurrence, ShellUnresolvedPart>(
             ReferenceEqualityComparer.Instance);
+        var expansionOnly = new HashSet<CommandOccurrence>(ReferenceEqualityComparer.Instance);
+        var runsNoProgram = new HashSet<CommandOccurrence>(ReferenceEqualityComparer.Instance);
         foreach (var command in Commands)
         {
             var part = ClassifyUnresolvedPart(command, knownRegionArguments);
+            // The expansion rule applies after the other causes. When it is the
+            // only cause of an exact command, a rewrite of the words can resolve
+            // the command, so the coordinator can keep its rewrite correction.
+            if (part != ShellUnresolvedPart.Command && HasUnboundedPathnameExpansion(command))
+            {
+                part = ShellUnresolvedPart.Command;
+                expansionOnly.Add(command);
+            }
+
             if (part != ShellUnresolvedPart.None)
                 unresolvedParts[command] = part;
+            else if (RunsNoProgramWhenProved(command))
+                runsNoProgram.Add(command);
         }
 
         _unresolvedParts = unresolvedParts;
+        _expansionOnly = expansionOnly;
+        _runsNoProgram = runsNoProgram;
         HasDynamicSyntax = !syntaxProofComplete || unresolvedParts.Count > 0;
         RequiresExactTreeApproval = ShellFileSystemTreeAccessPolicy.RequiresExactApproval(
             environment,
@@ -616,6 +650,45 @@ public sealed record ShellCommandAnalysis
     /// <summary>Returns how much of one command of this analysis the parser could not prove.</summary>
     internal ShellUnresolvedPart GetUnresolvedPart(CommandOccurrence command)
         => _unresolvedParts.TryGetValue(command, out var part) ? part : ShellUnresolvedPart.None;
+
+    private readonly IReadOnlySet<CommandOccurrence> _expansionOnly;
+
+    private readonly IReadOnlySet<CommandOccurrence> _runsNoProgram;
+
+    /// <summary>
+    /// True when the Bash source parsed completely and holds no command, for
+    /// example an assignment (<c>x=1</c>) or a comment. Such a call runs no
+    /// program. <see cref="IsResolved"/> stays false for every other rule.
+    /// </summary>
+    internal bool ProvesNoCommand { get; init; }
+
+    /// <summary>
+    /// Returns true when the parser proves that the command runs no program:
+    /// a command with only redirects (<c>&gt; file</c>), or a Bash data command
+    /// (<see cref="ShellVerbPolicyData.IsDataCommand"/>). Its only effects
+    /// outside the shell are its redirects, and each redirect target is one
+    /// proved file (see <see cref="HasPlainFileRedirects"/>).
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: owner decision (October 2026). Such a command gets no grant
+    /// candidate. The authorizer judges each redirect target with the file
+    /// rules of the audience, and never prompts for the command. A data
+    /// command that a shell-state assignment reaches qualifies only when its
+    /// operands are proved data, as for the approval exemption (F3). A
+    /// command substitution in an operand is its own occurrence and keeps its
+    /// own decision.
+    /// </remarks>
+    internal bool RunsNoProgram(CommandOccurrence command)
+        => _runsNoProgram.Contains(command);
+
+    /// <summary>
+    /// Returns true when the only cause that makes the command exact is a word
+    /// that Bash can glob, with an unknown value
+    /// (<see cref="HasUnboundedPathnameExpansion(CommandOccurrence)"/>). The
+    /// command stays exact, so no grant and no reviewed phrase covers it.
+    /// </summary>
+    internal bool IsUnresolvedOnlyByPathnameExpansion(CommandOccurrence command)
+        => _expansionOnly.Contains(command);
 
     /// <summary>
     /// Gets whether a filesystem tree effect requires one exact approval.
@@ -814,17 +887,33 @@ public sealed record ShellCommandAnalysis
         CommandOccurrence command,
         IReadOnlySet<ClauseElement> accountedRegionArguments)
     {
-        if (!command.IsComplete
-            || !Enum.IsDefined(command.ImmediateRole)
-            || command.ImmediateRole == CommandOccurrenceRole.Unknown
-            || command.Ancestry.Any(static frame =>
-                !IsKnownAncestor(frame.Ancestor)
-                || !Enum.IsDefined(frame.Region)
-                || frame.Region == CommandAncestryRegion.Unknown)
+        // ShellSyntaxTree marks a command with only redirects as incomplete,
+        // because it has no command word. Netclaw proves the rest of it here.
+        if (IsRedirectOnlyCommand(command))
+        {
+            return Environment.Grammar == ShellGrammar.Bash
+                   && HasPlainFileRedirects(command)
+                ? ShellUnresolvedPart.None
+                : ShellUnresolvedPart.Command;
+        }
+
+        if (!HasKnownStructure(command)
             || HasUnsupportedWorkingDirectory(command.WorkingDirectory)
             || command.Clause.Verb.IsDynamic
             || HasDynamicProgramWord(command)
             || HasUnresolvedRedirect(command))
+        {
+            return ShellUnresolvedPart.Command;
+        }
+
+        // A data command runs no program, so the file rules judge its redirect
+        // targets (RunsNoProgram). A target that is not one proved file (a
+        // glob, a set of values, or a Bash special device) cannot get that
+        // judgment, so the command is exact: the prompt shows its full text.
+        if (Environment.Grammar == ShellGrammar.Bash
+            && command.Redirects.Count > 0
+            && IsBashDataCommand(command)
+            && !HasPlainFileRedirects(command))
         {
             return ShellUnresolvedPart.Command;
         }
@@ -847,10 +936,112 @@ public sealed record ShellCommandAnalysis
             globMayAddOption |= pattern.Glob!.MayStartWithDash;
         }
 
-        return !HasOnlyDataOperands(command)
-               && (globMayAddOption || HasUnresolvedOperand(command, accountedRegionArguments))
+        if (HasOnlyDataOperands(command))
+            return ShellUnresolvedPart.None;
+
+        // A test builtin whose operands are not data can run a subscript.
+        return globMayAddOption
+               || HasUnresolvedOperand(command, accountedRegionArguments)
+               || HasTestBuiltinVerb(command)
             ? ShellUnresolvedPart.Operand
             : ShellUnresolvedPart.None;
+    }
+
+    /// <summary>
+    /// Returns true when the parser proves the structure of one command: the
+    /// command is complete, and its role and each ancestor are known.
+    /// </summary>
+    /// <remarks>
+    /// A literal twin has the structure of one top-level command, so the
+    /// structure of its source command must pass this check.
+    /// </remarks>
+    internal static bool HasKnownStructure(CommandOccurrence command)
+        => command.IsComplete
+           && HasKnownRoleAndAncestors(command);
+
+    private static bool HasKnownRoleAndAncestors(CommandOccurrence command)
+        => Enum.IsDefined(command.ImmediateRole)
+           && command.ImmediateRole != CommandOccurrenceRole.Unknown
+           && !command.Ancestry.Any(static frame =>
+               !IsKnownAncestor(frame.Ancestor)
+               || !Enum.IsDefined(frame.Region)
+               || frame.Region == CommandAncestryRegion.Unknown);
+
+    /// <summary>
+    /// Returns true when the command has no command word and no assignment:
+    /// each element is a redirect (<c>&gt; file</c>, <c>&lt; file</c>). Bash
+    /// opens each redirect target and runs no program.
+    /// </summary>
+    /// <remarks>
+    /// The rule composes general parser facts: no verb token, a verb that is
+    /// not dynamic, and the role of each element. The structure (role and
+    /// ancestors) must be known, as for <see cref="HasKnownStructure"/>.
+    /// </remarks>
+    internal static bool IsRedirectOnlyCommand(CommandOccurrence command)
+        => command.Clause.Verb.Tokens.Count == 0
+           && !command.Clause.Verb.IsDynamic
+           && command.Clause.Elements.Count > 0
+           && command.Clause.Elements.All(static element => element.Role == ClauseElementRole.Redirect)
+           && command.Assignments.Count == 0
+           && command.Arguments.Count == 0
+           && command.FileSystemTreeAccesses.Count == 0
+           && command.Redirects.Count > 0
+           && command.Redirects.Count == command.Clause.Redirects.Count
+           && HasKnownRoleAndAncestors(command);
+
+    // Owner decision (October 2026): a data command with redirects runs no
+    // program. ClassifyUnresolvedPart proved the whole command (part None),
+    // and with it each redirect target (HasPlainFileRedirects). The grammar
+    // check stays: PowerShell has an echo alias, and its redirects get no proof.
+    private bool RunsNoProgramWhenProved(CommandOccurrence command)
+        => Environment.Grammar == ShellGrammar.Bash
+           && (IsRedirectOnlyCommand(command)
+               || IsBashDataCommand(command)
+               && (command.Assignments.Count == 0
+                   || HasProvedDataOperands(command, isTestBuiltin: HasTestBuiltinVerb(command))));
+
+    /// <summary>
+    /// Returns true when each redirect of a Bash command is proved and each file
+    /// redirect target is one plain file: an exact absolute POSIX value. A
+    /// descriptor copy, move, or close (<c>2&gt;&amp;1</c>) opens no file.
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: Bash gives some paths under <c>/dev/</c> a meaning that is not
+    /// a file: <c>/dev/tcp/host/port</c> and <c>/dev/udp/host/port</c> open a
+    /// network connection, and <c>/dev/fd/N</c> copies a descriptor. The file
+    /// rules cannot judge such a target, so <c>/dev/null</c> is the only path
+    /// below <c>/dev/</c> that qualifies. A here document or a here string is
+    /// not a file redirect. It passes only as fixed text on stdin
+    /// (<see cref="HasFixedTextStdin(CommandOccurrence, HereDocumentRedirectAnalysis)"/>),
+    /// which opens no file, as a descriptor copy opens none. Each other here
+    /// document or here string fails the proof check. The check reads the canonical form of the value, so
+    /// <c>/dev/./tcp</c> and <c>//dev/tcp</c> also fail. Bash gives a special
+    /// meaning only to a word that starts with the literal name; a <c>..</c>
+    /// that leaves <c>/dev/</c> puts the rest of the word in the port, which
+    /// Bash rejects.
+    /// </remarks>
+    private static bool HasPlainFileRedirects(CommandOccurrence command)
+        => command.Redirects.All(redirect =>
+               !HasUnresolvedRedirect(command, redirect)
+               && redirect switch
+               {
+                   FileRedirectAnalysis file => IsPlainFileTarget(file),
+                   DescriptorDuplicateRedirectAnalysis or DescriptorMoveRedirectAnalysis or DescriptorCloseRedirectAnalysis => true,
+                   HereDocumentRedirectAnalysis or HereStringRedirectAnalysis => true,
+                   _ => false
+               });
+
+    private static bool IsPlainFileTarget(FileRedirectAnalysis redirect)
+    {
+        if (redirect.Target is not ShellValueDomain.Exact { Value: { Length: > 0 } value }
+            || !value.StartsWith('/')
+            || !CanonicalPath.TryCreate(value, relativeBase: null, ShellPathStyle.Posix, out var path))
+        {
+            return false;
+        }
+
+        return path.Value == "/dev/null"
+               || !path.Value.StartsWith("/dev/", StringComparison.Ordinal);
     }
 
     // ShellSyntaxTree 0.4.0-beta.17 gives no command words for a bracket
@@ -889,8 +1080,34 @@ public sealed record ShellCommandAnalysis
                 !IsAccountedExecutionRegionArgument(
                     argument,
                     accountedRegionArguments)
-                && HasUnsupportedArgumentDomain(argument)
+                && (HasUnsupportedArgumentDomain(argument) || IsUnscopedVariableWord(argument))
                 && !IsUnknownOutputData(command, argument));
+
+    /// <summary>
+    /// Returns true when a variable word is not a path word, so it has no path
+    /// scope.
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: Netclaw computes a path scope only from a path word that the
+    /// parser resolves, from a file word, and from a typed filesystem value. A
+    /// variable word such as <c>"$d"</c> is not a path word, also when the
+    /// parser proves its value. In
+    /// <c>for d in ../x; do dotnet build "$d"; done</c> or
+    /// <c>d=../x; dotnet build "$d"</c>, the value <c>../x</c> is outside the
+    /// folder, but the candidate keeps only the working directory scope. Such a
+    /// word is an unknown operand, so decision D1 lets only a safe phrase or a
+    /// grant for anywhere cover the command. ShellSyntaxTree 0.4.0-beta.19
+    /// gives a typed filesystem or data value only to a
+    /// <see cref="ArgKind.DynamicSkip"/> word, which keeps its own rule above.
+    /// A variable word that the parser marks as a path keeps its path scope,
+    /// or the path rule above makes it unknown when it has no resolved value.
+    /// A word whose proved value is an integer range (<c>"$?"</c>) is data, as
+    /// in <see cref="HasUnsupportedArgumentDomain(AnalyzedArgument)"/>.
+    /// </remarks>
+    private static bool IsUnscopedVariableWord(AnalyzedArgument argument)
+        => argument.Argument.Kind == ArgKind.EnvVar
+           && !argument.Argument.IsPath
+           && argument.Value is not ShellValueDomain.IntegerRange;
 
     internal static bool TryCollectKnownExecutionRegionArguments(
         ShellSyntaxNode node,
@@ -1236,23 +1453,166 @@ public sealed record ShellCommandAnalysis
     /// <summary>
     /// Returns true when every operand of the command is data: an output
     /// command (<c>echo</c>, <c>printf</c>, <c>:</c>, <c>true</c>, <c>false</c>)
-    /// prints or ignores its operands.
+    /// prints or ignores its operands, and a test builtin (<c>test</c>,
+    /// <c>[</c>) compares them.
     /// </summary>
     /// <remarks>
-    /// SECURITY: a dynamic operand of such a command reaches stdout only. It is
-    /// not the program word, and it is not a redirect target:
+    /// SECURITY: a dynamic operand of such a command reaches stdout or the exit
+    /// status only. It is not the program word, and it is not a redirect target:
     /// <see cref="HasUnresolvedRedirect(CommandOccurrence)"/> checks each
     /// redirect target separately. A command substitution inside an operand is
     /// its own occurrence with its own candidate, so the rule hides no command.
     /// ShellSyntaxTree accepts a dynamic printf operand only after a literal
     /// format, and it rejects <c>printf -v</c>, so no dynamic value reaches the
-    /// printf format or a shell variable. The rule is Bash only: in PowerShell
-    /// these words are aliases or external programs with their own parameters.
+    /// printf format or a shell variable. A test builtin can evaluate an array
+    /// subscript in an operand, so its operands must also pass
+    /// <see cref="HasBoundedNameSafeValue(AnalyzedArgument)"/>. The rule is Bash
+    /// only: in PowerShell these words are aliases or external programs with
+    /// their own parameters. The first verb token decides, because the parser
+    /// folds a plain operand into the verb (<c>echo yes</c>, <c>[ abc</c>).
     /// </remarks>
     private bool HasOnlyDataOperands(CommandOccurrence command)
         => Environment.Grammar == ShellGrammar.Bash
-           && command.Clause.Verb.Tokens is [var verb]
-           && ShellVerbPolicyData.SingleTokenSideEffectVerbs.Contains(verb);
+           && command.Clause.Verb.Tokens is [var verb, ..]
+           && ShellVerbPolicyData.IsDataCommand(verb, ApprovalShell.Bash)
+           && (!HasTestBuiltinVerb(command)
+               || HasProvedDataOperands(command, isTestBuiltin: true));
+
+    private bool HasTestBuiltinVerb(CommandOccurrence command)
+        => Environment.Grammar == ShellGrammar.Bash
+           && command.Clause.Verb.Tokens is [var verb, ..]
+           && ShellVerbPolicyData.BashTestBuiltins.Contains(verb);
+
+    /// <summary>
+    /// Returns true when the parser proves every value of the operand (an exact
+    /// value or a finite set) and no value has a <c>[</c>.
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: <c>[ -v 'a[$(cmd)]' ]</c> runs <c>cmd</c>, because Bash
+    /// evaluates the subscript as arithmetic. Arithmetic also evaluates the
+    /// value of a variable that it names, so <c>[ -v 'a[x]' ]</c> runs a
+    /// substitution in the value of <c>x</c>. A name without <c>[</c> has no
+    /// subscript, and the other test operators do not evaluate their operands.
+    /// An unknown value, a glob match, or a file name can hold any text, so
+    /// such an operand is not data. The rule reads only typed values. It does
+    /// not parse the test operators.
+    /// </remarks>
+    private static bool HasBoundedNameSafeValue(AnalyzedArgument argument)
+        => argument.Value switch
+        {
+            ShellValueDomain.Exact exact => HasNoSubscript(exact.Value),
+            ShellValueDomain.FiniteSet finite => finite.Values.All(HasNoSubscript),
+            _ => false
+        };
+
+    private static bool HasNoSubscript(string? value)
+        => value is not null && !value.Contains('[', StringComparison.Ordinal);
+
+    /// <summary>
+    /// Returns true when each operand of a Bash data command is proved data. An
+    /// output operand needs a word that Bash cannot glob, or a proved authored
+    /// value (an exact value or a finite set) with no glob character. A test
+    /// operand needs
+    /// <see cref="HasBoundedNameSafeValue(AnalyzedArgument)"/>.
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: an unquoted word with an unknown value, such as <c>$n</c> or
+    /// <c>../"$d"/*</c>, gets pathname expansion. ShellSyntaxTree gives no path
+    /// for such a word, so the protected-path screen cannot see what it lists.
+    /// ShellSyntaxTree 0.4.0-beta.19 reports
+    /// <see cref="AnalyzedArgument.MayPathnameExpand"/> from the authored word,
+    /// so a quoted part such as <c>pre"$n"</c> is data. A quoted unknown value is still not data for a test
+    /// builtin, because a <c>-v</c> subscript can run code.
+    /// </remarks>
+    internal static bool HasProvedDataOperands(CommandOccurrence command, bool isTestBuiltin)
+        => command.Arguments.All(argument => isTestBuiltin
+            ? HasBoundedNameSafeValue(argument)
+            : !argument.MayPathnameExpand
+              || HasGlobFreeAuthoredValue(argument));
+
+    /// <summary>
+    /// Returns true when a Bash operand with an unknown value can undergo
+    /// pathname expansion at run time.
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: ShellSyntaxTree 0.4.0-beta.19 reports
+    /// <see cref="AnalyzedArgument.MayPathnameExpand"/> from the authored word.
+    /// A word such as <c>"${d}ret"/*</c>, <c>$n</c>, or
+    /// <c>~/.netclaw/{keys,config}/key-1.xml</c> has no proved value and no
+    /// glob scope, so it can list or read the names in any directory, also a
+    /// protected one. Such a command gets one exact candidate with
+    /// <c>Once</c> and <c>Deny</c> only; no grant and no reviewed phrase covers
+    /// it, and an unattended run denies it. A proved glob scope
+    /// (<see cref="ShellValueDomain.PathPattern"/>) keeps decision D5, and a
+    /// quoted unknown value keeps decision D1.
+    /// Owner decision (#2349): a Bash data command keeps its earlier rule. An
+    /// output command (<c>echo</c>, <c>printf</c>) prints its operands, so the
+    /// worst case is file names in the output, never file contents. A test
+    /// builtin keeps the proved-value rule of
+    /// <see cref="HasBoundedNameSafeValue(AnalyzedArgument)"/>.
+    /// The rule does not read <c>MayFieldSplit</c>. A word that can split but
+    /// cannot glob is a quoted <c>"$@"</c> or a bounded arithmetic word. Field
+    /// splitting only cuts a value into more words, and each word keeps the
+    /// check of a normal operand: an unknown value gets decision D1, as a
+    /// quoted <c>"$x"</c> does. Splitting cannot add a path that the D1 gap
+    /// does not already accept. The agent cannot set <c>$@</c> without consent:
+    /// <c>set --</c> needs consent, and a function definition fails closed.
+    /// </remarks>
+    private bool HasUnboundedPathnameExpansion(CommandOccurrence command)
+        => Environment.Grammar == ShellGrammar.Bash
+           && !IsBashDataCommand(command)
+           && command.Arguments.Any(IsUnboundedPathnameExpansionWord);
+
+    private static bool IsUnboundedPathnameExpansionWord(AnalyzedArgument argument)
+        => argument.MayPathnameExpand
+           && argument.Value is ShellValueDomain.Unknown
+           && argument.Argument.Kind != ArgKind.Glob
+           && !HasGlobFreeAuthoredValue(argument)
+           && !IsStatusWord(argument);
+
+    private static bool IsBashDataCommand(CommandOccurrence command)
+        => command.Clause.Verb.Tokens is [var verb, ..]
+           && ShellVerbPolicyData.IsDataCommand(verb, ApprovalShell.Bash);
+
+    // `$?` is an exit status: an integer with no glob character.
+    private static bool IsStatusWord(AnalyzedArgument argument)
+        => argument.Argument.Kind == ArgKind.EnvVar
+           && argument.Argument.Raw == "$?";
+
+    /// <summary>
+    /// Returns true when the parser proves each authored value of the word
+    /// before splitting and pathname expansion, and no value has a glob
+    /// character. Bash then has nothing to expand, as for <c>$r</c> in
+    /// <c>for r in 1 2; do gh run view $r; done</c>.
+    /// </summary>
+    internal static bool HasGlobFreeAuthoredValue(AnalyzedArgument argument)
+        => argument.AuthoredValue switch
+        {
+            ShellValueDomain.Exact exact => HasNoGlobCharacter(exact.Value),
+            ShellValueDomain.FiniteSet finite => finite.Values.All(HasNoGlobCharacter),
+            _ => false
+        };
+
+    private static bool HasNoGlobCharacter(string? value)
+        => value is not null && value.IndexOfAny(['*', '?', '[']) < 0;
+
+    /// <summary>
+    /// Returns the source text of each word that makes a Bash command exact by
+    /// the pathname-expansion rule
+    /// (<see cref="HasUnboundedPathnameExpansion(CommandOccurrence)"/>).
+    /// </summary>
+    /// <remarks>
+    /// The approval coordinator names these words in its quote correction. In
+    /// double quotes, such a word gets no pathname expansion and no field
+    /// splitting, so its unknown value is one operand (decision D1). The list
+    /// grants no authority.
+    /// </remarks>
+    internal static IReadOnlyList<string> GetUnboundedPathnameExpansionWords(CommandOccurrence command)
+        => command.Arguments
+            .Where(IsUnboundedPathnameExpansionWord)
+            .Select(static argument => argument.Argument.Raw)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
 
     private static bool IsUnknownOutputData(
         CommandOccurrence command,
@@ -1288,9 +1648,9 @@ public sealed record ShellCommandAnalysis
         return redirect switch
         {
             HereDocumentRedirectAnalysis heredoc =>
-                !HasBoundedDataOnlyStdin(occurrence, heredoc),
+                !HasFixedTextStdin(occurrence, heredoc),
             HereStringRedirectAnalysis hereString =>
-                !HasBoundedDataOnlyStdin(occurrence, hereString),
+                !HasFixedTextStdin(occurrence, hereString),
             DescriptorDuplicateRedirectAnalysis duplicate =>
                 duplicate.TargetDescriptor < 0,
             DescriptorMoveRedirectAnalysis move => move.TargetDescriptor < 0,
@@ -1302,41 +1662,114 @@ public sealed record ShellCommandAnalysis
         };
     }
 
-    private static bool HasBoundedDataOnlyStdin(
+    /// <summary>
+    /// Returns true when a heredoc gives fixed text on stdin to a command that
+    /// can take it as data.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A heredoc with a quoted delimiter does not expand its body. Netclaw
+    /// treats the text as it treats text from a pipe: it reads no path and no
+    /// command from it. The command keeps its normal candidate: a grant for
+    /// <c>python3</c> covers <c>python3 - &lt;&lt;'EOF'</c> as it covers
+    /// <c>python3 -c '...'</c>. Each interpreter rule that applies to the
+    /// argument form also applies to this form.
+    /// </para>
+    /// <para>
+    /// SECURITY: an unquoted delimiter expands the body. ShellSyntaxTree marks
+    /// such a heredoc <c>Expand</c> and does not prove that the body has no
+    /// expansion, so it stays unresolved. Some receivers also stay unresolved:
+    /// see <see cref="CanTakeFixedStdinText(CommandOccurrence)"/>.
+    /// </para>
+    /// </remarks>
+    private static bool HasFixedTextStdin(
         CommandOccurrence occurrence,
         HereDocumentRedirectAnalysis redirect)
-    {
-        var clause = occurrence.Clause;
-        if (!IsStandardInputSource(redirect.Source)
-            || clause.Verb.Tokens.Count != 1
-            || !string.Equals(
-                LegacyShellTextScan.TrimShellPunctuation(clause.Verb.Tokens[0]),
-                "cat",
-                StringComparison.Ordinal)
-            || clause.Args.Any(static arg => !arg.IsCwdAttribution))
-        {
-            return false;
-        }
+        => IsStandardInputSource(redirect.Source)
+            && CanTakeFixedStdinText(occurrence)
+            && HasLiteralHereDocument(
+                redirect.Document,
+                occurrence.Clause.IsCommandStringWrapped);
 
-        return HasLiteralHereDocument(
-            redirect.Document,
-            clause.IsCommandStringWrapped);
-    }
-
-    private static bool HasBoundedDataOnlyStdin(
+    /// <summary>
+    /// Returns true when a here string gives a proved value on stdin to a
+    /// command that can take it as data. The rule is the heredoc rule of
+    /// <see cref="HasFixedTextStdin(CommandOccurrence, HereDocumentRedirectAnalysis)"/>.
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: ShellSyntaxTree gives an <c>Exact</c> or <c>FiniteSet</c>
+    /// value only when it proves the word. A word with an unknown variable or
+    /// a command substitution has an unknown value and stays unresolved.
+    /// </remarks>
+    private static bool HasFixedTextStdin(
         CommandOccurrence occurrence,
         HereStringRedirectAnalysis redirect)
-    {
-        var clause = occurrence.Clause;
-        return IsStandardInputSource(redirect.Source)
-            && clause.Verb.Tokens.Count == 1
-            && string.Equals(
-                LegacyShellTextScan.TrimShellPunctuation(clause.Verb.Tokens[0]),
-                "cat",
-                StringComparison.Ordinal)
-            && !clause.Args.Any(static arg => !arg.IsCwdAttribution)
+        => IsStandardInputSource(redirect.Source)
+            && CanTakeFixedStdinText(occurrence)
             && HasBoundedData(redirect.Data);
-    }
+
+    /// <summary>
+    /// Returns true when the command has known command words and no word that
+    /// can name a shell.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A command with Unknown command words has no grant identity, for example
+    /// <c>python3 - "$f"</c> in a loop. Its literal twins (F1) cannot carry a
+    /// heredoc, so the resolved command would get a rewrite correction that no
+    /// rewrite can satisfy. Such a command keeps the one exact candidate.
+    /// </para>
+    /// <para>
+    /// SECURITY: a shell reads stdin as a script. For <c>bash -c '...'</c>,
+    /// Netclaw analyzes the script as child commands, so the hard-deny and
+    /// path rules see each command. Netclaw does not analyze the text of a
+    /// heredoc or a here string as a script. Thus such text to a shell stays
+    /// unresolved, and a grant for the shell does not cover it. Text from a
+    /// pipe (<c>printf ... | bash</c>) is outside this rule.
+    /// </para>
+    /// <para>
+    /// The file name of each verb word decides (<c>bash</c>, <c>./bash</c>,
+    /// <c>/usr/local/bin/bash</c>, <c>env sh</c>, <c>xargs bash</c>). An
+    /// argument with a proved value that is a shell file name
+    /// (<c>timeout 5 /opt/x/bash</c>), and an argument with no proved value,
+    /// also keep the command unresolved. The existing <c>-c</c> wrapper rule
+    /// reads a shell word in an argument in the same way. A shell can also
+    /// be one word inside an argument: <c>env -S 'bash -s'</c>,
+    /// <c>ssh host 'bash -s'</c>, <c>flock x -c 'bash -s'</c>. Netclaw does
+    /// not read the private grammar of a program, so each part of a proved
+    /// value between white space gets the same file name test. The cost is
+    /// that <c>grep bash &lt;&lt;'EOF'</c> and
+    /// <c>grep 'run bash now' &lt;&lt;'EOF'</c> are also unresolved; this is
+    /// the safe direction. The shell names are policy data.
+    /// </para>
+    /// </remarks>
+    private static bool CanTakeFixedStdinText(CommandOccurrence occurrence)
+        => occurrence.CommandWords is ShellCommandWords.Known
+            && !HasShellReceiver(occurrence);
+
+    private static bool HasShellReceiver(CommandOccurrence occurrence)
+        => occurrence.Clause.Verb.Tokens.Any(ShellVerbPolicyData.IsScriptShellProgram)
+            || occurrence.Arguments.Any(static argument =>
+                !argument.Argument.IsCwdAttribution
+                && MayNameScriptShell(argument.Value));
+
+    private static bool MayNameScriptShell(ShellValueDomain value)
+        => value switch
+        {
+            ShellValueDomain.Exact exact => exact.Value is null
+                || HasScriptShellWord(exact.Value),
+            ShellValueDomain.FiniteSet finite => finite.Values.Any(static item =>
+                item is null || HasScriptShellWord(item)),
+            _ => true
+        };
+
+    // Owner decision 2026-10-08: each part of the value between white space
+    // gets the test, so a shell inside one argument stays strict. To test only
+    // the whole value, return ShellVerbPolicyData.IsScriptShellProgram(value).
+    private static bool HasScriptShellWord(string value)
+        => value
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+            .Any(ShellVerbPolicyData.IsScriptShellProgram);
 
     private static bool IsKnownRedirectSource(RedirectSource source)
         => source is RedirectSource.Default

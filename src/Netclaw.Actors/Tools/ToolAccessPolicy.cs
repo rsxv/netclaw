@@ -363,8 +363,40 @@ public sealed class ToolAccessPolicy
     internal ToolAuthorizationDecision? ScreenDirectoryScopes(
         BashDirectoryScopeProjection proof,
         ToolExecutionContext context)
+        => ScreenScopedSlices(proof.Slices, context);
+
+    /// <summary>
+    /// Returns the literal twins of the Bash commands of a call (owner decision
+    /// F1). A command without twins keeps its own candidates.
+    /// </summary>
+    /// <remarks>
+    /// The caller must screen each twin with <see cref="ScreenLiteralTwins"/>
+    /// before it uses the twin candidates.
+    /// </remarks>
+    internal bool TryProjectLiteralTwins(
+        ShellCommandAnalysis analysis,
+        [NotNullWhen(true)] out BashLiteralTwinSlices? twins)
+        => BashLiteralTwinSlices.TryCreate(
+            analysis,
+            _shellCommandPolicy,
+            _shellApprovalMatcher,
+            out twins);
+
+    /// <summary>
+    /// Screens each literal twin as if the operator typed it: hard deny,
+    /// protected text, and file protection in the directory of the twin.
+    /// </summary>
+    /// <returns>The first denial of a twin. One denied twin denies the call.</returns>
+    internal ToolAuthorizationDecision? ScreenLiteralTwins(
+        BashLiteralTwinSlices twins,
+        ToolExecutionContext context)
+        => ScreenScopedSlices(twins.Slices, context);
+
+    private ToolAuthorizationDecision? ScreenScopedSlices(
+        IEnumerable<ScopedShellApprovalSlice> slices,
+        ToolExecutionContext context)
     {
-        foreach (var slice in proof.Slices)
+        foreach (var slice in slices)
         {
             var denial = ScreenHardDeny(slice.Analysis)
                 ?? ScreenProtectedShellText(slice.Analysis)
@@ -390,6 +422,15 @@ public sealed class ToolAccessPolicy
                 IsMessy = false
             }
             : approval;
+
+    /// <summary>
+    /// Replaces the candidates of each command that has literal twins with the
+    /// candidates of its screened twins.
+    /// </summary>
+    internal static ShellApprovalAnalysis WithLiteralTwins(
+        ShellApprovalAnalysis approval,
+        BashLiteralTwinSlices twins)
+        => twins.Apply(approval);
 
     /// <summary>Replaces the unresolved candidates with the candidates of a screened directory proof.</summary>
     internal static ShellApprovalAnalysis WithDirectoryScopes(
@@ -490,63 +531,363 @@ public sealed class ToolAccessPolicy
                 return ToolAuthorizationDecision.Deny("shell_working_directory_outside_trust_zone");
         }
 
+        var readOnly = ReadOnlyOccurrences(analysis);
         return EnforceKnownShellPaths(
             ShellPolicyPathFacts.CreateExecutionViews(analysis)
-                .SelectMany(EnumerateKnownShellPaths),
+                .SelectMany((view, index) => EnumerateKnownShellPaths(
+                    view,
+                    readOnly.Contains(analysis.Commands[index]))),
             context.Invocation);
     }
 
     /// <summary>
-    /// Applies conservative write protection to all paths in a shell policy projection.
+    /// Applies file protection to all paths in a shell policy projection: write
+    /// protection, and read protection for a read-only program (decision D6).
     /// </summary>
     /// <remarks>
     /// A causal list adds an intent view after shell preflight.
     /// The coordinator must call this method before it checks stored grants or reviewed-safe coverage.
     /// </remarks>
+    /// <param name="candidates">The path facts of each candidate, with its source occurrence.</param>
+    /// <param name="analyses">
+    /// The analyses that own the source occurrences: the call analysis and the
+    /// analysis of each literal twin. A twin gets the read rule of its typed literal.
+    /// </param>
+    /// <param name="context">The invocation that supplies the trusted roots.</param>
     internal ToolAuthorizationDecision? EnforceProjectedShellFileProtection(
-        IReadOnlyList<ShellPolicyCandidatePathFacts> pathFacts,
+        IReadOnlyList<(ShellPolicyCandidatePathFacts PathFacts, CommandOccurrence? Occurrence)> candidates,
+        IReadOnlyList<ShellCommandAnalysis> analyses,
         ToolInvocationContext context)
-        => EnforceKnownShellPaths(pathFacts.SelectMany(EnumerateKnownShellPaths), context);
+    {
+        var readOnly = new HashSet<CommandOccurrence>(ReferenceEqualityComparer.Instance);
+        foreach (var owner in analyses)
+            readOnly.UnionWith(ReadOnlyOccurrences(owner));
+
+        return EnforceKnownShellPaths(
+            candidates.SelectMany(candidate => EnumerateKnownShellPaths(
+                candidate.PathFacts,
+                candidate.Occurrence is { } occurrence && readOnly.Contains(occurrence))),
+            context);
+    }
+
+    /// <summary>
+    /// Judges each redirect of a command that runs no program (owner decision,
+    /// October 2026). Such a command gets no prompt for itself, so these
+    /// checks and the shell trust zone are its only gates.
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: the shell trust zone (<see cref="EnforceProjectedShellFileProtection"/>)
+    /// already applied the write rules to each known redirect target, as for
+    /// every shell path. This screen adds three checks. A redirect target that
+    /// is not proved denies the call. An input redirect (<c>&lt; file</c>)
+    /// opens the file for reading, so it must also pass the read rules of the
+    /// audience. A <c>Deny</c> mode of the file tool (<c>file_write</c>, or
+    /// <c>file_read</c> for an input redirect) denies the call, as it denies
+    /// the tool. <see cref="WithFileToolConsent"/> owns the <c>Approval</c> mode;
+    /// its exact candidate keeps the mark, so this screen judges it too.
+    /// </remarks>
+    /// <param name="candidates">The path facts of each candidate.</param>
+    /// <param name="context">The call context that supplies the audience profile.</param>
+    /// <returns>The first denial, or null.</returns>
+    internal ToolAuthorizationDecision? ScreenNoProgramRedirects(
+        IEnumerable<(ApprovalCandidate Candidate, ShellPolicyCandidatePathFacts PathFacts)> candidates,
+        ToolExecutionContext context)
+    {
+        foreach (var (candidate, pathFacts) in candidates)
+        {
+            if (!candidate.RunsNoProgram)
+                continue;
+
+            foreach (var fact in RedirectFacts(pathFacts))
+            {
+                if (fact.State != ShellPolicyPathResolutionState.Known)
+                    return DenyRedirect("shell_redirect_unproved", candidate.Verb, "Netclaw cannot prove the redirect target");
+
+                var read = fact.Source.RedirectMode == FileRedirectMode.Input;
+                foreach (var path in fact.Paths.Where(static path => !ShellRedirectPolicyFacts.IsNullDevice(path)))
+                {
+                    if (read
+                        && _pathAccessPolicy.EvaluateShellPath(path, context.Invocation, PathAccessPolicy.FileOperation.Read)
+                            is not PathAccessPolicy.PathAccessDecision.Allowed)
+                    {
+                        return DenyRedirect(
+                            "shell_redirect_read_denied",
+                            path.Value,
+                            "the file_read rules of this audience do not let the redirect read that path");
+                    }
+
+                    if (GetFileToolMode(read, path, context) == ToolApprovalMode.Deny)
+                    {
+                        return DenyRedirect(
+                            "shell_redirect_file_tool_denied",
+                            path.Value,
+                            $"this audience may not use {FileToolName(read)}, and a redirect gets the same decision");
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Returns each file tool call that a redirect of a command that runs no
+    /// program stands for, when that tool has the <c>Approval</c> mode for the
+    /// audience and the path.
+    /// </summary>
+    internal IReadOnlyList<FileToolCall> GetRedirectsThatNeedConsent(
+        ShellApprovalAnalysis approval,
+        ToolExecutionContext context)
+    {
+        if (!approval.Candidates.Any(static candidate => candidate.RunsNoProgram))
+            return [];
+
+        var facts = ShellPolicyPathFacts.Create(approval.Candidates, ShellEnvironment.PathStyle);
+        return approval.Candidates
+            .SelectMany((candidate, index) => candidate.RunsNoProgram
+                ? RedirectsThatNeedConsent(facts[index], context)
+                : [])
+            .Distinct()
+            .ToArray();
+    }
+
+    /// <summary>
+    /// Returns the consent request that the file tool itself makes for this
+    /// path. The authorizer asks the grant store with it, so a grant of the
+    /// file tool covers the redirect as it covers the tool.
+    /// </summary>
+    internal ToolApprovalContext BuildFileToolConsentRequest(FileToolCall call, ToolExecutionContext context)
+    {
+        var tool = new ToolName(call.Tool);
+        return BuildNonShellConsentRequest(
+                   tool,
+                   context,
+                   new Dictionary<string, object?> { ["Path"] = call.Path },
+                   SelectMatcherForTool(tool)).ApprovalContext
+               ?? throw new InvalidOperationException("The file tool consent request has no context.");
+    }
+
+    /// <summary>
+    /// Keeps a prompt for a command that runs no program when the file tool of
+    /// one of its redirects needs consent and no grant of that tool covers it.
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: a redirect is a file write (or a read) without the file tool.
+    /// When the operator set <c>file_write</c> or <c>file_read</c> to
+    /// <c>Approval</c>, the redirect must not skip that consent. The candidate
+    /// becomes exact: its name lists each write and read that needs consent,
+    /// the prompt shows the full command, and it offers only "Once" and
+    /// "Deny". The candidate keeps its mark, so
+    /// <see cref="ScreenNoProgramRedirects"/> still judges each redirect of
+    /// the command before the prompt.
+    /// </remarks>
+    /// <param name="approval">The candidates of the call.</param>
+    /// <param name="context">The call context that supplies the audience profile.</param>
+    /// <param name="granted">The file tool calls that a stored grant of the tool covers.</param>
+    internal ShellApprovalAnalysis WithFileToolConsent(
+        ShellApprovalAnalysis approval,
+        ToolExecutionContext context,
+        IReadOnlySet<FileToolCall> granted)
+    {
+        if (!approval.Candidates.Any(static candidate => candidate.RunsNoProgram))
+            return approval;
+
+        var facts = ShellPolicyPathFacts.Create(approval.Candidates, ShellEnvironment.PathStyle);
+        var candidates = approval.Candidates
+            .Select((candidate, index) =>
+            {
+                if (!candidate.RunsNoProgram)
+                    return candidate;
+
+                var names = RedirectsThatNeedConsent(facts[index], context)
+                    .Where(call => !granted.Contains(call))
+                    .Select(static call => $"{(call.Tool == FileReadTool.ToolName ? "read" : "write")} {call.Path}")
+                    .ToArray();
+                return names.Length == 0
+                    ? candidate
+                    : candidate with
+                    {
+                        Verb = string.Join(", ", names),
+                        VerbTokens = null,
+                        Unresolved = ShellUnresolvedPart.Command
+                    };
+            })
+            .ToArray();
+        return approval with { Candidates = Array.AsReadOnly(candidates) };
+    }
+
+    private IEnumerable<FileToolCall> RedirectsThatNeedConsent(
+        ShellPolicyCandidatePathFacts pathFacts,
+        ToolExecutionContext context)
+        => RedirectFacts(pathFacts)
+            .SelectMany(fact => fact.Paths
+                .Where(static path => !ShellRedirectPolicyFacts.IsNullDevice(path))
+                .Select(path => (Read: fact.Source.RedirectMode == FileRedirectMode.Input, Path: path)))
+            .Where(item => GetFileToolMode(item.Read, item.Path, context) == ToolApprovalMode.Approval)
+            .Select(static item => new FileToolCall(FileToolName(item.Read), item.Path.Value))
+            .Distinct();
+
+    private static string FileToolName(bool read) => read ? FileReadTool.ToolName : FileWriteTool.ToolName;
+
+    // The consent mode that the file tool has for this audience and path: the
+    // same admission and mode resolution as a call of the tool itself.
+    private ToolApprovalMode GetFileToolMode(bool read, CanonicalPath path, ToolExecutionContext context)
+    {
+        var tool = new ToolName(FileToolName(read));
+        return _profileResolver.IsToolAllowed(tool, context.Invocation)
+            ? GetApprovalMode(
+                tool,
+                context,
+                new Dictionary<string, object?> { ["Path"] = path.Value },
+                SelectMatcherForTool(tool))
+            : ToolApprovalMode.Deny;
+    }
+
+    // The file redirects of the real view and of a causal intent view.
+    private static IEnumerable<ShellPolicyResolvedPathFact> RedirectFacts(ShellPolicyCandidatePathFacts pathFacts)
+        => pathFacts.Real.Facts
+            .Concat(pathFacts.Intent?.Facts ?? [])
+            .Where(static fact => fact.Source.Origin == ShellPolicyPathOrigin.Redirect);
+
+    private static ToolAuthorizationDecision DenyRedirect(string reason, string target, string cause)
+        => ToolAuthorizationDecision.Deny(
+            reason,
+            $"Tool access denied: a redirect of the command uses '{target}', and {cause}. The call did not run.");
+
+    /// <summary>
+    /// Returns the occurrences of a Bash program that only reads its operands
+    /// (<see cref="ShellVerbPolicyData.ReadOnlyOperandVerbs"/>, decision D6).
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: the set is empty for unresolved or dynamic syntax, because a
+    /// function or an alias can replace the program. An occurrence with an
+    /// assignment prefix or a dynamic program word is never read-only. A redirect
+    /// that writes keeps write protection for its target only. Each argument must have a bounded value, so a
+    /// glob or an unknown value cannot read a path that no check sees.
+    /// </remarks>
+    private static HashSet<CommandOccurrence> ReadOnlyOccurrences(ShellCommandAnalysis analysis)
+    {
+        var occurrences = new HashSet<CommandOccurrence>(ReferenceEqualityComparer.Instance);
+        if (analysis.Environment.Grammar != ShellGrammar.Bash
+            || !analysis.IsResolved
+            || analysis.HasDynamicSyntax)
+        {
+            return occurrences;
+        }
+
+        foreach (var occurrence in analysis.Commands)
+        {
+            var directory = occurrence.WorkingDirectory is ShellValueDomain.Exact exact
+                ? exact.Value
+                : analysis.WorkingDirectory;
+            if (occurrence is { IsComplete: true, Assignments.Count: 0, Clause.Verb: { IsDynamic: false, Tokens: [var program, ..] } }
+                && ShellVerbPolicyData.ReadOnlyOperandVerbs.Contains(program)
+                && occurrence.Arguments.All(argument => IsReadOnlyOperand(argument, directory)))
+            {
+                occurrences.Add(occurrence);
+            }
+        }
+
+        return occurrences;
+    }
+
+    // SECURITY: each value must be bounded. A path gets a path fact. A plain word
+    // must have one value that names no entry of the occurrence directory: such a
+    // word (grep -r token config) is a path that no path fact sees, and its scope
+    // is not read below, so the occurrence is not read-only. The parser reports a
+    // brace word ({netclaw,secrets}.json) or an ANSI-C quoted word ($'\x73') as one
+    // exact value, but Bash expands it, so such a word is never a read-only operand.
+    private static bool IsReadOnlyOperand(AnalyzedArgument argument, string? directory)
+        => !ToolPathPolicy.HasUnmodeledExpansion(argument.Element.Raw)
+           && argument.Value is ShellValueDomain.Exact or ShellValueDomain.FiniteSet
+           && (argument.Argument.IsPath
+               || argument.Value is ShellValueDomain.Exact exact && !NamesEntry(exact.Value, directory));
+
+    // The one shared file-word rule of the approval matcher, the store, and the doctor.
+    private static bool NamesEntry(string word, string? directory)
+        => ShellGrantFileWords.NamesEntry(word, directory, out _);
 
     private ToolAuthorizationDecision? EnforceKnownShellPaths(
-        IEnumerable<CanonicalPath> paths,
+        IEnumerable<ShellPathAccess> paths,
         ToolInvocationContext context)
-        => paths
-            .Where(static path => !ShellRedirectPolicyFacts.IsNullDevice(path))
-            .DistinctBy(static path => (path.Style, path.Value))
-            .Any(path => _pathAccessPolicy.EvaluateShellPath(path, context) is not PathAccessPolicy.PathAccessDecision.Allowed)
-            ? ToolAuthorizationDecision.Deny("shell_path_outside_trust_zone")
-            : null;
+    {
+        foreach (var access in paths
+                     .Where(static access => !ShellRedirectPolicyFacts.IsNullDevice(access.Path))
+                     .DistinctBy(static access => (access.Path.Style, access.Path.Value, access.Read)))
+        {
+            if (IsShellPathAllowed(access, context))
+                continue;
 
-    private static IEnumerable<CanonicalPath> EnumerateKnownShellPaths(
-        ShellPolicyCandidatePathFacts candidate)
+            // The code only names the cause. Both codes deny, and no grant opens either one.
+            // shell_path_protected: the path or its link target is protected.
+            // shell_path_outside_trusted_roots: a bounded (Roots) profile does not hold the path.
+            return ToolAuthorizationDecision.Deny(
+                access.Path.IsHostStyle && _toolPathPolicy.FileSystem.IsProtected(access.Path.Value, PathOperation.Write)
+                    ? "shell_path_protected"
+                    : "shell_path_outside_trusted_roots");
+        }
+
+        return null;
+    }
+
+    // D6: a read-only program can read a write-protected path that a file tool
+    // may read. Its scopes and operands get read protection instead.
+    private bool IsShellPathAllowed(ShellPathAccess access, ToolInvocationContext context)
+        => _pathAccessPolicy.EvaluateShellPath(access.Path, context, PathAccessPolicy.FileOperation.Write) is PathAccessPolicy.PathAccessDecision.Allowed
+           || access.Read != ShellPathRead.None
+           && _pathAccessPolicy.EvaluateShellReadPath(access.Path, context, access.Read == ShellPathRead.Operand)
+               is PathAccessPolicy.PathAccessDecision.Allowed;
+
+    private static IEnumerable<ShellPathAccess> EnumerateKnownShellPaths(
+        ShellPolicyCandidatePathFacts candidate,
+        bool readOnly)
     {
         if (candidate.RealScope.Path is { } realScope)
-            yield return realScope;
+            yield return new ShellPathAccess(realScope, readOnly ? ShellPathRead.Scope : ShellPathRead.None);
 
-        foreach (var path in EnumerateKnownShellPaths(candidate.Real))
+        foreach (var path in EnumerateKnownShellPaths(candidate.Real, readOnly))
             yield return path;
 
         if (candidate.Intent is { } intent)
         {
-            foreach (var path in EnumerateKnownShellPaths(intent))
+            foreach (var path in EnumerateKnownShellPaths(intent, readOnly))
                 yield return path;
         }
     }
 
-    private static IEnumerable<CanonicalPath> EnumerateKnownShellPaths(
-        ShellPolicyResolvedPathView view)
+    private static IEnumerable<ShellPathAccess> EnumerateKnownShellPaths(
+        ShellPolicyResolvedPathView view,
+        bool readOnly)
     {
         if (view.ResolutionBase.Path is { } resolutionBase)
-            yield return resolutionBase;
+            yield return new ShellPathAccess(resolutionBase, readOnly ? ShellPathRead.Scope : ShellPathRead.None);
 
-        foreach (var path in view.Facts
-                     .Where(static fact => fact.State == ShellPolicyPathResolutionState.Known)
-                     .SelectMany(static fact => fact.Paths))
+        foreach (var fact in view.Facts.Where(static fact => fact.State == ShellPolicyPathResolutionState.Known))
         {
-            yield return path;
+            // A redirect that writes (cat cfg > /tmp/x) keeps write protection for its target.
+            var read = readOnly
+                       && (fact.Source.Origin != ShellPolicyPathOrigin.Redirect
+                           || fact.Source.RedirectMode == FileRedirectMode.Input)
+                ? ShellPathRead.Operand
+                : ShellPathRead.None;
+            foreach (var path in fact.Paths)
+                yield return new ShellPathAccess(path, read);
         }
     }
+
+    private enum ShellPathRead
+    {
+        /// <summary>The path gets write protection only.</summary>
+        None,
+
+        /// <summary>A scope of a read-only program: the working directory or a candidate folder.</summary>
+        Scope,
+
+        /// <summary>A path that a read-only program reads.</summary>
+        Operand,
+    }
+
+    private readonly record struct ShellPathAccess(CanonicalPath Path, ShellPathRead Read);
 
     internal ToolAuthorizationDecision? PreflightStructuredPathAccess(
         INetclawTool tool,
@@ -706,7 +1047,7 @@ public sealed class ToolAccessPolicy
     {
         var candidateVerbs = candidates
             .Select(static candidate => candidate.Verb)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Distinct(ApprovalPatternMatching.VerbTextComparer(candidates.FirstOrDefault()?.Shell))
             .ToList();
 
         var managedTemporaryRetry = context.Approval.ManagedTemporaryRetry;
@@ -772,23 +1113,6 @@ public sealed class ToolAccessPolicy
         return correction;
     }
 
-    internal ToolCorrection.ProjectDirectorySuggested? EvaluateShellProjectCorrection(
-        IReadOnlyList<ApprovalCandidate> candidates,
-        string? cwd,
-        ToolInvocationContext invocation)
-    {
-        if (_temporaryPathCorrectionPolicy.IsPlatformTemporaryRoot(cwd))
-            return null;
-
-        if (_safeVerbPolicy is null)
-            return null;
-
-        if (!_safeVerbPolicy.CanShortCircuitAfterProjectDeclaration(candidates, cwd, invocation))
-            return null;
-
-        return new ToolCorrection.ProjectDirectorySuggested(cwd!);
-    }
-
     internal ToolApprovalMode GetApprovalMode(
         ToolName toolName,
         ToolExecutionContext context,
@@ -835,7 +1159,7 @@ public sealed class ToolAccessPolicy
     {
         var candidateVerbs = unapprovedCandidates
             .Select(static candidate => candidate.Verb)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Distinct(ApprovalPatternMatching.VerbTextComparer(unapprovedCandidates.FirstOrDefault()?.Shell))
             .ToList();
         string? repository = null;
         IReadOnlyList<ToolApprovalOption> options;
@@ -1039,6 +1363,10 @@ public sealed class ToolAccessPolicy
         return options;
     }
 
+    /// <summary>The answers of a prompt that only one exact retry can satisfy: "Once" and "Deny".</summary>
+    internal static IReadOnlyList<ToolApprovalOption> OneShotApprovalOptions { get; } =
+        BuildApprovalOptions(ApprovalOptionProfile.OneShotOnly, includeRepository: false, hasAssignmentDigest: false);
+
     internal static bool HasAssignmentDigest(IReadOnlyList<ApprovalCandidate> candidates)
         => candidates.Any(static candidate =>
             candidate.AssignmentDigest is not null);
@@ -1203,6 +1531,11 @@ public sealed record FeatureGates(
     /// <summary>All subsystems enabled — used as the default when no gates are supplied.</summary>
     public static readonly FeatureGates AllEnabled = new();
 }
+
+/// <summary>One call of a file tool that a shell redirect stands for.</summary>
+/// <param name="Tool">The file tool name: <c>file_write</c> or <c>file_read</c>.</param>
+/// <param name="Path">The canonical redirect target.</param>
+internal readonly record struct FileToolCall(string Tool, string Path);
 
 /// <summary>
 /// Context for an approval-gated tool invocation. Contains the information

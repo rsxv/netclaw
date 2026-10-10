@@ -223,8 +223,9 @@ procedure, cost limits, and expansion criteria.
 
 When adding or changing properties on any `*Config` type in `Netclaw.Configuration`,
 update `src/Netclaw.Configuration/Schemas/netclaw-config.v1.schema.json` in the same PR.
-The schema uses `"additionalProperties": false` throughout — any new property that is
-missing from the schema will be rejected by `ConfigSchemaDoctorCheck` at runtime.
+Most schema objects set `"additionalProperties": false`, so a new property that is missing from the
+schema is rejected by `ConfigSchemaDoctorCheck` at runtime, and `netclaw doctor --fix` deletes it
+without a backup. Provider entries under `Providers` stay open because the binder ignores key case.
 
 **Migration-friendly schema changes:** `netclaw doctor --fix` uses `SchemaFixResolver` to
 auto-fix common schema validation errors. To ensure smooth upgrades for existing configs:
@@ -371,6 +372,21 @@ each other. Otherwise, open one PR.
   - Use Akka.TestKit's `AwaitAssertAsync` for polling assertions on async state.
   - `Task.Delay` in fake/mock services to simulate latency is acceptable only in
     the fake itself, never in test orchestration logic.
+- **A test MUST delete every file and folder that it creates in the temp
+  directory.** Use `DisposableTempDir` or `TestSessionTempDirectory`. Delete
+  the path in `Dispose`. A `TestKit` class has `IAsyncDisposable`, so xunit
+  does not call its `IDisposable.Dispose`. `TestKit` also stops its actor system
+  after `AfterAllAsync` returns, and it fails the test when `AfterAllAsync`
+  takes more than 5 seconds. A `TestKit` class that owns a temp folder MUST
+  re-implement `IAsyncDisposable.DisposeAsync`. It calls `base.DisposeAsync()`,
+  and then deletes the folder. A class that derives from `LlmSessionTestBase`
+  overrides `DeleteOwnedDirectories` instead. `TestKitTeardownGuardTests` fails
+  when an `AfterAllAsync` override deletes or disposes. Each test process gets
+  a private temp root
+  (`tests/Shared/TestRunTempRoot.cs`). The test run fails with "Test Assembly
+  Cleanup Failure" when a test leaves an entry in that root. The CI log prints
+  the leaks. A test project opts in with
+  `<UseTestRunTempRoot>true</UseTestRunTempRoot>`.
 - **TUI / Termina changes MUST be validated with the native smoke
   harness** before being marked done. xUnit cannot drive Spectre-style
   prompts, and the non-interactive smoke scenarios only cover the
@@ -403,24 +419,20 @@ must be fixed or explicitly baselined with justification.
 
 ## Eval Suite
 
-Run the behavioral eval suite (`./evals/run-evals.sh`) when changing:
+Run the behavioral eval suite (`./evals/run-evals.sh`) only when changing
+the prompt or identity grounding that the agent reads:
 
 - Identity file templates (`SOUL.md`, `AGENTS.md`, `TOOLING.md` in init wizard)
 - System prompt assembly (`SystemPromptAssembler`, `FileSystemPromptProvider`)
 - Skill content (any `SKILL.md` under `feeds/skills/.system/files/`)
 - Skill matching logic (`SkillRegistry` keyword handling)
-- Memory pipeline (`SQLiteMemoryRecallCoordinator`, `MemoryProposalGate`,
-  checkpoint triggers)
-- Compaction logic (`ObservationPromptBuilder`, `ExtractiveSessionReducer`,
-  compaction behavior)
-- Tool definitions (new tools, changed tool schemas, grant categories)
-- Model/provider changes (switching models, changing context window config)
-- `SessionConfig` defaults
+
+Do not run the eval suite for other changes. For those changes, the normal
+test gates in Definition of Done apply.
 
 Update eval cases when:
 
 - Adding a new system skill — add a skill auto-load case
-- Adding a new tool — add a tool discovery/use case
 - Changing identity grounding rules — update identity assertion patterns
 - A production session exhibits a new failure pattern — add a regression case
 
@@ -483,7 +495,7 @@ Done means all of the following are true:
 - operational impact is documented (runbooks or CLI help)
 - OpenSpec artifacts are updated or archived appropriately
 - system skills updated if a mapped feature area was changed (see table above)
-- eval suite passes for changes to identity, skills, memory, or tools (see
+- eval suite passes for changes to identity or skill grounding (see
   Eval Suite section)
 - interactive tape harness passes for changes to Termina TUI surfaces
   (init wizard, model/provider/webhook pickers, chat page) — see

@@ -70,7 +70,7 @@ internal sealed class ShellPolicyCoordinator(
         if (preflight is ShellPolicyPreflightResult.Continue { DirectoryScopes.IsCausalList: true })
         {
             // A causal list received one-call advice before its candidates came from the
-            // directory proof. It keeps that advice, and it gets no project advice.
+            // directory proof. It keeps that advice.
             candidates = [];
             isMessy = true;
         }
@@ -90,12 +90,12 @@ internal sealed class ShellPolicyCoordinator(
             isMessy = approval.IsMessy;
         }
 
-        // Relocation changes the directory, so project advice for the original directory no longer applies.
+        // Relocation changes the directory, so other advice for the original directory no longer applies.
         var temporary = policy.EvaluateShellTemporaryCorrection(analysis, candidates, toolCall.Arguments, context.Invocation);
         if (temporary is not null)
             return temporary;
 
-        // Project advice applies to shell calls. The replacement native tool must pass its own policy checks.
+        // One-call directory advice applies to shell calls. The replacement native tool must pass its own policy checks.
         if (native is not null)
             return null;
 
@@ -107,7 +107,7 @@ internal sealed class ShellPolicyCoordinator(
                 ? null
                 : SelectOneCallDirectoryCorrection(analysis, toolCall, context);
 
-        return GetAvailableProjectCorrection(candidates, analysis.WorkingDirectory, context.Invocation);
+        return null;
     }
 
     private static ToolCorrection.ShellWorkingDirectorySuggested? SelectOneCallDirectoryCorrection(
@@ -151,27 +151,6 @@ internal sealed class ShellPolicyCoordinator(
         return new ToolCorrection.ShellWorkingDirectorySuggested(target.Value);
     }
 
-    private ToolCorrection.ProjectDirectorySuggested? GetAvailableProjectCorrection(
-        IReadOnlyList<ApprovalCandidate> candidates,
-        string? workingDirectory,
-        ToolInvocationContext invocation)
-    {
-        var project = policy.EvaluateShellProjectCorrection(candidates, workingDirectory, invocation);
-        if (project is null)
-            return null;
-
-        if (registry.GetByName(SetWorkingDirectoryTool.ToolName) is not SetWorkingDirectoryTool declaration)
-            return null;
-
-        if (!policy.IsToolExposed(declaration, invocation))
-            return null;
-
-        if (!declaration.CanDeclare(project.Directory, invocation))
-            return null;
-
-        return project;
-    }
-
     /// <summary>
     /// Covers the candidates of a resolved shell call: one batched stored-grant
     /// lookup, then the side-effect exemption, then (interactive only) the
@@ -209,8 +188,14 @@ internal sealed class ShellPolicyCoordinator(
             // A pure side effect has no directory and no assignment, so its
             // exemption does not depend on the role. The causal list role keeps
             // a directory change and its action uncovered; it does not change echo.
+            // Owner decision (October 2026): a command that runs no program
+            // is exempt too. The authorizer already judged each redirect of
+            // such a command with the file rules and the file tool modes of
+            // the audience (ToolAccessPolicy.ScreenNoProgramRedirects), so a
+            // grant or an answer can add no fact.
             foreach (var candidate in evaluation.Candidates.Where(static item =>
-                         ApprovalPatternMatching.IsPureSideEffect(item.Candidate)))
+                         ApprovalPatternMatching.IsPureSideEffect(item.Candidate)
+                         || item.Candidate is { RunsNoProgram: true, Unresolved: ShellUnresolvedPart.None }))
             {
                 evaluation.Cover(candidate, Coverage.Exempt.Instance);
             }
@@ -269,8 +254,11 @@ internal sealed class ShellPolicyCoordinator(
                 return true;
 
             // A candidate with no parser verb (a redirect-only clause) has no
-            // command identity at all, as before: exact approval only.
+            // command identity at all, as before: exact approval only. A
+            // proved redirect-only command runs no program, so the file rules
+            // judge it instead.
             if (candidate.Candidate.VerbTokens is null
+                && !candidate.Candidate.RunsNoProgram
                 && candidate.SourceOccurrence is { Clause.Verb.Tokens.Count: 0 })
             {
                 return true;
@@ -307,6 +295,14 @@ internal sealed class ShellPolicyCoordinator(
             // unusable input keeps failing closed.
             if (candidate.Candidate.VerbTokens is not { } tokens)
             {
+                // A redirect-only command has no parser verb. It never asks
+                // for a grant, so it needs no command identity.
+                if (candidate.Candidate.RunsNoProgram
+                    && candidate.SourceOccurrence is { Clause.Verb.Tokens.Count: 0 })
+                {
+                    continue;
+                }
+
                 if (candidate.SourceOccurrence?.Clause.Verb.Tokens is not { Count: > 0 } parserTokens
                     || parserTokens.Any(static token => token.Length == 0))
                 {
@@ -450,31 +446,52 @@ internal sealed class ShellPolicyCoordinator(
     }
 
     /// <summary>
-    /// Returns a rewrite correction when an uncovered candidate has Unknown
-    /// command words and every such candidate has a cause that the model can
-    /// fix (a bare glob, or in Bash an expansion, brace list, or word
-    /// splitting). Returns null otherwise, so a dynamic program name or a
+    /// Returns a rewrite correction when an uncovered candidate has a cause
+    /// that the model can fix. A candidate with Unknown command words gets the
+    /// command-words rewrite (a bare glob, or in Bash a brace list or a word
+    /// with a proved value). A word with a run-time value has no literal
+    /// form, so it gets no rewrite. A candidate with known command words that is exact
+    /// only because a word can glob with an unknown value gets the quote
+    /// correction. Returns null otherwise, so a dynamic program name or a
     /// PowerShell script block keeps the one-time prompt or the denial.
     /// </summary>
     /// <remarks>
     /// SECURITY: the correction grants no authority. The call does not run and
     /// does not prompt. The rewritten call passes normal approval. A candidate
     /// that other coverage (reviewed-safe, approval-exempt output) already
-    /// covers needs no command words, so it never causes a correction.
+    /// covers needs no command words, so it never causes a correction. In
+    /// double quotes, the word gets no pathname expansion, so its unknown value
+    /// is one operand: decision D1 then lets only a grant for anywhere cover it.
+    /// The rule reads general shell facts only, never the grammar of a program.
     /// </remarks>
     internal static ToolCorrectionCollection? SelectCommandWordsCorrection(
         IReadOnlyList<ShellPolicyCandidate> uncovered)
     {
-        ToolCorrection.ShellCommandWordsRewriteSuggested? correction = null;
+        ToolCorrection? correction = null;
         foreach (var candidate in uncovered)
         {
             // A rewrite of the words cannot prove a directory, a redirect, a
-            // link, or a glob scope, so such a call keeps its prompt.
-            if (candidate.Candidate.Unresolved == ShellUnresolvedPart.Command)
+            // link, or a glob scope, so such a call keeps its prompt. A word
+            // that can glob with an unknown value is the exception: the rewrite
+            // can remove it.
+            if (candidate.Candidate.Unresolved == ShellUnresolvedPart.Command
+                && !candidate.Candidate.WordRewriteCanResolve)
                 return null;
 
             if (candidate.Candidate.VerbTokens is not null)
+            {
+                if (!candidate.Candidate.WordRewriteCanResolve)
+                    continue;
+
+                if (candidate.SourceOccurrence is not { } source
+                    || ShellCommandAnalysis.GetUnboundedPathnameExpansionWords(source) is not { Count: > 0 } words)
+                {
+                    return null;
+                }
+
+                correction ??= new ToolCorrection.ShellWordQuoteSuggested(words);
                 continue;
+            }
 
             if (candidate.SourceOccurrence is not { } occurrence
                 || candidate.Candidate.Shell is not { } shell

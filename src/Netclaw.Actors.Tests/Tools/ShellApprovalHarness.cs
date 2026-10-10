@@ -53,9 +53,10 @@ internal enum ApprovalCorrection
 {
     ManagedTemporaryDirectory,
     NativeTool,
-    ProjectDirectory,
     ShellWorkingDirectory,
-    ShellCommandWords
+    ShellCommandWords,
+    ShellWordQuote,
+    ShellCommandTooLongToShow
 }
 
 /// <summary>
@@ -81,6 +82,9 @@ internal sealed record ApprovalPromptObservation(
 {
     /// <summary>The command text that a channel shows to the operator.</summary>
     public string DisplayText { get; init; } = string.Empty;
+
+    /// <summary>The patterns that a channel lists when the prompt has no candidate verb.</summary>
+    public IReadOnlyList<string> Patterns { get; init; } = [];
 
     /// <summary>The button labels, in the same order as <see cref="OptionKeys"/>.</summary>
     public IReadOnlyList<string> OptionLabels { get; init; } = [];
@@ -260,8 +264,47 @@ internal sealed class ShellApprovalHarness : IAsyncDisposable
     {
         var rootDirectory = Path.Combine(
             CanonicalTemporaryDirectory(),
-            "netclaw-approval-matrix",
-            Guid.NewGuid().ToString("N"));
+            $"netclaw-approval-matrix-{Guid.NewGuid():N}");
+        try
+        {
+            return await CreateInRootAsync(
+                rootDirectory,
+                caseId,
+                invocation,
+                approvals,
+                actorSystem,
+                ct,
+                timeProvider,
+                scope,
+                safeVerbs,
+                deniedPaths,
+                shellApprovalMode,
+                policy);
+        }
+        catch
+        {
+            // A harness that fails to build has no owner to dispose it. Some
+            // cases expect that failure, for example an invalid override file.
+            if (Directory.Exists(rootDirectory))
+                Directory.Delete(rootDirectory, recursive: true);
+            throw;
+        }
+    }
+
+    private static async Task<ShellApprovalHarness> CreateInRootAsync(
+        string rootDirectory,
+        string caseId,
+        ShellApprovalInvocation invocation,
+        ApprovalState approvals,
+        ActorSystem actorSystem,
+        CancellationToken ct,
+        TimeProvider? timeProvider,
+        ShellApprovalHarnessScope? scope,
+        SafeVerbList? safeVerbs,
+        IReadOnlyList<string>? deniedPaths,
+        ToolApprovalMode? shellApprovalMode,
+        ShellApprovalHarnessPolicy? policy)
+    {
         var projectDirectory = Path.Combine(rootDirectory, "project");
         var sessionDirectory = Path.Combine(rootDirectory, "session");
         var externalDirectory = Path.Combine(rootDirectory, "workspaces", "external");
@@ -451,7 +494,7 @@ internal sealed class ShellApprovalHarness : IAsyncDisposable
             paths,
             environment,
             config,
-            DaemonToolPathPolicyFactory.Create(paths, environment),
+            DaemonToolPathPolicyFactory.Create(paths, environment, HarnessSkillFeeds),
             SafeVerbLoader.Load(environment.Platform == ShellPlatform.Windows),
             TimeProvider.System);
 
@@ -484,6 +527,12 @@ internal sealed class ShellApprovalHarness : IAsyncDisposable
         services.AddDaemonToolExecutor(registry, policy);
     }
 
+    /// <summary>One configured server feed, so that its sync state files are protected as in the daemon.</summary>
+    internal static SkillFeedsConfig HarnessSkillFeeds { get; } = new()
+    {
+        Feeds = [new SkillFeedSource { Name = "team", Url = "https://skills.example.test/" }]
+    };
+
     // The daemon protects the control plane of its Netclaw home. A Windows host
     // case runs on any host, so it uses one Windows protected path instead.
     // A case that names its own protected paths uses only those paths.
@@ -497,7 +546,7 @@ internal sealed class ShellApprovalHarness : IAsyncDisposable
 
         return environment.Platform == ShellPlatform.Windows
             ? new ToolPathPolicy(environment, [@"C:\protected\config"])
-            : DaemonToolPathPolicyFactory.Create(paths, environment);
+            : DaemonToolPathPolicyFactory.Create(paths, environment, HarnessSkillFeeds);
     }
 
     private static FunctionCallContent CreateShellCall(
@@ -686,10 +735,11 @@ internal sealed class ShellApprovalHarness : IAsyncDisposable
             AgentCorrectionTarget = decision.AgentCorrection switch
             {
                 ToolCorrection.ShellWorkingDirectorySuggested suggestion => suggestion.Directory,
-                ToolCorrection.ProjectDirectorySuggested suggestion => suggestion.Directory,
                 ToolCorrection.NativeToolSuggested suggestion => suggestion.ToolName.Value,
                 ToolCorrection.ManagedTemporaryDirectorySuggested suggestion => suggestion.Target.ManagedTemporaryDirectory,
                 ToolCorrection.ShellCommandWordsRewriteSuggested suggestion => suggestion.Rewrite.ToString(),
+                ToolCorrection.ShellWordQuoteSuggested quote => string.Join(' ', quote.Words),
+                ToolCorrection.ShellCommandTooLongToShow tooLong => tooLong.Length.ToString(CultureInfo.InvariantCulture),
                 _ => null
             },
             PlatformTemporaryRoot = decision.AgentCorrection is ToolCorrection.ManagedTemporaryDirectorySuggested temporary
@@ -699,12 +749,22 @@ internal sealed class ShellApprovalHarness : IAsyncDisposable
     }
 
     private static ApprovalPromptObservation ObservePrompt(ToolApprovalContext approvalContext)
-        => new(
+    {
+        // Owner decision (October 2026): a consent request that names nothing
+        // is a defect. Every test that observes a prompt fails loudly here.
+        if (approvalContext.CandidateVerbs.Count == 0 && approvalContext.Patterns.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"The consent request for '{approvalContext.DisplayText}' has no displayable candidate.");
+        }
+
+        return new(
             approvalContext.CandidateVerbs,
             approvalContext.IsMessy,
             approvalContext.Options.Select(option => option.Key.Value).ToList())
         {
             DisplayText = approvalContext.DisplayText,
+            Patterns = approvalContext.Patterns,
             OptionLabels = approvalContext.Options.Select(option => option.Label).ToList(),
             CandidateDirectories = approvalContext.Candidates?
                 .Select(candidate => candidate.Directory)
@@ -712,6 +772,7 @@ internal sealed class ShellApprovalHarness : IAsyncDisposable
             Cwd = approvalContext.Cwd,
             OneTimeApprovalKeys = OneTimeApprovalKeys.Create(approvalContext)
         };
+    }
 
     internal static ApprovalOutcome ObserveOutcome(
         AuthorizationDecision decision)
@@ -745,9 +806,10 @@ internal sealed class ShellApprovalHarness : IAsyncDisposable
             null => null,
             ToolCorrection.ManagedTemporaryDirectorySuggested => ApprovalCorrection.ManagedTemporaryDirectory,
             ToolCorrection.NativeToolSuggested => ApprovalCorrection.NativeTool,
-            ToolCorrection.ProjectDirectorySuggested => ApprovalCorrection.ProjectDirectory,
             ToolCorrection.ShellWorkingDirectorySuggested => ApprovalCorrection.ShellWorkingDirectory,
             ToolCorrection.ShellCommandWordsRewriteSuggested => ApprovalCorrection.ShellCommandWords,
+            ToolCorrection.ShellWordQuoteSuggested => ApprovalCorrection.ShellWordQuote,
+            ToolCorrection.ShellCommandTooLongToShow => ApprovalCorrection.ShellCommandTooLongToShow,
             _ => throw new ArgumentOutOfRangeException(
                 nameof(correction), correction, "Unknown approval correction.")
         };
@@ -780,9 +842,13 @@ internal sealed class ShellApprovalHarness : IAsyncDisposable
 
     /// <summary>Writes one persistent shell grant, for example a legacy entry from an older store.</summary>
     public void AddStoredShellEntry(TrustAudience audience, ApprovalEntry entry)
+        => AddStoredEntry(audience, ShellTool.ToolName, entry);
+
+    /// <summary>Writes one persistent grant of any tool.</summary>
+    public void AddStoredEntry(TrustAudience audience, string toolName, ApprovalEntry entry)
     {
         var change = _services.GetRequiredService<ToolApprovalStore>()
-            .TryAddApprovals(audience, ShellTool.ToolName, [entry]);
+            .TryAddApprovals(audience, toolName, [entry]);
         if (change is not ApprovalStoreChangeResult.Completed { ChangeCount: 1 })
             throw new InvalidOperationException($"The store did not save the seed grant: {change}.");
     }
@@ -846,11 +912,18 @@ internal sealed class ShellApprovalHarness : IAsyncDisposable
     {
         // Same reason as the seed-phase stop above: the budget bounds a
         // multi-hop teardown under a starved CI scheduler, not correctness.
-        if (_approvalActor.StartedActor is { } actor)
-            await actor.GracefulStop(TimeSpan.FromSeconds(15));
-        await _services.DisposeAsync();
-        if (Directory.Exists(_rootDirectory))
-            Directory.Delete(_rootDirectory, recursive: true);
+        try
+        {
+            if (_approvalActor.StartedActor is { } actor)
+                await actor.GracefulStop(TimeSpan.FromSeconds(15));
+            await _services.DisposeAsync();
+        }
+        finally
+        {
+            // A failed stop must not leave the case directory in the temp root.
+            if (Directory.Exists(_rootDirectory))
+                Directory.Delete(_rootDirectory, recursive: true);
+        }
     }
 
     private static ToolConfig CreateConfig(

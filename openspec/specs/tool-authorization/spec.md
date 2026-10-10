@@ -30,7 +30,8 @@ inbound adapter -> turn context (audience, requester)          durable in the se
   -> shell only: analyze with ShellSyntaxTree
   -> screen: hard deny, protected paths, path access decision    call-local
   -> cover each candidate: one-time, chat grant, persistent
-     grant, reviewed-safe, approval-exempt output command        store is durable
+     grant, reviewed-safe, approval-exempt output command,
+     command that runs no program                                 store is durable
   -> outcome: Allowed | RequiresAgentCorrection
               | RequiresApproval | Denied
   -> RequiresApproval: no operator -> fixed denial text
@@ -82,7 +83,7 @@ document in the same diff.
 | TA-3 | `ToolAuthorizationMutationTests` (tool authorization mutation gate), `McpToolAudienceGrantsTests`, `ToolAudienceProfileDefaultsTests` |
 | TA-4 | `ToolApprovalConfigTests`, `SecurityPolicyDefaultsTests`, `ToolApprovalGateTests` |
 | TA-5 | Catalog deny rows with 0 approval service calls (`ShellApprovalDispositionMatrixTests`), `ToolAuthorizationMutationTests.Shell_hard_denial_prevents_dispatch_despite_approval`, `DispatchingToolExecutorLaunchTests`, `HardDenyParityCorpusTests`, `GlobPolicyMutationTests` (bound values), the shell analysis mutation gate (daemon kill pattern) |
-| TA-6 | `ToolPathPolicyTests`, `UnattendedPathAccessTests`, `PublicAudienceFileAccessPolicyTests`, `PathAccessPolicyMutationTests` (path access mutation gate), `DaemonToolPathPolicyFactoryTests`, `GlobPolicyMutationTests` (D5 glob match and link walk) |
+| TA-6 | `ToolPathPolicyTests`, `UnattendedPathAccessTests`, `PublicAudienceFileAccessPolicyTests`, `PathAccessPolicyMutationTests` (path access mutation gate), `DaemonToolPathPolicyFactoryTests`, `GlobPolicyMutationTests` (D5 glob match and link walk), `ShellConfigReadTests` (D6 gate), `ToolAuthorizerOrderMutationTests` with `scripts/run-shell-config-read-mutations.sh` (D6 mutation gate) |
 | TA-7 | `ShellApprovalDispositionMatrixTests` with `ShellApprovalCaseCatalog`, `MessyCommandOneTimeApprovalTests`, `ShellCommandAnalysisTests`, `PerCommandJudgmentMutationTests` (D1), `GlobPolicyMutationTests`, the shell analysis and shell assignment mutation gates |
 | TA-8 | `ToolApprovalActorTests`, `RepositoryWorktreeApprovalTests`, `ApprovalDirectoryMutationTests` (approval directory mutation gate), `ReviewedSafeShellPolicyTests`, `PathAccessPolicyMutationTests` (interactive read branch), `ApprovalPatternV3Tests` and `SubcommandEverywhereGrantTests` (legacy grant words) |
 | TA-9 | `DispatchingToolExecutorTests` correction cases, `SessionToolExecutionPipelineTests`, `ToolCorrectionDeliveryTests`, `TemporaryPathCorrectionPolicyTests` |
@@ -390,7 +391,9 @@ keeps them call-local.
 
 A file tool SHALL get its filesystem authority only from a path access
 decision for its exact file operation (`Read`, `Write`, `Attach`, or
-`DeclareProjectScope`). A shell path SHALL use the `Write` operation. The
+`DeclareProjectScope`). A shell path SHALL use the `Write` operation, except
+that a Bash program that only reads its operands SHALL get `Read` protection
+for a write-protected path (owner decision D6). The
 decision SHALL apply, in order: the canonical path, the audience root catalog,
 the link check, then protection.
 
@@ -416,18 +419,44 @@ the link check, then protection.
 - A path through a link that leaves the root SHALL be denied. A path whose
   base has a link ancestor SHALL be denied, and Netclaw SHALL NOT try another
   base.
-- Protection SHALL depend on the operation. The
+- Protection SHALL depend on the operation. Each file under the config
+  directory is
   [ordinary configuration](../../../docs/spec/GLOSSARY.md#ordinary-configuration)
-  files `netclaw.json` and the grant store `tool-approvals.json` SHALL be
-  readable by a file tool (owner decision D6). Secrets (`secrets.json`), keys,
-  webhook secrets, `daemon.env`, device state, bootstrap state, the hard-deny
-  override file, the database, and process-control files SHALL be
-  read-denied. The config directory, secrets, keys, the database, process
-  control files, system skills, and server feeds SHALL be write-denied.
-- Shell text that names the config directory, secrets, webhooks, keys, the
-  database, or process-control files SHALL be denied. This includes
-  `netclaw.json` and `tool-approvals.json`, because shell text cannot show a
-  read from a write. The agent reads these files with `file_read`.
+  and SHALL be readable by a file tool (owner decision D6), except
+  `secrets.json` and the webhook route files, which hold the verification
+  secret. This includes `netclaw.json`, the grant store `tool-approvals.json`,
+  `daemon.env`, device state, bootstrap state, and the hard-deny override
+  file. Secrets (`secrets.json`), webhook route files, keys, the database,
+  process-control files, and the tooling shadow SHALL be read-denied. The config directory, secrets, keys, the database, process
+  control files, and the tooling shadow SHALL be write-denied. The system
+  skill folder and the server feed folder SHALL NOT be protected (owner
+  decision, 2026-10-05): skills are agent guidance, as the identity files
+  are, and not control plane. The sync state files of each configured
+  server feed (skills and sub-agents) are integrity records and SHALL stay
+  write-denied; a file tool MAY read them. The shell and the file tools SHALL
+  use the same protected-path list.
+- Shell text that names secrets, webhook route files, keys, the database, or
+  process-control files SHALL be denied. Shell text that names the config
+  directory SHALL be denied. Only an exact path argument of a read-only shell
+  program that names one file below the config directory SHALL leave this
+  text check. A `..` segment, a glob, a brace word, the directory itself, and
+  program text (a `jq` module search path, `python3 -c`, `node -e`) SHALL keep
+  the denial. The check SHALL also see the directory in each spelling: with
+  `//`, `/./`, or `name/../` in the text, and in the unquoted value of a word
+  whose quotes split the name.
+- A read-only shell program SHALL be one of the policy-data programs `cat`,
+  `head`, `tail`, `wc`, `grep`, `jq`, and `diff`, with bounded argument
+  values and no assignment prefix. A redirect that writes SHALL keep `Write`
+  protection for its target only, and a null-device redirect SHALL be
+  ignored. A plain
+  argument word that names an entry of the command's directory, or a word
+  with a brace, SHALL make the program not read-only. Such a program SHALL get
+  `Read` protection only for a path that the write list protects. A
+  write-protected directory operand that holds a read-denied path SHALL stay
+  denied. Known gap (issue #2341): a recursive or brace read that names only a
+  parent of the config directory is not denied by this rule. Each other shell program SHALL keep
+  `Write` protection for each path, so each write to a config file stays
+  denied.
 - Owner decision D5 (option A): a shell glob word that can match a protected
   shell path, the default credential store (`~/.netclaw/keys`,
   `~/.netclaw/config/secrets.json`), or a directory that contains one, SHALL
@@ -443,6 +472,11 @@ the link check, then protection.
   decision of the literal value.
 - Allow checks SHALL compare paths with ordinal case except on Windows. Deny
   checks SHALL ignore case.
+- A shell path that file protection denies SHALL get the reason
+  `shell_path_protected` when the path, or its link target, is a
+  write-protected path. Otherwise it SHALL get the reason
+  `shell_path_outside_trusted_roots`: a bounded (`Roots`) profile does not hold
+  the path.
 - A path access denial SHALL be terminal and SHALL NOT reveal root paths to a
   Public session. No grant SHALL replace a path access denial, attended or
   unattended.
@@ -451,9 +485,8 @@ the link check, then protection.
   paths of a shell call from the command analysis, independent of approval
   candidates, and SHALL check known causal-intent and fallback paths before
   stored or reviewed-safe coverage.
-- A readable `netclaw.json` or `tool-approvals.json` SHALL NOT imply write,
-  edit, attach, or shell authority. Secret values SHALL live only in protected
-  stores.
+- A readable config file SHALL NOT imply write, edit, attach, or other shell
+  authority. Secret values SHALL live only in protected stores.
 
 Owner: `PathAccessPolicy` owns the path access decision, and its result is
 call-local. `ToolPathPolicy` owns protection and the D5 glob match
@@ -461,12 +494,43 @@ call-local. `ToolPathPolicy` owns protection and the D5 glob match
 read, write, and shell lists come from `DaemonToolPathPolicyFactory` and are
 process-local. No state of these checks is durable.
 
+#### Scenario: Each config file but the secrets is readable
+
+- **GIVEN** an interactive Personal session
+- **WHEN** the model calls `file_read` on `netclaw.json`, `tool-approvals.json`, or `hard-deny-overrides.json`
+- **THEN** the path access decision allows the read
+- **AND** a `shell_execute` call with `cat <config dir>/hard-deny-overrides.json` is not denied
+
+#### Scenario: A shell write to a config file stays denied
+
+- **GIVEN** an interactive Personal session
+- **WHEN** the model calls `shell_execute` with `cp other.json <config dir>/hard-deny-overrides.json`, `echo x > <config dir>/netclaw.json`, or `sort -o <config dir>/netclaw.json <config dir>/netclaw.json`
+- **THEN** authorization returns `Denied`
+
 #### Scenario: Ordinary config is readable but not by shell text
 
 - **GIVEN** an interactive Personal session
 - **WHEN** the model calls `file_read` on `netclaw.json` or on `tool-approvals.json`
 - **THEN** the path access decision allows the read
-- **AND** a `shell_execute` call with `cat <config dir>/netclaw.json` is denied with `shell_references_protected_path`
+- **AND** a `shell_execute` call whose text names the whole config directory (`grep -r token <config dir>` or `cat <config dir>/*.json`) is denied
+
+#### Scenario: Program text that names the config directory stays denied
+
+- **GIVEN** an interactive Personal session
+- **WHEN** the model calls `shell_execute` with `jq -n 'import "secrets" as $s {search: "<config dir>"}; $s'`
+- **THEN** authorization returns `Denied`
+
+#### Scenario: A harmless redirect does not deny a config read
+
+- **GIVEN** an interactive Personal session
+- **WHEN** the model calls `shell_execute` with `grep -n port <config dir>/netclaw.json 2>/dev/null`
+- **THEN** the call is not denied
+
+#### Scenario: Webhook route files stay read-denied
+
+- **GIVEN** an interactive Personal session
+- **WHEN** the model calls `file_read` on a file in the webhooks directory, or `shell_execute` with `cat <config dir>/webhooks/<route>.json`
+- **THEN** the read is denied
 
 #### Scenario: Secrets stay read-denied
 
@@ -485,7 +549,7 @@ process-local. No state of these checks is durable.
 - **GIVEN** an interactive Personal session with a grant for anywhere for `cat` (catalog case `glob-credential-keys-denied-as-literal`)
 - **WHEN** the model calls `shell_execute` with `cat ~/.netclaw/k*/*.xml`
 - **THEN** authorization returns `Denied` with reason `shell_references_protected_path`
-- **AND** `cat ~/.netclaw/*/secrets.json` and `cat ~/.netclaw/*/tool-approvals.json` are denied with the same reason
+- **AND** `cat ~/.netclaw/*/secrets.json` is denied with the same reason
 
 #### Scenario: A glob that cannot match a protected path is not denied
 
@@ -535,8 +599,22 @@ process-local. No state of these checks is durable.
 #### Scenario: A grant never opens a protected path
 
 - **GIVEN** an unattended Personal run in Approval mode and a grant for `cat`
-- **WHEN** the model calls `shell_execute` with `cat <config dir>/netclaw.json`
+- **WHEN** the model calls `shell_execute` with `cat <config dir>/secrets.json`
 - **THEN** the call is denied
+
+#### Scenario: A brace word keeps the denial
+
+- **GIVEN** a Personal run, attended or unattended
+- **WHEN** the model calls `shell_execute` with `cat <config dir>/{netclaw,secrets}.json`
+- **THEN** the call is denied, because Bash expands the word to `secrets.json`
+- **AND** `cat <config dir>/netclaw.json` is not denied
+
+#### Scenario: Program text keeps the denial in each spelling
+
+- **GIVEN** a Personal run, attended or unattended
+- **WHEN** the model calls `shell_execute` with `jq -n 'import "secrets" as $s {search: "<home>//config"}; $s'`, or with `<home>/./config`, `<home>/x/../config`, or `<home>/con'fig'` in the program text
+- **THEN** the call is denied
+- **AND** program text that names `<home>/x/../other` is not denied by this check
 
 #### Scenario: Team does not get the shared sessions root
 
@@ -562,6 +640,46 @@ process-local. No state of these checks is durable.
 - **GIVEN** an interactive Personal session
 - **WHEN** the model calls `file_read` on a file in another session directory
 - **THEN** the path access decision allows the read
+
+#### Scenario: A skill script runs from its skill folder
+
+- **GIVEN** an interactive Personal session with a grant for anywhere for `bash`
+- **AND** a script `scripts/audit.sh` in a server feed skill folder
+- **WHEN** the model calls `shell_execute` with `bash <feed skill folder>/scripts/audit.sh`
+- **THEN** authorization returns `Allowed` with allow reason `StoredApproval`
+- **AND** `ls ~/.netclaw/skills/.system/` is not denied
+
+#### Scenario: A skill folder write gets the decision of an ordinary path
+
+- **GIVEN** an interactive Personal session
+- **WHEN** the model calls `file_write` or `file_edit` on a file in the system skill folder
+- **THEN** the decision is the same as for a file in the user skill root
+- **AND** `touch <feed skill folder>/added` asks for approval and is not denied
+
+#### Scenario: A control-plane write stays denied in each form
+
+- **GIVEN** an interactive Personal session with a grant for anywhere for `echo`, `touch`, `cp`, `mv`, `tee`, `rm`, `sed`, and `bash`
+- **WHEN** the model writes to `netclaw.json`, `tool-approvals.json`, `secrets.json`, a webhook route file, or a key file with a redirect, `touch`, `cp`, `mv`, `tee`, `rm`, `sed -i`, `bash -c`, `file_write`, or `file_edit`
+- **THEN** authorization returns `Denied`
+
+#### Scenario: A link to the config directory names the protected cause
+
+- **GIVEN** an interactive Personal session and a project link `cfg` to the config directory
+- **WHEN** the model calls `shell_execute` with `touch cfg/netclaw.json`
+- **THEN** authorization returns `Denied` with reason `shell_path_protected`
+
+#### Scenario: A bounded profile names the trusted-root cause
+
+- **GIVEN** a Personal profile with `WriteFiles` mode `Roots`
+- **WHEN** the model calls `shell_execute` with a path argument outside those roots
+- **THEN** authorization returns `Denied` with reason `shell_path_outside_trusted_roots`
+
+#### Scenario: The feed sync state stays write-protected
+
+- **GIVEN** an interactive Personal session with a configured server feed and a grant for anywhere for `echo` and `rm`
+- **WHEN** the model calls `shell_execute` with `echo x > <feed sync state>` or `rm <feed sync state>`, or calls `file_write` on that file
+- **THEN** authorization returns `Denied`, and the shell redirect gets reason `shell_path_protected`
+- **AND** `file_read` on that file is not denied
 
 ### Requirement: TA-7 Shell analysis uses general syntax facts
 
@@ -609,20 +727,32 @@ have their glossary meaning.
   decision of the literal value, in path policy and in hard deny (TA-5). A
   name with a run-time value (`PID=$!`, `x=$(cmd)`, `read x`) SHALL be
   unknown. A command that reads it as a word SHALL be one exact candidate with
-  `Once` and `Deny` only, and SHALL get no rewrite advice.
+  `Once` and `Deny` only, and SHALL get no rewrite advice, except the quote
+  correction below for a command with known command words. The data-position
+  rule below is the exception: an `echo` or `printf` operand that reads it
+  SHALL be data.
 - An unresolved command (a dynamic command name, an unknown value, an
   unresolved path or redirect, a command after an unproved directory change
   such as `cd "$x"`, `pushd`, `popd`, or a failed `cd`) SHALL produce one
   exact candidate: its source text, with no reusable grant. In a Bash session,
   attended or not, each other command of the call SHALL keep its own
   candidates and coverage.
+- Scope-free data commands (0.27.1, owner finding F2): a Bash data command
+  with no redirect and with proved data operands SHALL keep its normal
+  candidate after an unproved directory change, when the analysis proves the
+  rest of the command. Such a command has no path scope, so the directory
+  cannot change what it reaches, and it keeps its approval exemption (TA-8).
+  A data command with a redirect, or with an operand that is not proved data
+  (an unquoted `echo $n`), SHALL stay one exact candidate.
 - Bracket-word rule: a program word that is a literal bracket pattern (for
   example `["ci","build"]`), with no command words and no other word except a
-  redirect, SHALL be unresolved, because Bash expands the pattern. Brace text
-  and regex text in the program word (`{"b":2}`, `^\d{4}$`) SHALL NOT be
-  unresolved by this rule; they keep the rewrite advice of a command with
-  unknown command words. The `[` test builtin (`[ -d /work ]`) SHALL stay an
-  ordinary command.
+  redirect, SHALL be unresolved, because Bash expands the pattern. Regex text
+  in the program word (`^\d{4}$`) SHALL NOT be unresolved by this rule; it
+  keeps the rewrite advice of a command with unknown command words. Since
+  ShellSyntaxTree 0.4.0-beta.18, the parser rejects a brace list in the
+  program word (`{"b":2,"c":3}`), because Bash expands it to another program
+  and its operands, so the source is unresolved. This rule SHALL NOT apply to the `[` test builtin
+  (`[ -d /work ]`); the data-position rule below applies to it.
 - A source that does not split into commands (incomplete control flow, a
   command-resolution mutation such as `alias` or `hash`, `&&` under Windows
   PowerShell 5.1, unresolved PowerShell syntax) SHALL allow only a one-time
@@ -633,6 +763,70 @@ have their glossary meaning.
   `printf -v` SHALL stay unresolved. A command substitution inside the operand
   SHALL be its own command with its own candidate, and a redirect target SHALL
   keep its own check. PowerShell SHALL keep only the bare `$?` rule.
+- Test builtins: in Bash, `test` and `[` SHALL be data commands. Each operand
+  SHALL be data only when the parser proves an exact value or a finite set
+  and no value has a `[`. Bash evaluates an array subscript in a `-v` operand
+  as arithmetic, and the arithmetic runs a command substitution. Thus an operand with a `[`, an
+  unknown value, or a glob or file-name value SHALL make the command one exact
+  candidate. Netclaw SHALL NOT parse the test operators. A path operand of a
+  test builtin SHALL NOT be a scope. The protected-path screen SHALL still
+  deny a literal or proved protected path.
+- A Bash data command with no redirect SHALL get no assignment digest only
+  when each operand is proved data. An output operand SHALL be proved data
+  with an exact value, a finite set, a proved authored value with no glob
+  character, or a word that Bash cannot glob (`MayPathnameExpand` is false,
+  from ShellSyntaxTree 0.4.0-beta.19). A test operand SHALL need an
+  exact value or a finite set with no `[`. Any other data command, and a data
+  command with a redirect, SHALL keep its digest. Thus
+  `n=$(cmd); echo "$n"` is data, and `d=key; echo ../netclaw/"${d}s"/*` needs
+  consent, because its literal twin is denied.
+- `continue`, `break`, `exit`, and `return` SHALL be Bash data commands.
+  They change only which statement runs next. ShellSyntaxTree 0.4.0-beta.18
+  parses `break` and `continue` with no operand or one decimal level, and
+  `exit` and `return` with no operand or one bounded status. It joins the
+  flow state at each one. Other forms stay unresolved. A redirect or a
+  substitution keeps its own check. Thus `cd x || exit 1; ls` needs no grant
+  for `exit`.
+- Arithmetic (ShellSyntaxTree 0.4.0-beta.18): a bounded `$((...))` SHALL be
+  data. Arithmetic that reads a command substitution or a variable without a
+  proved integer value, and an arithmetic command `((...))`, SHALL be
+  unresolved, because Bash evaluates those values as code.
+- ANSI-C words (ShellSyntaxTree 0.4.0-beta.19): a `$'...'` word SHALL get the
+  decision of its decoded text. Each proved path value SHALL also get the
+  default credential store text hints, so `cat ~/.netclaw/$'\x6beys'/key-1.xml`
+  is denied as its literal twin.
+- Pathname expansion (ShellSyntaxTree 0.4.0-beta.19): a Bash operand that
+  Bash can glob (`MayPathnameExpand`), whose value is unknown, and whose
+  authored value is not proved free of glob characters SHALL make its command
+  one exact candidate with `Once` and `Deny` only. Decision D1 SHALL NOT cover
+  it, and an unattended run SHALL deny it. A brace word such as
+  `~/.netclaw/{keys,config}/key-1.xml` is such an operand. A proved glob scope
+  keeps decision D5, and `$?` is exempt. Owner decision (#2349): an operand of
+  a Bash data command keeps its earlier rule. An `echo` or `printf` operand
+  can only print file names, never contents, and a test operand keeps the
+  proved-value rule above.
+- Rewrite exception: when the pathname-expansion rule is the only cause that
+  makes a command exact, and a rewrite of the command words can remove the
+  word, the call SHALL get the rewrite correction, attended or unattended.
+  The command SHALL stay exact, so no grant and no reviewed phrase covers it.
+  The call does not run, and the rewritten call passes normal approval. A
+  run-time value in the verb slot, as in `f=$(date); cat /work/$f`, gives
+  unknown command words and has no literal spelling, so that command SHALL
+  keep its prompt or its unattended denial.
+- Quote correction (0.27.1, owner finding F4): when the command words are
+  known and the pathname-expansion rule is the only cause that makes the
+  command exact, the call SHALL get a quote correction that names each such
+  word, attended or unattended. The call does not run. In double quotes, the
+  word gets no pathname expansion and no field splitting, so the retry has one
+  unknown operand, and decision D1 applies. The rule SHALL read only general
+  shell facts, never the grammar of a program. An unknown program word,
+  unknown command words, and any other cause SHALL keep their handling.
+- The pathname-expansion rule SHALL NOT read `MayFieldSplit`. A word that can
+  split but cannot glob is a quoted `"$@"` or a bounded arithmetic word.
+  Splitting only cuts a value into more words, and each word keeps the check
+  of a normal operand: an unknown value gets decision D1. The agent cannot set
+  `$@` without consent, because `set --` needs consent and a function
+  definition fails closed.
 - Owner decision D1: a command whose command words are known and whose only
   unknown part is an operand value SHALL be covered by a reviewed safe phrase
   or by a grant for anywhere, attended or unattended (D2). A folder,
@@ -667,7 +861,8 @@ call-local. The analysis keeps no state between calls.
 
 - **GIVEN** an interactive Personal session with no grants (catalog cases `if-statement-prompts-for-each-command` and `case-statement-uses-reviewed-phrases`)
 - **WHEN** the model calls `shell_execute` with `if test -f marker; then git push; else git fetch; fi`
-- **THEN** authorization returns `RequiresApproval` with the candidates `test`, `git push`, and `git fetch`
+- **THEN** authorization returns `RequiresApproval` with the candidates `git push` and `git fetch`
+- **AND** `test -f marker` is a data command, so it needs no grant
 - **AND** `case x in a) cat a.txt ;; *) cat b.txt ;; esac` returns `Allowed` with allow reason `ReviewedSafePolicy`
 
 #### Scenario: A command substitution is its own command
@@ -676,6 +871,41 @@ call-local. The analysis keeps no state between calls.
 - **WHEN** the model calls `shell_execute` with `echo $(git push)` (catalog case `command-substitution-fails-closed`)
 - **THEN** authorization returns `RequiresApproval` with the candidate `git push`
 - **AND** the `echo` operand is data, so `echo` needs no grant
+
+#### Scenario: A test builtin with bounded operands needs no approval
+
+- **GIVEN** an interactive Personal session on the Bash 5.2 host with no grants (catalog cases `test-builtin-literal-operands-allows`, `test-builtin-bounded-variable-allows`, and `test-builtin-loop-value-allows`)
+- **WHEN** the model calls `shell_execute` with `x=3; [ "$x" -gt 2 ] && echo yes`
+- **THEN** authorization returns `Allowed` with allow reason `ApprovalExemptShellCandidates`
+- **AND** `for d in a b; do [ "$d" = a ] && echo yes; done` returns the same result with no rewrite advice
+
+#### Scenario: A test operand with a subscript is not data
+
+- **GIVEN** an interactive Personal session on the Bash 5.2 host with no grants (catalog case `test-builtin-subscript-operand-prompts`)
+- **WHEN** the model calls `shell_execute` with `[ -v 'a[$(printf marker >&2)]' ]`
+- **THEN** authorization returns `RequiresApproval` with that exact candidate
+- **AND** a run-time value such as `n=$(cmd); [ -v "$n" ]` gets the same result (catalog case `test-builtin-unknown-value-prompts`)
+
+#### Scenario: A test builtin does not hide another command
+
+- **GIVEN** an interactive Personal session on the Bash 5.2 host with no grants (catalog cases `test-builtin-guard-keeps-action-prompt`, `test-builtin-guard-keeps-hard-deny`, and `test-builtin-credential-path-denies`)
+- **WHEN** the model calls `shell_execute` with `[ 3 -gt 2 ] && git push`
+- **THEN** authorization returns `RequiresApproval` with the candidate `git push`
+- **AND** `x=3; [ "$x" -gt 2 ] && rm -rf /` is denied with `hard_deny_system_destructive`
+- **AND** `[ -f ~/.netclaw/keys/x ] && echo yes` is denied with `shell_references_protected_path`
+
+#### Scenario: A run-time value in an output operand is data
+
+- **GIVEN** an interactive Personal session on the Bash 5.2 host with no grants (catalog case `echo-substitution-value-is-data`)
+- **WHEN** the model calls `shell_execute` with `n=$(git push); echo "$n"; printf '%s\n' "$n"`
+- **THEN** authorization returns `RequiresApproval` with the candidate `git push` only
+
+#### Scenario: An unquoted glob built from a variable needs consent
+
+- **GIVEN** a Personal session on the Bash 5.2 host with no grants (catalog cases `output-glob-from-binding-prompts` and `output-glob-from-binding-unattended-denies`)
+- **WHEN** the model calls `shell_execute` with `d=key; echo ../netclaw/"${d}s"/*`
+- **THEN** an interactive call returns `RequiresApproval` with the one exact candidate `echo ../netclaw/"${d}s"/*` (ShellSyntaxTree 0.4.0-beta.19 reports that the word can glob)
+- **AND** an unattended call is denied with `approval_required_unattended`
 
 #### Scenario: A dynamic redirect target is not data
 
@@ -747,10 +977,57 @@ call-local. The analysis keeps no state between calls.
 
 #### Scenario: A brace program word keeps its rewrite advice
 
-- **GIVEN** an unattended Personal session in Approval mode with no grants (catalog case `unattended-brace-program-word-gets-rewrite-advice`)
+The scenario name is historical. Since ShellSyntaxTree 0.4.0-beta.18, the
+parser rejects the brace word, so the call gets no rewrite advice.
+
+- **GIVEN** an unattended Personal session in Approval mode with no grants (catalog case `unattended-brace-program-word-denies`)
 - **WHEN** the model calls `shell_execute` with `{"b":2,"nested":{"c":3}}`
-- **THEN** authorization returns `RequiresAgentCorrection`
-- **AND** the bracket-word rule does not deny the call
+- **THEN** authorization returns `Denied` with reason `approval_required_unattended`
+- **AND** the call does not run
+
+#### Scenario: A bounded arithmetic expansion is data
+
+- **GIVEN** an interactive Personal session with no grants (catalog case `arithmetic-expansion-is-data`)
+- **WHEN** the model calls `shell_execute` with `echo $((1 + 2))`
+- **THEN** authorization returns `Allowed`, because `echo` only prints its operands
+
+#### Scenario: Arithmetic that can run code stays unresolved
+
+- **GIVEN** an interactive Personal session with no grants (catalog cases `arithmetic-expansion-fails-closed`, `arithmetic-unproved-read-fails-closed`, and `arithmetic-command-fails-closed`)
+- **WHEN** the model calls `shell_execute` with `echo $(( $(id) + 1 ))`, `echo $((count + 1))`, or `(( p = 0 ))`
+- **THEN** authorization returns `RequiresApproval` for unresolved syntax, with `Once` and `Deny` only
+
+#### Scenario: A decoded ANSI-C path gets the decision of its literal twin
+
+- **GIVEN** an interactive Personal session with a global `cat` grant (catalog case `ansi-c-credential-keys-denied-as-literal`)
+- **WHEN** the model calls `shell_execute` with `cat ~/.netclaw/$'\x6beys'/key-1.xml`
+- **THEN** authorization returns `Denied` with reason `shell_references_protected_path`
+
+#### Scenario: A word that can glob to an unproved path needs exact consent
+
+The scenario name is historical. The brace word is the only cause that makes
+the command exact, so the call gets the rewrite correction.
+
+- **GIVEN** a Personal session with a global `cat` grant (catalog cases `brace-credential-keys-gets-rewrite-correction` and `unattended-brace-credential-keys-gets-rewrite-correction`)
+- **WHEN** the model calls `shell_execute` with `cat ~/.netclaw/{keys,config}/key-1.xml`
+- **THEN** an interactive run and an unattended run return `RequiresAgentCorrection`
+- **AND** the call does not run, and the `cat` grant does not cover it
+- **AND** `f=$(date); cat /work/$f` with the same grant returns `RequiresApproval` with the one exact candidate `cat /work/$f` (catalog case `unknown-glob-word-read-needs-exact-consent`)
+- **AND** an unattended run of that call returns `Denied` with reason `approval_required_unattended` (catalog case `unattended-unknown-glob-word-read-denies`)
+
+#### Scenario: A control-transfer builtin needs no grant
+
+- **GIVEN** an unattended Personal session with grants for anywhere for `cd` and `make` (catalog case `unattended-cd-or-exit-grant-allows`)
+- **WHEN** the model calls `shell_execute` with `cd /netclaw-approval-external/cd-list || exit 1; make`
+- **THEN** authorization returns `Allowed` with allow reason `StoredApproval`
+- **AND** `exit` needs no grant
+
+#### Scenario: A quoted unknown output part is data
+
+- **GIVEN** an interactive Personal session with no grants (catalog cases `quoted-unknown-output-part-is-data` and `unknown-glob-word-output-keeps-glob-rule`)
+- **WHEN** the model calls `shell_execute` with `d=$(date); echo pre"$d"`
+- **THEN** authorization returns `Allowed`
+- **AND** `d=$(date); echo "${d}ret"/*` returns `RequiresApproval` with the one exact candidate `echo "${d}ret"/*`
 
 #### Scenario: Unresolved syntax in a headless run
 
@@ -758,6 +1035,32 @@ call-local. The analysis keeps no state between calls.
 - **WHEN** the model calls `shell_execute` with `cat "$FILE"`
 - **THEN** authorization returns `Denied` with reason `approval_required_unattended`
 - **AND** no prompt is shown
+
+#### Scenario: A known-words command with an unquoted expansion gets a quote correction
+
+- **GIVEN** a Personal session with grants for anywhere for `git rev-list` and `git branch` (catalog cases `substitution-word-with-known-words-gets-quote-correction`, `unattended-substitution-word-with-known-words-gets-quote-correction`, and `quoted-substitution-word-uses-verb-grant`)
+- **WHEN** the model calls `shell_execute` with `git rev-list --left-right --count HEAD...origin/$(git branch --show-current) 2>/dev/null`
+- **THEN** an interactive run and an unattended run return `RequiresAgentCorrection`, and the correction names the word `HEAD...origin/$(git branch --show-current)`
+- **AND** the call does not run
+- **AND** the quoted retry `git rev-list --left-right --count "HEAD...origin/$(git branch --show-current)" 2>/dev/null` returns `Allowed` with allow reason `StoredApproval`
+- **AND** `$(date) rev-list HEAD...origin/$(git branch --show-current)` keeps one exact answer for the call (catalog case `unknown-program-word-with-glob-word-keeps-prompt`)
+- **AND** `f=$(date); git log origin/$f > "$f".log` returns `RequiresApproval` with the one exact candidate `git log origin/$f > "$f".log` (catalog case `glob-word-with-unknown-redirect-keeps-prompt`)
+
+#### Scenario: A data command after an unproved directory change keeps its exemption
+
+- **GIVEN** a Personal session with grants for anywhere for `cd` and `git fetch` (catalog cases `data-commands-after-failing-cd-are-exempt` and `unattended-data-commands-after-failing-cd-are-exempt`)
+- **WHEN** the model calls `shell_execute` with `cd sub && n=$(git fetch) && git fetch "$n"; echo "---"; echo "== $n =="; [ 3 -gt 2 ]`
+- **THEN** an interactive run and an unattended run return `Allowed` with allow reason `StoredApproval`
+- **AND** `cd sub && n=$(git fetch) && git fetch "$n"; echo "---" > /netclaw-approval-external/marker` returns `RequiresApproval` with the one exact candidate `echo "---" > /netclaw-approval-external/marker` (catalog case `data-command-redirect-after-failing-cd-keeps-prompt`)
+- **AND** `cd sub && n=$(git fetch) && git fetch "$n"; echo $n` returns `RequiresApproval` with the one exact candidate `echo $n` (catalog case `unquoted-unknown-echo-after-failing-cd-keeps-prompt`)
+
+#### Scenario: The live CPM survey prompts only for its unscoped reads
+
+- **GIVEN** an interactive Personal session with grants for anywhere for `cd`, `find`, and `grep` (catalog case `live-cpm-props-survey-prompts-only-for-unscoped-reads`)
+- **WHEN** the model calls `shell_execute` with the survey command of the F2 report, which runs `echo`, `find`, and `grep` after a `cd` that can fail
+- **THEN** authorization returns `RequiresApproval`
+- **AND** the candidates are only the `find` and `grep` commands whose directory is not known
+- **AND** no `echo` command is a candidate
 
 ### Requirement: TA-8 Every candidate needs coverage
 
@@ -776,9 +1079,30 @@ SHALL be:
   known path. Under decision D1 it also covers an unknown operand value;
 - under decision D1, a grant for anywhere for an exact candidate whose only
   unknown part is an operand;
-- an approval-exempt output command (`echo`, `printf`, `:`, `true`, `false`)
-  with no directory scope and no assignment digest, while the store is
-  available.
+- an approval-exempt data command with no directory scope and no assignment
+  digest, while the store is available: an output command (`echo`,
+  `printf`, `:`, `true`, `false`), or in Bash a test builtin (`test`, `[`);
+- a Bash command that runs no program, while the store is available (owner
+  decision, 2026-10-07): a command with only redirects (`> file`), or a data
+  command, when each redirect target is one proved plain file. A data command
+  that a shell-state assignment reaches SHALL qualify only when each operand
+  is proved data. Each redirect SHALL get the decision of the file tool for
+  the audience and the path: `file_write` for a write target, `file_read` for
+  an input redirect (`<`). The shell trust zone SHALL judge each target, and
+  the `file_read` path rules SHALL also judge an input target. A refused
+  target, a target that is not proved, and a `Deny` mode of the file tool
+  SHALL deny the call (`shell_path_protected`,
+  `shell_path_outside_trusted_roots`, `shell_redirect_read_denied`,
+  `shell_redirect_unproved`, `shell_redirect_file_tool_denied`). Each redirect
+  of the command SHALL get these checks before any prompt. With an `Approval`
+  mode of the file tool, a stored grant of that tool SHALL cover the redirect.
+  With no such grant, one exact candidate SHALL name each write and read that
+  needs consent, with `Once` and `Deny` only. Otherwise the candidate
+  SHALL NOT ask for a stored grant, and an answer SHALL NOT save one. Such a
+  command SHALL get no managed temporary directory advice. A Bash source that
+  parses with no command (an assignment, a comment, an empty `case`, an
+  empty subshell) SHALL be allowed after the screens. A target below `/dev/` other than `/dev/null`, a glob, or a
+  set of values SHALL make a data command one exact candidate.
 
 The path rule for reviewed-safe policy SHALL NOT depend on the run (D2):
 
@@ -796,10 +1120,41 @@ session SHALL NOT cover another session. A global grant SHALL cover a phrase
 in any directory. A folder grant SHALL NOT cover a candidate outside its
 folder, and a new global grant SHALL NOT remove a folder grant.
 
-A legacy exact-phrase grant (`LegacyExact`) SHALL cover a candidate when its
-phrase equals all command words of the candidate. The display text of the
-prompt SHALL NOT count. A candidate with more words or other words SHALL need
-separate coverage.
+A shell grant SHALL cover a candidate's command words by one reach rule
+(owner decision, 2026-10-05). The approval matcher and the store hygiene SHALL
+use the same rule:
+
+- A grant of two or more words names a verb. It SHALL cover each candidate
+  whose command words start with the grant words. The later words are the
+  arguments of the verb.
+- A grant of one word names only the program. It SHALL cover a candidate
+  only when the candidate has that one command word. Policy data that gives a
+  program a one-token chain (`echo`, `which`, `jq`) keeps its exception.
+- A word of the grant SHALL never be free. A candidate with fewer words, or
+  with another word in a grant position, SHALL need separate coverage.
+- A grant with no words SHALL cover nothing.
+- A token-prefix grant (`TokenPrefix`) and a legacy exact-phrase grant
+  (`LegacyExact`) SHALL use the same rule. The words of a legacy grant are the
+  space-separated words of its phrase. The display text of the prompt SHALL
+  NOT count.
+- The rule SHALL use no command-specific knowledge: no option tables, no
+  per-command lists, and no executable grammar.
+- A new grant SHALL save the command words of the approved candidate. The
+  reach rule SHALL NOT change what a grant saves.
+
+A word after the verb slot that names a link in the occurrence directory SHALL
+stay a command word. The protected-path screen SHALL check each plain word
+after the program word, command word or argument. When the word names a link
+in the occurrence directory and the resolved link target is protected, the
+call SHALL be denied before grant lookup, also under a grant. The link check
+SHALL NOT change folder, repository, or global grant coverage, so a link to an
+ordinary file SHALL keep the decision of its grant.
+
+The store SHALL NOT save a grant that a stored grant already covers, and
+`netclaw doctor --fix` SHALL remove such a grant. A grant covers another grant
+when the tool, the shell, and the assignment digest are equal, its words cover
+the other words by the reach rule, and it applies anywhere or has the same
+scope. A removal SHALL NOT change an allowed decision.
 
 A repository grant SHALL cover a candidate only when the candidate resolves to
 an ordinary checkout or a Git-registered linked worktree of the same Git
@@ -816,6 +1171,31 @@ own the reviewed-safe path rule; their result is call-local.
 `ApprovalPatternMatching` owns the grant match, including the legacy rule; its
 result is call-local. `ToolApprovalActor` holds chat grants (actor-local).
 `ToolApprovalStore` holds persistent grants (durable).
+
+#### Scenario: A command that runs no program needs no prompt
+
+- **GIVEN** an interactive Personal session on the Bash 5.2 host with no grants
+- **WHEN** the model calls `shell_execute` with `printf 'a\tb\n' > drafts-harvest.tsv && : > drafts-harvest.json` (catalog case `no-program-harvest-drafts-allows`), `> drafts.json`, or `x=1`
+- **THEN** authorization returns `Allowed` with no grant lookup
+- **AND** an unattended call returns the same result
+
+#### Scenario: A command that runs no program cannot reach a refused path
+
+- **GIVEN** an interactive Personal session on the Bash 5.2 host
+- **WHEN** the model calls `shell_execute` with `: > <config dir>/secrets.json` or `echo x > <config dir>/tool-approvals.json`
+- **THEN** authorization returns `Denied`
+- **AND** with bounded read roots, `: < <outside>/notes.txt` returns `Denied` with reason `shell_redirect_read_denied`
+- **AND** `date > out.txt` and `echo $(rm -rf build) > out.txt` still prompt for `date` and `rm`
+
+#### Scenario: A redirect gets the consent mode of its file tool
+
+- **GIVEN** an interactive Personal session on the Bash 5.2 host
+- **WHEN** `file_write` has mode `Deny` and the model calls `shell_execute` with `echo x > out.txt`
+- **THEN** authorization returns `Denied` with reason `shell_redirect_file_tool_denied`
+- **AND** with mode `Approval`, the prompt shows the one candidate `write <project>/out.txt` and offers `Once` and `Deny` only
+- **AND** with mode `Approval`, an unattended call returns `Denied` with reason `approval_required_unattended`
+- **AND** with mode `Approval` and a chat grant for `file_write`, the call returns `Allowed`
+- **AND** with `file_read` = `Approval` and `file_write` = `Deny`, `: < notes.txt > out.txt` returns `Denied`
 
 #### Scenario: Folder grant stays inside its folder
 
@@ -844,9 +1224,51 @@ result is call-local. `ToolApprovalActor` holds chat grants (actor-local).
 
 #### Scenario: A legacy grant does not cover other words
 
-- **GIVEN** a Personal `LegacyExact` grant for `git merge-base`
-- **WHEN** the model calls `shell_execute` with `git merge-base dev`
+- **GIVEN** a Personal `LegacyExact` grant for `git push upstream`
+- **WHEN** the model calls `shell_execute` with `git push origin main`
 - **THEN** authorization returns `RequiresApproval`
+- **AND** the grant covers `git push upstream feature-x`
+
+#### Scenario: A verb grant covers its arguments
+
+- **GIVEN** a Personal global grant for `git push`, or a `LegacyExact` grant for `git push`
+- **WHEN** the model calls `shell_execute` with `git push upstream` or `git push origin main`
+- **THEN** authorization returns `Allowed` with allow reason `StoredApproval`
+- **AND** a global grant for `dotnet package search` covers `dotnet package search Dapper.AOT`
+
+#### Scenario: A grant word is never free
+
+- **GIVEN** a Personal global grant for `git push upstream`, and another for `git push origin feature-x`
+- **WHEN** the model calls `shell_execute` with `git push origin main`
+- **THEN** authorization returns `RequiresApproval`
+- **AND** the `git push upstream` grant covers `git push upstream feature-x`
+
+#### Scenario: A program-only grant stays exact
+
+- **GIVEN** a Personal global grant for `gh`, saved from `gh --help`
+- **WHEN** the model calls `shell_execute` with `gh auth logout`
+- **THEN** authorization returns `RequiresApproval`
+- **AND** the grant covers `gh --version`
+
+#### Scenario: A verb grant does not hide a link target
+
+- **GIVEN** a Personal grant for `git add`, a link `keylink`, and a link `keys2` in the project directory, both to the protected keys directory
+- **WHEN** the model calls `shell_execute` with `git add keylink` or `git add keys2` (a word with a digit is an argument) in the project directory
+- **THEN** authorization returns `Denied` with reason `shell_references_protected_path`, attended or not
+- **AND** the same grant covers `git add README`
+
+#### Scenario: A folder grant covers a link to a file in its folder
+
+- **GIVEN** a Personal folder grant for `mytool write` in the project directory, and a link `readmelink` in that directory to `README.md` in the same directory
+- **WHEN** the model calls `shell_execute` with `mytool write readmelink` in the project directory
+- **THEN** authorization returns `Allowed` with allow reason `StoredApproval`, in an attended and in an unattended run
+
+#### Scenario: Store hygiene uses the reach rule
+
+- **GIVEN** a stored global grant for `git push` and a stored global grant for `gh`
+- **WHEN** Netclaw saves a folder grant for `git push upstream`, and a global grant for `gh auth logout`
+- **THEN** the store skips the `git push upstream` grant, and saves the `gh auth logout` grant
+- **AND** `netclaw doctor --fix` removes a stored `git push upstream feature-x` grant and keeps a stored `gh auth status` grant
 
 #### Scenario: Repository grant covers a registered sibling worktree
 
@@ -882,8 +1304,8 @@ and pass every check again.
   the managed path.
 - An exact leading Bash directory change for project work SHALL receive a
   one-call working-directory correction that does not rewrite the command.
-- Corrections SHALL precede an `Auto` allow. Temporary and project advice
-  SHALL keep stored-grant and one-time precedence.
+- Corrections SHALL precede an `Auto` allow. Temporary advice SHALL keep
+  stored-grant and one-time precedence.
 - A repeated equivalent call after a managed temporary correction SHALL
   suppress the correction once and SHALL offer only `Once` and `Deny`.
 - The parent session and a subagent SHALL use the same corrections.
@@ -907,6 +1329,14 @@ and pass every check again.
 - **WHEN** the model repeats the same call
 - **THEN** authorization returns `RequiresApproval`
 - **AND** the prompt offers only `Once` and `Deny`
+
+#### Scenario: A reviewed phrase in a readable folder gets no project correction
+
+- **GIVEN** a Personal session, attended or unattended, with no grants
+- **AND** the shell folder is readable by the audience but is not the declared project directory
+- **WHEN** the model calls `shell_execute` with a reviewed phrase, for example `git status`, in that folder
+- **THEN** authorization returns `Allowed` through reviewed-safe coverage
+- **AND** the result has no correction that asks for `set_working_directory`
 
 ### Requirement: TA-10 Consent prompts offer only safe options
 
@@ -937,6 +1367,12 @@ and labels:
 - The prompt SHALL offer only `Once` and `Deny` when any uncovered
   candidate has unresolved syntax or no reusable phrase, or when the call is
   a managed temporary retry.
+- A shell consent request SHALL always name what it asks for (owner decision,
+  2026-10-07). When it has no candidate and no pattern (a source that does not parse, an
+  unknown program word such as `$cmd > x`), its one display candidate SHALL be
+  the full command text, and it SHALL offer only `Once` and `Deny`. The
+  one-time key SHALL NOT read the display list, so a `Once` answer still
+  covers the retry.
 - `Always here` SHALL be offered only for a shell call with a directory scope
   that is not shallow and not session-owned.
 - `This repository` SHALL be offered only for a clean reusable shell phrase
@@ -972,6 +1408,13 @@ result is call-local. `ConsentAnswerCodec.AppendResultNote` owns the approval
 note line. `SessionToolExecutionPipeline` and `SubAgentActor` add the line to
 the call-local tool result. The journal keeps the consent request and the
 answer (durable).
+
+#### Scenario: A prompt for an unknown program shows the command text
+
+- **GIVEN** an interactive Personal session on the Bash 5.2 host
+- **WHEN** the model calls `shell_execute` with `$cmd > drafts.txt`
+- **THEN** the prompt shows `$cmd > drafts.txt` as its one candidate and offers `Once` and `Deny` only
+- **AND** a `Once` answer allows the retry of the same call
 
 #### Scenario: Unresolved syntax offers one-time options only
 

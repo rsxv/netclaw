@@ -3,7 +3,7 @@ name: netclaw-operations
 description: "REQUIRED when the user asks about scheduling, reminders, cron jobs, timers, background jobs, diagnostics, troubleshooting, MCP tools, daemon health, identity updates, or Netclaw capabilities and self-maintenance."
 metadata:
   author: netclaw
-  version: "2.91.0"
+  version: "2.108.1"
 ---
 
 # Netclaw Operations
@@ -37,6 +37,57 @@ a reference file — load the one matching the user's intent with
 | Rotate or repair secrets | `skill_read_resource('netclaw-operations', 'references/secrets.md')` |
 | Pair remote devices, manage access | `skill_read_resource('netclaw-operations', 'references/devices.md')` |
 | Kick the tires on Netclaw end-to-end locally | `skill_read_resource('netclaw-operations', 'references/demo-apphost.md')` |
+
+## CLI Chat Delivery
+
+A fresh `netclaw chat` creates its session on the first input.
+A resume chat attaches when its page opens.
+The CLI requires a daemon that advertises text admission version 1.
+Upgrade the daemon when the CLI reports unsupported text admission.
+
+Normal Ctrl+Q permits two seconds total for prior input admission.
+It does not wait for model completion.
+The daemon retains admitted work after the client disconnects.
+The CLI prints unresolved delivery status after the terminal UI closes.
+
+Unsent text did not start its input RPC.
+Unconfirmed delivery may already exist in the daemon journal.
+Check the session before you resend unconfirmed text or an interaction response.
+The CLI does not automatically replay an uncertain request.
+Do not delete a session solely because its completed turn count is zero.
+Forced termination does not provide the normal quit guarantee.
+
+Identity redo waits for the daemon to apply the saved config before guided chat.
+A daemon that already runs must report its config generation before the identity save.
+A probe failure blocks that save. Retry after the daemon becomes ready.
+Esc on the saved screen skips chat and keeps the saved identity.
+
+## Built-in Tools Before the `netclaw` CLI
+
+A built-in tool needs no shell approval. A `netclaw` command through `shell_execute`
+needs one, and an unattended run cannot get it. Use the built-in tool when one does
+the operation. If the tool is not in your tool list, it is deferred: call
+`load_tool(name)`, then call the tool. Call `search_tools(query)` only when you do
+not know the name, and wait for its result before a shell call.
+
+| Operation | Built-in tool |
+|-----------|---------------|
+| Reminders: list, create or change, stop, read run history, test | `list_reminders`, `set_reminder`, `cancel_reminder`, `get_reminder_history`, `run_reminder` |
+| Inbound webhooks: list, create or change, delete | `list_webhooks`, `set_webhook`, `delete_webhook` |
+| Memories: search, read, save, change or delete | `find_memories`, `get_memories`, `store_memory`, `update_memory` |
+| Skills: load, read a bundled file, create or edit or delete | `skill_load`, `skill_read_resource`, `skill_manage` |
+| Read `netclaw.json`, the saved shell grants (`tool-approvals.json`), or a log | `file_read` |
+
+A `netclaw` command for an operation in this table, such as `netclaw reminder list`
+or `netclaw skill list`, is for a person at a terminal. Do not run it.
+
+Run a `netclaw` command through `shell_execute` only when no built-in tool does the
+operation. Common cases: `netclaw status`, `netclaw doctor`,
+`netclaw reminder show|status|enable|delete <id>`, `netclaw approvals trust-verb|revoke`
+(run `netclaw approvals list` first to get the exact label for a revoke),
+`netclaw secrets set`, `netclaw mcp ...`, `netclaw skill sync|validate|issues|source`,
+`netclaw sessions`, `netclaw stats`, `netclaw update`, and
+`netclaw memory backfill-embeddings`.
 
 ## File and Shell Selection
 
@@ -74,6 +125,8 @@ Keep shell approval friction bounded:
 11. Advice grants no authority. Every replacement call passes current policy.
 12. If you require the exact platform path, retry unchanged once through normal policy.
 13. Reviewed diagnostics without file output do not receive temporary relocation advice. Normal approval and denial rules still apply.
+14. Write long text (PR bodies, issue bodies, commit messages, file contents) to a file first, then pass the file to the command (for example `gh pr create --body-file <file>`, `gh issue create --body-file <file>`, `git commit -F <file>`). Do not inline long text in a shell command: a command that needs approval and is longer than 900 characters gets a `shorten_shell_command` correction, not a prompt.
+15. To send fixed text on stdin, quote the heredoc delimiter (`python3 - <<'EOF'`) or use a literal here string (`<<< 'text'`). Such a call gets the same approval as the same text in an argument (`python3 -c '...'`), so a saved grant can cover it. Put each file redirect before the heredoc operator (`cat > out.txt <<'EOF'`), and put the next command on a new line after the end word. Use only literal arguments with the heredoc. An unquoted delimiter, a here string with a variable, a pipe or `&&` on the operator line, a loop variable in the command, stdin text to a shell (`bash`, `sh`), and an argument that holds a shell name (`ssh host 'bash -s'`, `grep 'run bash now'`) get a one-time prompt.
 
 ## Project Directory
 
@@ -201,14 +254,21 @@ This failure does not prove that the turn exhausted its tool budget.
 
 ## Large tool output
 
-Tool output is bounded to a small inline budget
-(`Session.Tuning.MaxInlineToolResultChars`, default 2000 chars) so it never floods
-the context window. When a tool's output exceeds that budget you get a head+tail
-view inline plus a pointer to the full output — not the whole thing:
+Netclaw limits each inline tool result to a character budget.
+`Session.Tuning.MaxInlineToolResultChars` defaults to 12,000 characters.
+`shell_execute` uses 2,000 characters.
+A longer result contains only its tail, with a separator before the retained text.
+The shell tail retains the process exit status.
 
-- **`shell_execute`** retains the full redacted output inside the current session.
-  Use `tool_output_read` with the returned `CallId`, `Start`, and `Limit` values.
+- **Each tool, also `skill_load`, `skill_read_resource`, and MCP tools**: Netclaw
+  keeps the full redacted result inside the current session. The last line of the
+  result names `tool_output_read` and a `CallId`. Use `tool_output_read` with that
+  `CallId` and a `Start`/`Limit` window to read the omitted prefix or middle.
+  Set `Start=0` to read from the start of the retained result.
   Do not request a path or rerun the source tool to read more.
+  If the last line says that Netclaw did not keep the full output, the omitted text is
+  not available: narrow the call if the tool has a bound, or read one specific
+  resource with `skill_read_resource`.
 - **`file_read`** on a large file returns the head and steers you to read a
   specific range with `StartLine`/`Limit` or `grep` (`StartLine` is a 1-based line
   number — line 1 is the first line). Don't `cat` a huge file through
@@ -419,8 +479,20 @@ over to another session. A scheduled reminder run is another session.
 
 Shell approvals store a typed phrase and a scope in `tool-approvals.json`:
 
-- **verb** — the command head plus subcommand chain only (e.g. `git push`,
-  `grep`, `freshdesk`). No flags, no path arguments.
+- **verb** — the command words of the call: the program and its plain words
+  (e.g. `git push`, `pipedrive dealFields list`, `grep needle`). No flags, no
+  path arguments. The prompt shows the same words that the answer saves. So
+  `pipedrive dealFields list --json` shows and saves
+  `pipedrive dealFields list`, not `pipedrive`.
+  A phrase of two or more words names a verb. It covers its command words and
+  any later command words, which are arguments: `git push` covers
+  `git push origin main`, and `dotnet package search` covers each package.
+  A phrase of one word names only the program and covers that word alone:
+  `gh` covers `gh --help`, not `gh auth logout`. A word of the phrase is never
+  free: `git push upstream` does not cover `git push origin main`. A new grant
+  saves the words of the approved call, and the prompt shows those words. A
+  call with other words (`pipedrive organizationFields list`) gets its own
+  prompt.
 - **directory** — the path field for folder and global grants. Netclaw sets it from:
   - **Path argument** in the original command (`find /repo`, `ls /var/log`,
     `cat ~/.bashrc`). The path argument is the directory; for file targets
@@ -448,14 +520,16 @@ the program again to cover one file.
 A word that names an existing file or folder in the command's directory is
 not a command word, unless it is the program or the first word after it. So
 `dotnet build Phobos.slnx` uses the `dotnet build` grant, and a new grant
-never stores a file name. The store also skips a grant that a saved grant
-already covers. `netclaw doctor --fix` removes a grant that another grant
+never stores a file name. A word that names a link stays a command word.
+Netclaw denies the call when the link target is a protected path. The store also skips a grant that a saved
+grant already covers: a saved `git push` grant covers a new `git push upstream`
+grant. `netclaw doctor --fix` removes a grant that another grant
 covers. It reports and keeps a folder grant that names a file of its folder
 and a grant whose folder is gone. It never touches an "anywhere" grant for a
 file-like word.
-An older exact-phrase grant covers a call whose command words equal its
-phrase. The grant `dotnet list package` covers
-`dotnet list package --vulnerable`, even when the prompt shows `dotnet list`.
+An older exact-phrase grant uses the same rule for its words. The grant
+`dotnet list package` covers `dotnet list package --vulnerable`, even when the
+prompt shows `dotnet list`.
 
 `This repository` stores a distinct Git repository scope. It applies to
 registered worktrees of one repository. Netclaw derives this scope from each
@@ -484,11 +558,27 @@ A changed assignment needs a separate approval.
 An unqualified grant cannot cover an assignment-qualified command.
 The reviewed-safe list does not cover an assignment-qualified command.
 An incomplete assignment gets only `Once` and `Deny`.
+On a Bash 5.2 or 5.3 host, an assignment that stays in the shell does not
+qualify a command (decision F3). Netclaw gives the parser the names of the
+daemon environment, never the values. An assignment stays in the shell when
+the source does not export it and the daemon environment does not hold the
+name: `b=$(git branch --show-current); git fetch origin` needs only a grant
+for `git fetch`. An assignment still qualifies the command after `export b`,
+as a prefix (`b=1 env`), or to a name that the environment holds
+(`GIT_DIR=/x; git status`). `set -a` gets only `Once` and `Deny`. An output
+command (`echo`, `printf`) keeps every assignment.
 A name with a run-time value (`PID=$!`, `x=$(cmd)`, `read x`) is unknown, so a
 command that reads it as a word gets only `Once` and `Deny`.
 A word that reads a bound value (`x=/etc/app.conf; cat "$x"`) gets the
 decision of the literal value, so a protected path or a hard-deny form stays
 denied.
+A quote or a backslash before the `=` of an option word does not change the
+word that the program gets. `tar --file'='../x`, `tar --file\=../x`, and
+`tar "--file=../x"` get the option, the value, and the path of
+`tar --file=../x`, so a folder grant does not cover a path outside the folder.
+`awk -F'[= ]' '{print $2}' f` is a normal command with reusable choices.
+An option word with an expansion and no proved value (`-o"$n"`, `--$n=x`) is
+an unknown operand.
 
 On Linux, a glob word (`ls -d ~/repositories/*/akka*`) reaches the paths below
 its covering directory, and that directory is its scope. A glob that can match
@@ -538,7 +628,61 @@ compound command includes pure side-effect verbs (`echo`, `printf`, `:`,
 authorized for the current call by the click but no `ApprovalEntry` is
 written for them. Recording every literal `echo "==="` would be noise.
 A dynamic operand of these verbs is data: `echo "head: $(git rev-parse HEAD)"`
-keeps reusable candidates, and the command inside `$(...)` gets its own.
+keeps reusable candidates, and the command inside `$(...)` gets its own. A
+value from `$(...)` or `read` is data too when the shell cannot glob the word:
+in `n=$(cmd); echo "$n"` or `echo pre"$n"`, only `cmd` needs approval.
+Unquoted, `n=$(cmd); echo $n` needs consent. `echo $((1 + 2))` and
+`echo $(cmd)` are data (only `cmd` needs approval). In Bash, `test` and `[` need no approval when each operand is a
+literal or a proved value without `[`: `[ 3 -gt 2 ]`, `x=3; [ "$x" -gt 2 ]`,
+and a guard on a loop over literal words. A test on a value from `$(...)` or
+`read`, an environment value (`[ -n "$FOO" ]`), or a file name from a glob
+loop gets a one-time prompt.
+`continue`, `break`, `exit`, and `return` need no approval. These rules also
+apply after `cd dir && action;`, where the directory is not known: `echo "---"`
+there needs no approval, but a redirect or an unquoted `echo $n` still needs
+consent. For a program that
+can open files, such as `cat`, a word that the shell can glob and whose value
+Netclaw cannot prove (`$f`, `/work/$f`, `~/notes/{a,b}.txt`) makes its command
+exact; no grant covers it. When a rewrite can remove the word (a brace list or
+a loop over literal words), you get a "write the command words literally"
+correction, and the call does not run. Netclaw sends that correction only
+when you can make the rewrite. A word with a run-time value (`"$FOO"`,
+`$(cmd)`, `$?`, a glob loop value) in a command-word position gets a one-time
+prompt with `Once` and `Deny` instead. No grant covers it, and an unattended
+run denies it. When the command words are known and
+the unquoted word comes after them, as in
+`git rev-list --count HEAD...origin/$(git branch --show-current)`, you get a
+quote correction that names the word, and the call does not run. Put the word
+in double quotes (`"HEAD...origin/$(git branch --show-current)"`) and call
+again: a grant for anywhere for the command words then covers it. A value from
+`$(...)` or `read` in the verb slot (`f=$(cmd); cat /work/$f`) gets one exact
+prompt with `Once` and `Deny`. Write such paths literally. `echo`, `printf`, `test`, and `[` keep their own rules. An ANSI-C word such as
+`$'\x6beys'` gets the decision of its decoded text.
+
+**A command that runs no program needs no approval of its own.** An
+assignment (`x=1`), a command with only redirects (`> out.json`), and an
+output or test command (`echo`, `printf`, `:`, `true`, `false`, `test`) run no
+program. The only effect of such a command is its redirects. Each redirect
+gets the decision of the file tool for your audience and that path: a write
+target (`>`, `>>`, `&>`) gets the `file_write` decision, and an input target
+(`<`) gets the `file_read` decision. When the tool can use the path with no
+prompt, the command runs with no prompt and no grant:
+`printf 'a\n' > drafts/h.tsv && : > drafts/h.json` runs. When the path rules
+or a `Deny` mode refuse the target, the call is denied. Examples are
+`~/.netclaw/config/secrets.json` and a path outside the trusted roots. Write
+the file in an allowed folder instead. When the file tool needs approval, a
+saved grant of that tool covers the redirect too. With no such grant, you get
+one prompt that names each file ("write /path/out.json"), with `Once` and
+`Deny`. That prompt saves nothing, so it repeats: use `file_write`, and save
+its approval, to stop it. A program still needs its own approval: `date > out.txt` and
+`tee out.txt < in.txt` prompt, and so does `cmd` in `echo $(cmd) > out.txt`.
+These forms keep a prompt with `Once` and `Deny` that shows the command text:
+a target that Netclaw cannot prove as one file (`> "$f"`, `> *.json`,
+`> /dev/tcp/host/port`, a loop variable in the target, a target behind a
+link; on macOS also `/var` and the default `TMPDIR`), a redirect after `cd dir;` (use `cd dir && ...` or an absolute target),
+the operators `>|`, `>&`, and `<>`, and `x=1 y=2`, `a=(1 2)`, or `x+=1`. A
+prompt never shows an empty name. For an unknown program word (`$cmd > x`,
+`eval x`), it shows the full command text.
 
 **Prompts survive passivation and restart.** Pending approval prompts are
 journaled with their requester and trust context, so if the session goes idle or
@@ -576,10 +720,25 @@ is intended behavior. Mutating verbs in the same directory still prompt.
   Bash call, only the unresolved command is shown, as its exact text; the
   other commands keep their grants. A command whose only unknown part is an
   operand runs under a safe phrase or an `Always anywhere` grant (decision D1).
+  A variable word with an unknown value is such an operand
+  (`for n in $(gh issue list); do gh api "x/$n"; done`).
+  A loop over literal values, or a word with one known value, gets the
+  decision of each literal command (decision F1). In
+  `for n in 8250 8244; do gh api repos/o/r/issues/$n; done`, Netclaw checks
+  `gh api repos/o/r/issues/8250` and `gh api repos/o/r/issues/8244` as if you
+  typed them. The prompt offers the normal choices, and a chat or folder
+  grant for `gh api` covers the next run of the loop. One literal command
+  that is denied denies the call. A literal path keeps its scope, so a folder
+  grant does not cover `for d in ../x; do dotnet build "$d"; done` or
+  `d=../x; dotnet build "$d"`. A program word from a value
+  (`for p in /bin/rm; do $p x; done`) gets no literal command.
   Multi-line `python3 -c` code is not unresolved: its scope is the working
   directory, so the prompt offers reusable grants.
   An API route such as `gh api /repos/o/r/...` is not a folder: a word below a
   top-level directory that does not exist uses the working directory scope.
+  An option value is a path too: a folder grant for `dotnet build` does not
+  cover `dotnet build --output=../x` or `--output=$HOME/x`. Write the output
+  path inside the folder, or ask for `This chat` or `Always anywhere`.
 - **Shallow cwd** (e.g. `/etc/`, `/`) hides `Always here` only. Persisting a
   too-shallow root would grant the verb across most of the filesystem;
   `This chat` and `Always anywhere` remain available.
@@ -602,14 +761,22 @@ holds raw paths or arguments.
 
 ### Inspecting, revoking, and pre-approving grants
 
-Use the `netclaw approvals` CLI rather than hand-editing
-`tool-approvals.json`. The daemon reads the file on every approval check, so
+To read the saved grants, call `file_read` on `~/.netclaw/config/tool-approvals.json`.
+To change a grant, use the `netclaw approvals` CLI; you cannot write that file.
+A revoke needs the exact label that `netclaw approvals list` prints, so run `list`
+before a revoke. The daemon reads the file on every approval check, so
 mutations take effect on the next prompt without a daemon restart.
 
-You may read your own configuration with `file_read`:
-`~/.netclaw/config/netclaw.json` and `~/.netclaw/config/tool-approvals.json`.
-You cannot write them, and you cannot read `secrets.json` or `~/.netclaw/keys`.
-A shell command that names the config directory is denied, so use `file_read`.
+You may read each file under `~/.netclaw/config/` with `file_read`, for example
+`netclaw.json`, `tool-approvals.json`, and `hard-deny-overrides.json`. You
+cannot write them, and you cannot read `secrets.json`, the webhook route files
+in `~/.netclaw/config/webhooks/`, or `~/.netclaw/keys`.
+In the shell, `cat`, `head`, `tail`, `wc`, `grep`, `jq`, and `diff` can read a
+config file by its exact path argument. A glob, a brace word
+(`{a,b}.json`), a recursive search of the config directory, the config path
+inside program text (a `jq` or `python3 -c` program), or a write to a config
+file is denied. A `jq` filter with a brace (`jq '{a: .x}' file`) is denied
+too; use `cat file | jq '{a: .x}'`. `file_read` always works.
 
 ```bash
 # Interactive TUI: see everything grouped by audience and tool
@@ -706,7 +873,12 @@ protected. Attachment handling is covered alongside. Full setup + rules:
 Secrets live in `~/.netclaw/config/secrets.json` — **never print raw secret values**
 in chat, issues, PRs, or logs. Set them via CLI (`netclaw secrets set <Path> <value>`),
 never by direct file edit. Protected paths (`secrets.json`, `.netclaw/keys`,
-`config/webhooks`) are always access-denied. Full rotation guidance:
+`config/webhooks`) are always access-denied. A write to the config directory,
+including the grant store `tool-approvals.json`, is always denied. The skill
+folders (`~/.netclaw/skills/.system`, `~/.netclaw/skills/.server-feeds`) are not
+protected, except the feed `.sync-state.json` files. You can run a bundled
+skill script with `bash <path>` from `skill_read_resource`. Do not copy it to
+another folder first. Full rotation guidance:
 `skill_read_resource('netclaw-operations', 'references/secrets.md')`.
 
 ## LLM & Search Providers
@@ -739,8 +911,20 @@ add to it. This applies to `AllowedTools`, `ReadFiles`/`WriteFiles`/`AttachFiles
 - `netclaw doctor` warns when a Public or Team allowlist does not include
   `tool_output_read`. A spilled tool result tells the model to call that tool. The warning
   has no auto-fix, because a narrow list can be intentional.
+- `netclaw doctor` warns when the Personal profile has `McpServersMode: Allowlist` and
+  an enabled MCP server is not in `AllowedMcpServers`. The Personal audience cannot use
+  that server. `netclaw mcp permissions` in 0.27.1-beta.1 and earlier wrote such a list
+  when the operator enabled one server. The warning has no auto-fix, because the list can
+  be intentional. To repair it, enable the server in `netclaw mcp permissions`, or delete
+  `McpServersMode` and `AllowedMcpServers` from the Personal profile.
+- `netclaw mcp tools` stops with an error when the `Tools` section is not valid. Fix the
+  key that the error names, then run the command again.
+- An absent `Security.DeploymentPosture` means the Public posture, unless
+  `Security.StrictDefaults` is `false`. The daemon and the `netclaw config` screens use
+  the same rule.
 - The daemon reads `netclaw.json`, `secrets.json`, and `NETCLAW_*` variables.
-  `netclaw doctor` reads only `netclaw.json`, so it can show a different list.
+  `netclaw doctor`, `netclaw mcp permissions`, `netclaw mcp tools`, and the
+  `netclaw config` screens read only `netclaw.json`, so they can show a different value.
 - `netclaw init` writes only the posture (`Security.DeploymentPosture`,
   `Security.ShellExecutionMode`, `Security.StrictDefaults`) and `Tools.ShellMode`. It does
   not write `Tools.AudienceProfiles`. The daemon computes the profiles from the posture. An
@@ -758,7 +942,8 @@ Check the actor log before you conclude that an older run skipped a phase.
 
 When something is broken, start with `netclaw status`, then `netclaw doctor`. Feature
 kill switches and self-update/health are covered in the reference. Memory embeddings
-can be backfilled with `netclaw memory backfill-embeddings [--force]`; doctor checks
+can be backfilled with `netclaw memory backfill-embeddings [--force]` (a no-op while
+`Memory.Embeddings.Enabled` is false); doctor checks
 memory embedding availability. Full guidance:
 `skill_read_resource('netclaw-operations', 'references/diagnostics.md')`.
 

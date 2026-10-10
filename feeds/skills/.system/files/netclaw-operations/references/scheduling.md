@@ -5,6 +5,22 @@ When disabled, reminder tools are hidden, `ReminderManagerActor` skips startup
 reconciliation, and fired reminders are acknowledged but not executed. Public
 audience sessions cannot use scheduling tools regardless of the config flag.
 
+Use the reminder tools, not the `netclaw reminder` commands in the third column.
+Those commands are for a person at a terminal, and each one needs a shell approval.
+The tools are deferred: call `load_tool(name)` first.
+
+| Operation | Tool and arguments | Operator command |
+|-----------|--------------------|------------------|
+| List reminders; read a schedule, a status, or the next fire time | `list_reminders` (`Filter`: `active` or `all`; `all` adds disabled reminders) | `netclaw reminder list` |
+| Create or change a reminder | `set_reminder` (see below) | none |
+| Stop a reminder (disable it) | `cancel_reminder` (`ReminderId`) | `netclaw reminder cancel <id>` |
+| Read the run history | `get_reminder_history` (`ReminderId`, optional `Last`) | `netclaw reminder history <id>` |
+| Test a reminder in this chat | `run_reminder` (`Id`) | `netclaw reminder run <id>` |
+
+No tool reads the instructions or the delivery of a reminder, reads its retry state,
+enables it again, or deletes it. For those operations, run
+`netclaw reminder show|status|enable|delete <id>` through `shell_execute`.
+
 `set_reminder` accepts three schedule types:
 
 | Type | Examples |
@@ -47,8 +63,11 @@ Rules:
 
 - Always choose `delivery_kind` explicitly.
 - Do not try to route via `delivery_instructions`.
-- `current_session` is the session check-back path and should be preferred for
-  conversational follow-ups in Slack/TUI/SignalR sessions.
+- Use `current_session` for a reminder that must return to the current conversation.
+  Slack, Discord, Mattermost, TUI, and SignalR support this route.
+  Mattermost uses the original channel and thread root ID.
+  Omit `delivery_transport` and `delivery_address` for this route.
+  Netclaw preserves the stored reminder audience when the reminder executes.
 - `channel` requires both transport + address and resolves names/handles to
   canonical IDs at set time; unresolved targets fail loud.
 - Discord reminder targets must be explicit because channel IDs and user IDs are
@@ -62,19 +81,8 @@ Rules:
   not keep firing indefinitely.
 
 `cancel_reminder` **disables** the reminder — it stops future executions but
-preserves the definition file on disk for diagnosis and re-enablement. To
-permanently delete a reminder and its history, use the CLI:
-
-```
-netclaw reminder delete <id>
-```
-
-The `cancel` CLI subcommand mirrors the tool behavior (disable only):
-
-```
-netclaw reminder cancel <id>     # disable, keep definition
-netclaw reminder delete <id>     # permanent delete + history
-```
+preserves the definition file on disk for diagnosis and re-enablement.
+`netclaw reminder delete <id>` permanently deletes a reminder and its history.
 
 Reminders that hit 5 consecutive failures are auto-disabled with a
 `ReminderAutoDisabled` critical alert. The definition stays on disk so the
@@ -93,10 +101,17 @@ The retry uses bounded backoff and the same durable occurrence identity. A
 successful execution resets the consecutive failure count.
 
 A one-shot reminder stays enabled while an occurrence can retry. After a
-successful acknowledgement, Netclaw deletes its definition and history. A poison
-one-shot becomes disabled with a `Failed` outcome. Its definition and history
-remain available until an operator uses the permanent delete command.
-Startup reconciliation also removes completed one-shots from prior versions.
+successful acknowledgement, it becomes disabled with a `Completed` outcome. A
+poison one-shot becomes disabled with a `Failed` outcome. Either way the
+definition and its history stay available (`netclaw reminder history <id>`,
+`netclaw reminder status <id>`). A `Completed` one-shot is pruned with its
+history 12 days after it ran. Netclaw never prunes a `Failed` one-shot or any
+recurring reminder, whatever its state; only `netclaw reminder delete <id>`
+removes those (or removes a completed one sooner). Reminders that are disabled
+or auto-disabled do not count in the `failed` figure of `netclaw stats`, which
+counts only enabled reminders with failures. Creating a reminder with the id of
+a completed one-shot replaces it and drops its old history; a failed one-shot
+keeps its id until you delete it.
 
 Each attempt has a 20-minute inactivity limit and a one-hour absolute limit.
 The durable acknowledgement lease is 70 minutes. A daemon crash therefore lets
@@ -111,8 +126,15 @@ notices plus the disabled notice), not the unbounded skip stream.
 
 A one-shot that cannot start receives a negative acknowledgement. Akka.Reminders
 then controls its retry delay. Netclaw acknowledges and skips a blocked recurring
-occurrence. It does not keep a stale catch-up queue. The status command shows the
-skip count:
+occurrence. It does not keep a stale catch-up queue.
+
+An interval can be shorter than the one-hour attempt limit. An interval
+occurrence starts when it arrives before its next due time. If the previous run
+is still active at the next due time, Netclaw skips that occurrence. After
+downtime, Netclaw runs the current occurrence at most. It does not replay the
+occurrences that it missed.
+
+The status command shows the skip count:
 
 ```
 netclaw reminder status <id>
@@ -148,9 +170,6 @@ it, cannot read its history or status, and cannot overwrite it by reusing its ID
 in `set_reminder` — each of those calls behaves exactly as it would for an ID
 that does not exist. Do not treat "not found" as proof a reminder was deleted;
 it may exist at a higher audience than the current session.
-
-Other scheduling tools: `list_reminders`, `cancel_reminder`,
-`get_reminder_history`, and `run_reminder` (see "Test a reminder in a chat").
 
 ## Proactive channel messaging
 
@@ -284,10 +303,14 @@ approval, and no stored grant covers it. Test the reminder with
 `/run-reminder <id>` in a chat with the same audience and answer the prompt
 with an "Always" option, or run `netclaw approvals trust-verb <verb>`.
 
-**If a reminder fails with `shell_path_outside_trust_zone`:** The audience
+**If a reminder fails with `shell_path_outside_trusted_roots`:** The audience
 profile is bounded (`Roots`) and the command targets a path outside its roots.
 Either move the target into those roots, or ask the user to add the path to the
 profile. A grant cannot open it.
+
+**If a reminder fails with `shell_path_protected`:** The command uses a
+protected path, such as the config directory or the keys. No grant or profile
+change opens it. Use the CLI command for that setting.
 
 ## Background Jobs
 
