@@ -122,7 +122,7 @@ internal static class SessionCompactionPipeline
                 ClearedCount = clearedCount,
                 PreCompactionInputTokens = parameters.PreCompactionInputTokens,
                 KeepCountUsed = effectiveKeepCount
-            });
+            }, ActorRefs.NoSender);
         }
         catch (Exception ex)
         {
@@ -130,7 +130,7 @@ internal static class SessionCompactionPipeline
             {
                 OperationId = operationId,
                 Cause = ex
-            });
+            }, ActorRefs.NoSender);
         }
     }
 
@@ -231,7 +231,7 @@ internal static class SessionCompactionPipeline
                 totalChars += tc.ArgumentsJson?.Length ?? 0;
             totalChars += EstimateMediaChars(msg);
         }
-        return (int)(totalChars / 4);
+        return PromptTokenEstimate.FromCharacters(totalChars);
     }
 
     private static long EstimateMediaChars(SerializableChatMessage msg)
@@ -239,8 +239,7 @@ internal static class SessionCompactionPipeline
         var total = 0L;
         foreach (var media in msg.MediaReferences)
         {
-            // base64 inflates raw bytes by 4/3
-            total += media.FileSizeBytes * 4 / 3;
+            total += PromptTokenEstimate.MediaCharacters(media.FileSizeBytes);
         }
         return total;
     }

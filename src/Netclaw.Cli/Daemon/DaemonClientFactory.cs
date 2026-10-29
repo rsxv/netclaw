@@ -62,15 +62,15 @@ internal static class DaemonClientFactory
     }
 
     internal static ExposureMode ResolveExposureMode(NetclawPaths paths)
-        => LoadDaemonConfig(paths).ExposureMode;
+        => LoadDaemonConfig(paths, lenient: true).ExposureMode;
 
-    internal static DaemonConfig LoadDaemonConfig(NetclawPaths paths)
+    internal static DaemonConfig LoadDaemonConfig(NetclawPaths paths, bool lenient)
     {
-        var config = new ConfigurationBuilder()
-            .AddJsonFile(paths.NetclawConfigPath, optional: true, reloadOnChange: false)
-            .AddJsonFile(paths.SecretsPath, optional: true, reloadOnChange: false)
-            .AddEnvironmentVariables("NETCLAW_")
-            .Build();
+        // Optional JSON providers can treat a directory as an absent file. Preflight rejects it.
+        if (!lenient && CliConfigPreflight.TryDescribeUnreadableConfig(paths, out var message, out var fix))
+            throw new InvalidDataException($"{message} {fix}");
+
+        var config = CliConfigPreflight.AddConfigSources(new ConfigurationBuilder(), paths, lenient).Build();
 
         return DaemonConfig.BindFromConfiguration(config.GetSection("Daemon"));
     }
@@ -101,7 +101,7 @@ internal static class DaemonClientFactory
         if (!File.Exists(paths.SecretsPath))
             return null;
 
-        var dict = ConfigFileHelper.LoadJsonDict(paths.SecretsPath);
+        var dict = ConfigFileHelper.LoadJsonDict(paths.SecretsPath, readOnly: true);
         if (!dict.TryGetValue("DeviceToken", out var val))
             return null;
 

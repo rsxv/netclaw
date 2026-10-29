@@ -4,6 +4,7 @@
 // </copyright>
 // -----------------------------------------------------------------------
 using Netclaw.Actors.Jobs;
+using Netclaw.Actors.SubAgents;
 using Netclaw.Actors.Protocol;
 using Netclaw.Actors.Reminders;
 using Netclaw.Actors.Serialization;
@@ -34,10 +35,11 @@ public static partial class SessionProtocol
         /// Populated when this turn originated from a reminder firing.
         /// Format is <c>"{reminderId}:{fireTimestampMs}"</c>, matching the value
         /// placed on <see cref="Channels.MessageSource.ReminderId"/> by the
-        /// reminder dispatcher. Null for regular user turns. Used for forensics
-        /// and to rebuild the in-memory reminder dedup ledger
-        /// (<see cref="SessionState.ProcessedReminderIds"/>) from
-        /// event replay.
+        /// reminder dispatcher. Null for regular user turns. A child result notice turn
+        /// carries the link that the child run kept from the turn that started it
+        /// (<see cref="SubAgents.BackgroundChildRun.SourceReminderId"/>), and a delivery
+        /// retry turn carries the link of the turn that it repeats. The session reads it
+        /// to report a failed post of a reminder reply.
         /// </summary>
         public ReminderId? SourceReminderId { get; init; }
 
@@ -50,6 +52,18 @@ public static partial class SessionProtocol
         public BackgroundJobId? SourceBackgroundJobId { get; init; }
 
         public IReadOnlyList<InputId> ConsumedInputIds { get; init; } = [];
+
+        /// <summary>Read-only. Deployed journal rows carry it. No writer sets it.</summary>
+        public ChildContinuation? ChildContinuation { get; init; }
+
+        /// <summary>
+        /// True when a sub-agent ran a routed skill and produced this turn's reply, so the main model did not.
+        /// Replay needs it to treat the turn as the live session did: a failed post alerts but never retries
+        /// on the main model. It is false for the notice turn that posts the result of a routed-skill child
+        /// run, because the main model writes that reply, so the turn retries like any ordinary turn. A journal
+        /// entry written before this field reads as false (an ordinary turn).
+        /// </summary>
+        public bool RoutedSkill { get; init; }
 
         public DateTimeOffset RecordedAt => DateTimeOffset.FromUnixTimeMilliseconds(RecordedAtMs);
 
@@ -66,6 +80,8 @@ public static partial class SessionProtocol
 
         public InputId InputId { get; init; }
 
+        public BackgroundJobId? SourceBackgroundJobId { get; init; }
+
         public string? SourceMessageId { get; init; }
 
         public required SerializableChatMessage UserMessage { get; init; }
@@ -74,6 +90,18 @@ public static partial class SessionProtocol
         public string? ExecutableText { get; init; }
 
         public required TurnContextRecord TurnContext { get; init; }
+
+        /// <summary>
+        /// Set when the input reports the end of a child run. The kind is durable, so a rebuilt waiting input
+        /// keeps it and stays automated input even though its context names a person.
+        /// </summary>
+        public ChildNotice? ChildNotice { get; init; }
+
+        /// <summary>
+        /// Marks the continuation input that a restart drain writes for a turn that it stopped after a tool batch
+        /// (#2632, #2659). A record with no marker on the wire reads with the old shape rule.
+        /// </summary>
+        public bool ContinuesStoppedTurn { get; init; }
 
         public long AdmittedAtMs { get; init; }
 
@@ -89,7 +117,20 @@ public static partial class SessionProtocol
 
         public IReadOnlyList<InputId> InputIds { get; init; } = [];
 
+        /// <summary>Read-only. Deployed journal rows carry it. No writer sets it.</summary>
+        public ChildContinuation? ChildContinuation { get; init; }
+
+        public BackgroundJobId? SourceBackgroundJobId { get; init; }
+
+        public SerializableChatMessage? RejectedJobReport { get; init; }
+
         public long ClosedAtMs { get; init; }
+
+        /// <summary>
+        /// True when the close keeps the open turn and its noticed runs: it closes a waiting input that a newer input
+        /// replaced, or an approval notice that recovery closed. A close that ends a turn leaves it false.
+        /// </summary>
+        public bool KeepsTurn { get; init; }
 
         public DateTimeOffset Timestamp => DateTimeOffset.FromUnixTimeMilliseconds(ClosedAtMs);
     }
@@ -112,6 +153,9 @@ public static partial class SessionProtocol
 
         public IReadOnlyList<InputId> ConsumedInputIds { get; init; } = [];
 
+        /// <summary>Read-only. Deployed journal rows carry it. No writer sets it.</summary>
+        public ChildContinuation? ChildContinuation { get; init; }
+
         public DateTimeOffset Timestamp => DateTimeOffset.FromUnixTimeMilliseconds(StartedAtMs);
     }
 
@@ -125,6 +169,8 @@ public static partial class SessionProtocol
         public SessionId SessionId { get; init; }
 
         public SerializableChatMessage ToolResult { get; init; } = new();
+
+        public ActiveJobInfo? StartedBackgroundJob { get; init; }
 
         public long RecordedAtMs { get; init; }
 
@@ -170,6 +216,10 @@ public static partial class SessionProtocol
 
     public sealed record ToolApprovalRequested : ISessionEvent
     {
+        public ToolCallId? OriginalChildCallId { get; init; }
+
+        public SubAgentRunId? SourceChildRunId { get; init; }
+
         public SessionId SessionId { get; init; }
 
         public string CallId { get; init; } = string.Empty;
@@ -220,6 +270,8 @@ public static partial class SessionProtocol
 
     public sealed record ToolApprovalResolved : ISessionEvent
     {
+        public SubAgentRunId? SourceChildRunId { get; init; }
+
         public SessionId SessionId { get; init; }
 
         public string CallId { get; init; } = string.Empty;
@@ -302,6 +354,22 @@ public static partial class SessionProtocol
         public DateTimeOffset RecordedAt => DateTimeOffset.FromUnixTimeMilliseconds(RecordedAtMs);
 
         public DateTimeOffset Timestamp => RecordedAt;
+    }
+
+    /// <summary>
+    /// A fresh restart reminder authorized the continuation input <see cref="InputId"/> that the child consent pause holds
+    /// (#2659). Recovery queues only an authorized continuation behind the pause. A compaction snapshot does not block on
+    /// it. <c>SessionSnapshot.AuthorizedContinuationInputIds</c> carries the set.
+    /// </summary>
+    public sealed record ContinuationAuthorized : ISessionEvent
+    {
+        public SessionId SessionId { get; init; }
+
+        public InputId InputId { get; init; }
+
+        public long AuthorizedAtMs { get; init; }
+
+        public DateTimeOffset Timestamp => DateTimeOffset.FromUnixTimeMilliseconds(AuthorizedAtMs);
     }
 
     /// <summary>

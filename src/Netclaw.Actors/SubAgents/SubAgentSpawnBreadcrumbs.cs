@@ -44,28 +44,20 @@ internal static class SubAgentSpawnBreadcrumbs
                 agentName);
     }
 
+    public static void NoResultReader(ILogger? logger, ToolInvocationContext context, string agentName)
+    {
+        using (BeginSessionScope(logger, context.SessionId))
+            logger?.LogWarning(
+                "SubAgent [{AgentName}] was refused: the parent audience policy does not allow file_read, so the parent cannot read the result",
+                agentName);
+    }
+
     public static void ChildSpawnFailed(ILogger? logger, ToolInvocationContext context, string agentName, SubAgentRunId runId, Exception ex)
     {
         using (BeginSessionScope(logger, context.SessionId))
             logger?.LogError(
                 ex, "SubAgent [{AgentName}] failed to spawn child actor (runId={RunId})",
                 agentName, runId.Value);
-    }
-
-    public static void ChildSpawned(ILogger? logger, ToolInvocationContext context, string agentName, SubAgentRunId runId)
-    {
-        using (BeginSessionScope(logger, context.SessionId))
-            logger?.LogInformation(
-                "SubAgent [{AgentName}] child actor spawned (runId={RunId}); dispatching RunSubAgent",
-                agentName, runId.Value);
-    }
-
-    public static void Completed(ILogger? logger, ToolInvocationContext context, string agentName, SubAgentRunId runId, bool success, long durationMs)
-    {
-        using (BeginSessionScope(logger, context.SessionId))
-            logger?.LogInformation(
-                "SubAgent [{AgentName}] completed (runId={RunId}, success={Success}, duration={Duration}ms)",
-                agentName, runId.Value, success, durationMs);
     }
 
     public static void RunFailed(ILogger? logger, ToolInvocationContext context, string agentName, SubAgentRunId runId, Exception ex)

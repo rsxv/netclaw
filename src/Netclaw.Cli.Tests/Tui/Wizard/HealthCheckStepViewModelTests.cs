@@ -17,10 +17,14 @@ using Xunit;
 
 namespace Netclaw.Cli.Tests.Tui.Wizard;
 
+// The class sets NETCLAW_DAEMON_PATH for the whole process, so it must not run in parallel with a
+// test that starts a daemon.
+[Collection(LegacyModelEnvironmentCollection.Name)]
 public sealed class HealthCheckStepViewModelTests : IDisposable
 {
     private readonly DisposableTempDir _dir = new();
     private readonly NetclawPaths _paths;
+    private readonly string? _originalDaemonPath = Environment.GetEnvironmentVariable("NETCLAW_DAEMON_PATH");
 
     public HealthCheckStepViewModelTests()
     {
@@ -30,7 +34,7 @@ public sealed class HealthCheckStepViewModelTests : IDisposable
 
     public void Dispose()
     {
-        Environment.SetEnvironmentVariable("NETCLAW_DAEMON_PATH", null);
+        Environment.SetEnvironmentVariable("NETCLAW_DAEMON_PATH", _originalDaemonPath);
         _dir.Dispose();
     }
 
@@ -224,7 +228,7 @@ public sealed class HealthCheckStepViewModelTests : IDisposable
             }
             return response;
         });
-        var daemonApi = new DaemonApi(new StubHttpClientFactory(handler), new ConfigurationBuilder().Build(), _paths);
+        var daemonApi = new DaemonApi(new StubHttpClientFactory(handler), new ConfigurationBuilder().Build(), _paths, DaemonApiTestDependencies.CreateProofProtector(), TimeProvider.System);
 
         using var step = new HealthCheckStepViewModel(
             daemonManager,
@@ -293,7 +297,7 @@ public sealed class HealthCheckStepViewModelTests : IDisposable
             daemonApi: null,
             navigationState: new ChatNavigationState())
         {
-            SystemdService = new SystemdUserService(unitFilePath: Path.Combine(_dir.Path, "absent.service"), homePath: _dir.Path)
+            SystemdService = new SystemdUserService(_dir.Path, unitFilePath: Path.Combine(_dir.Path, "absent.service"))
         };
         var launched = false;
         step.Navigate = _ => launched = true;
@@ -336,7 +340,7 @@ public sealed class HealthCheckStepViewModelTests : IDisposable
             navigationState: new ChatNavigationState())
         {
             SystemdService = new SystemdUserService(
-                unitPath, runner, enabledOnThisPlatform: true, homePath: SystemdUserService.DefaultHomePath)
+                SystemdUserService.DefaultHomePath, unitPath, runner, enabledOnThisPlatform: true)
         };
         step.Navigate = _ => { };
         using var exposureStep = new ExposureModeStepViewModel { SelectedMode = ExposureMode.Local };

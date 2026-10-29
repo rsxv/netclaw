@@ -46,12 +46,12 @@ public sealed partial class SetReminderTool : NetclawTool<SetReminderTool.Params
         [property: Description("Schedule value: relative time, ISO 8601 datetime, interval duration, or cron expression (optional 'CRON_TZ=<IANA-time-zone-id>' prefix for timezone-aware cron, e.g. 'CRON_TZ=Europe/Brussels 0 9 * * *').")]
         string Schedule,
         [property: Description("How to deliver results: 'current_session' (reply here), 'channel' (post to a target), or 'none' (silent execution).")]
-        string? DeliveryKind = null,
+        string DeliveryKind,
         [property: Description("Transport for channel delivery (e.g., 'slack' or 'discord'). Required when delivery_kind='channel'.")]
         string? DeliveryTransport = null,
         [property: Description("Target for channel delivery (e.g., '#general', '@user', '<@discordUserId>', channel ID). Required when delivery_kind='channel'.")]
         string? DeliveryAddress = null,
-        [property: Description("Fail execution if delivery doesn't succeed. Default true. Set false for audit/cleanup tasks.")]
+        [property: Description("Fail execution if a channel delivery doesn't succeed. Default true. Set false for audit/cleanup tasks. No effect for current_session delivery.")]
         bool DeliveryRequired = true,
         [property: Description("Optional guidance for what to include in the delivery to the user. Content guidance only.")]
         string? DeliveryInstructions = null,
@@ -293,7 +293,7 @@ public sealed partial class SetReminderTool : NetclawTool<SetReminderTool.Params
 
         var scheduleDesc = schedule.Type switch
         {
-            ReminderScheduleType.OneShot => $"Runs once. Next execution: {nextFireStr}.",
+            ReminderScheduleType.OneShot => $"Runs once. Next execution: {nextFireStr}. The reminder deletes itself after it runs or after you cancel it.",
             ReminderScheduleType.Interval => $"Runs every {FormatInterval(schedule.Interval!.Value)}. Next execution: {nextFireStr}.",
             ReminderScheduleType.Cron => $"Runs {CronScheduleHelper.Describe(schedule.CronExpression!)}. Next execution: {nextFireStr}.",
             _ => $"Next execution: {nextFireStr}."

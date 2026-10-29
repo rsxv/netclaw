@@ -179,7 +179,28 @@ public static partial class SessionProtocol
         /// Null for non-reminder turns.
         /// </summary>
         public ReminderId? SourceReminderId { get; init; }
+
+        /// <summary>
+        /// True only when the session ended the turn on purpose with no new reply, after the model ignored the
+        /// escalated nudge for a refused repeat. A channel binding then posts no empty-turn fallback, because
+        /// that text is Netclaw text and the person must see only text of the model. Every other turn, also an
+        /// empty one, sets false. The wire field is optional: a missing field reads as false.
+        /// </summary>
+        public bool QuietEnd { get; init; }
+
+        /// <summary>
+        /// The child runs whose result has not yet had its follow-up parent turn. The session assigns it
+        /// from its durable state for every outcome. Empty means no open run, and a client reads an absent
+        /// wire field as empty. See the "open child run" term in the engineering glossary.
+        /// </summary>
+        public required IReadOnlyList<SubAgentRunId> OpenChildRunIds { get; init; }
     }
+
+    /// <summary>
+    /// Signals that the session actor will stop after committed passivation.
+    /// Lifecycle — always delivered regardless of <see cref="OutputFilter"/>.
+    /// </summary>
+    public sealed record SessionDeactivated : SessionOutput;
 
     /// <summary>
     /// Session title was generated or updated by the LLM.
@@ -209,7 +230,21 @@ public static partial class SessionProtocol
         Unknown,
 
         /// <summary>The active model cannot accept the complete session input.</summary>
-        InputCompatibility
+        InputCompatibility,
+
+        /// <summary>
+        /// The model broke a rule that the runtime enforces: it kept returning empty replies and each
+        /// stream finished with Stop or Length, it ended a text reply on the output limit (Length) with
+        /// no tool call, or one call streamed only thinking until the thinking cap. The provider worked.
+        /// The model did not comply. Empty replies from a stream with no finish reason are
+        /// <see cref="StreamFailure"/>. A repeated refused tool call is not a failure: the runtime
+        /// refuses it again and nudges the model.
+        /// </summary>
+        /// <remarks>
+        /// New members go last. The wire carries this enum by name, and an older reader maps an
+        /// unknown name to <see cref="Unknown"/>.
+        /// </remarks>
+        ModelBehavior
     }
 
     /// <summary>
@@ -463,7 +498,32 @@ public static partial class SessionProtocol
         /// True when adopted-context provenance was preserved in stored approval state.
         /// </summary>
         public bool PersistedAdoptedContext { get; init; }
+
+        /// <summary>
+        /// How long a channel keeps the prompt pending. A parent prompt lives until the turn ends. A child prompt
+        /// lives until an answer or a close. Renderers do not show it.
+        /// </summary>
+        public ToolInteractionLifetime Lifetime { get; init; } = ToolInteractionLifetime.UntilTurnEnd;
     }
+
+    /// <summary>
+    /// The lifetime of a pending prompt on a channel. The default is the lifetime of today's prompts.
+    /// </summary>
+    public enum ToolInteractionLifetime
+    {
+        /// <summary>The channel clears the prompt at the end of the turn or at a turn error.</summary>
+        UntilTurnEnd = 0,
+
+        /// <summary>The channel keeps the prompt until an answer or a close.</summary>
+        UntilClosed = 1
+    }
+
+    /// <summary>
+    /// An open child consent prompt closed: a person answered it, or the session withdrew it with no answer. A channel
+    /// finds its prompt by <see cref="CallId"/>, redraws it as closed with the reason text, and removes it. The output
+    /// is not persisted. Lifecycle — always delivered regardless of <see cref="OutputFilter"/>.
+    /// </summary>
+    public sealed record ToolInteractionClosed(ToolCallId CallId, ToolInteractionCloseReason Reason) : SessionOutput;
 
     /// <summary>
     /// An option presented to the user in a <see cref="ToolInteractionRequest"/>.

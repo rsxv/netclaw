@@ -162,6 +162,52 @@ public sealed class RetryingChatClientTests
     }
 
     [Fact]
+    public async Task StreamingRetries_WhenFailureFollowsOnlyLifecycleUpdates()
+    {
+        // The Responses adapter yields content-free lifecycle updates before any output;
+        // a failure after those is still pre-first-chunk and must be retried without
+        // leaking the failed attempt's ids.
+        var attempts = 0;
+        var fake = new FakeChatClient(streamHandler: (_, _, ct) =>
+        {
+            attempts++;
+            return attempts == 1
+                ? LifecycleThenThrow("resp-1", ct)
+                : LifecycleThenText("resp-2", ct);
+        });
+        var client = new RetryingChatClient(fake, _policy, NullLogger.Instance);
+
+        var updates = new List<ChatResponseUpdate>();
+        await foreach (var u in client.GetStreamingResponseAsync(
+            [new ChatMessage(ChatRole.User, "hi")], cancellationToken: TestContext.Current.CancellationToken))
+        {
+            updates.Add(u);
+        }
+
+        Assert.Equal(2, attempts);
+        Assert.DoesNotContain(updates, u => u.ResponseId == "resp-1");
+        var response = updates.ToChatResponse();
+        Assert.Equal("resp-2", response.ResponseId);
+        Assert.Equal("done", Assert.Single(response.Messages).Text);
+    }
+
+    [Fact]
+    public async Task StreamingReleasesHeldUpdates_WhenStreamEndsWithoutOutput()
+    {
+        var fake = new FakeChatClient(streamHandler: (_, _, ct) => LifecycleOnly("resp-only", ct));
+        var client = new RetryingChatClient(fake, _policy, NullLogger.Instance);
+
+        var updates = new List<ChatResponseUpdate>();
+        await foreach (var u in client.GetStreamingResponseAsync(
+            [new ChatMessage(ChatRole.User, "hi")], cancellationToken: TestContext.Current.CancellationToken))
+        {
+            updates.Add(u);
+        }
+
+        Assert.Equal("resp-only", updates.ToChatResponse().ResponseId);
+    }
+
+    [Fact]
     public async Task StreamingDoesNotRetryAfterFirstChunk()
     {
         var attempts = 0;
@@ -291,58 +337,39 @@ public sealed class RetryingChatClientTests
         yield return new ChatResponseUpdate { Role = ChatRole.Assistant, Contents = [new TextContent("partial")] };
         throw new HttpRequestException("mid-stream failure", null, HttpStatusCode.InternalServerError);
     }
-}
 
-/// <summary>
-/// Minimal IChatClient test double.
-/// </summary>
-internal sealed class FakeChatClient : IChatClient
-{
-    private readonly Func<IEnumerable<ChatMessage>, ChatOptions?, CancellationToken, Task<ChatResponse>>? _handler;
-    private readonly Func<IEnumerable<ChatMessage>, ChatOptions?, CancellationToken, IAsyncEnumerable<ChatResponseUpdate>>? _streamHandler;
+    private static ChatResponseUpdate Lifecycle(string responseId) =>
+        new() { Role = ChatRole.Assistant, ResponseId = responseId, MessageId = responseId + "-msg" };
 
-    public FakeChatClient(
-        Func<IEnumerable<ChatMessage>, ChatOptions?, CancellationToken, Task<ChatResponse>>? handler = null,
-        bool streaming = false,
-        Func<IEnumerable<ChatMessage>, ChatOptions?, CancellationToken, IAsyncEnumerable<ChatResponseUpdate>>? streamHandler = null)
+    private static async IAsyncEnumerable<ChatResponseUpdate> LifecycleThenThrow(
+        string responseId, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        _ = streaming;
-        _handler = handler;
-        _streamHandler = streamHandler;
+        await Task.Yield();
+        cancellationToken.ThrowIfCancellationRequested();
+        yield return Lifecycle(responseId);
+        throw new HttpRequestException("stream failed after lifecycle updates", null, HttpStatusCode.ServiceUnavailable);
     }
 
-    public Task<ChatResponse> GetResponseAsync(
-        IEnumerable<ChatMessage> messages,
-        ChatOptions? options = null,
-        CancellationToken cancellationToken = default)
+    private static async IAsyncEnumerable<ChatResponseUpdate> LifecycleThenText(
+        string responseId, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        if (_handler is not null)
-            return _handler(messages, options, cancellationToken);
-
-        return Task.FromResult(new ChatResponse([new ChatMessage(ChatRole.Assistant, "default")]));
-    }
-
-    public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
-        IEnumerable<ChatMessage> messages,
-        ChatOptions? options = null,
-        CancellationToken cancellationToken = default)
-    {
-        if (_streamHandler is not null)
-            return _streamHandler(messages, options, cancellationToken);
-
-        return StreamAsync();
-    }
-
-    private async IAsyncEnumerable<ChatResponseUpdate> StreamAsync()
-    {
-        await Task.CompletedTask;
+        await Task.Yield();
+        cancellationToken.ThrowIfCancellationRequested();
+        yield return Lifecycle(responseId);
         yield return new ChatResponseUpdate
         {
             Role = ChatRole.Assistant,
-            Contents = [new TextContent("streamed")]
+            ResponseId = responseId,
+            MessageId = responseId + "-msg",
+            Contents = [new TextContent("done")],
         };
     }
 
-    public object? GetService(Type serviceType, object? serviceKey = null) => null;
-    public void Dispose() { }
+    private static async IAsyncEnumerable<ChatResponseUpdate> LifecycleOnly(
+        string responseId, [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await Task.Yield();
+        cancellationToken.ThrowIfCancellationRequested();
+        yield return Lifecycle(responseId);
+    }
 }

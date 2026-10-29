@@ -121,6 +121,38 @@ public sealed class ShellProcessLaunchTests
     [SlopwatchSuppress("SW001", "This test requires native POSIX symbolic-link behavior.")]
     [Fact(SkipType = typeof(TestPlatform), SkipUnless = nameof(TestPlatform.IsPosix),
         Skip = "POSIX-only symbolic-link semantics")]
+    public async Task Final_start_rejects_a_compound_redirect_link_that_changes_after_authorization()
+    {
+        using var directory = new DisposableTempDir();
+        var safe = Directory.CreateDirectory(Path.Combine(directory.Path, "safe"));
+        var denied = Directory.CreateDirectory(Path.Combine(directory.Path, "denied"));
+        var link = Path.Combine(directory.Path, "target");
+        Directory.CreateSymbolicLink(link, safe.FullName);
+        var environment = TestShellEnvironment.Current;
+        var context = TestToolExecutionContext.CreateBound("launch/compound-path", directory.Path, TrustAudience.Personal);
+        var launch = new ShellProcessLaunch(
+            "while false; do :; done > target/output.txt",
+            directory.Path,
+            context.Invocation,
+            new ShellCommandPolicy(environment),
+            new ToolPathPolicy(environment, [denied.FullName]),
+            _ =>
+            {
+                Directory.Delete(link);
+                Directory.CreateSymbolicLink(link, denied.FullName);
+                return Task.CompletedTask;
+            });
+
+        var error = await Assert.ThrowsAsync<ShellProcessStartException>(() =>
+            launch.StartAsync(TestContext.Current.CancellationToken));
+
+        Assert.Contains("protected file path", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(Path.Combine(denied.FullName, "output.txt")));
+    }
+
+    [SlopwatchSuppress("SW001", "This test requires native POSIX symbolic-link behavior.")]
+    [Fact(SkipType = typeof(TestPlatform), SkipUnless = nameof(TestPlatform.IsPosix),
+        Skip = "POSIX-only symbolic-link semantics")]
     public async Task Final_start_rejects_a_link_in_a_projected_child_scope()
     {
         using var directory = new DisposableTempDir();
@@ -144,6 +176,30 @@ public sealed class ShellProcessLaunchTests
 
         Assert.Equal("shell_launch_paths_changed", error.DenyReason);
         Assert.False(File.Exists(Path.Combine(denied.FullName, "marker.txt")));
+    }
+
+    [SlopwatchSuppress("SW001", "This test requires native POSIX symbolic-link behavior.")]
+    [Fact(SkipType = typeof(TestPlatform), SkipUnless = nameof(TestPlatform.IsPosix),
+        Skip = "POSIX-only symbolic-link semantics")]
+    public async Task Launch_rejects_a_link_at_the_parent_of_the_session_workspace()
+    {
+        using var directory = new DisposableTempDir();
+        var target = Directory.CreateDirectory(Path.Combine(directory.Path, "target"));
+        var link = Path.Combine(directory.Path, "link");
+        Directory.CreateSymbolicLink(link, target.FullName);
+        var workspace = Path.Combine(link, "workspace");
+        var environment = TestShellEnvironment.Current;
+        var context = TestToolExecutionContext.CreateBound("launch/parent-link", workspace, TrustAudience.Personal);
+        var launch = new ShellProcessLaunch("echo ok", workspace, context.Invocation,
+            new ShellCommandPolicy(environment), new ToolPathPolicy(environment, []), static _ => Task.CompletedTask);
+
+        var error = await Assert.ThrowsAsync<ShellProcessStartException>(() =>
+            launch.StartAsync(TestContext.Current.CancellationToken));
+
+        Assert.Contains("session folder above the workspace", error.Message, StringComparison.OrdinalIgnoreCase);
+        // Nothing was created behind the link, not even the managed temporary
+        // directory, because the workspace check runs before its creation.
+        Assert.False(Directory.Exists(Path.Combine(target.FullName, "workspace")));
     }
 
     [SlopwatchSuppress("SW001", "This test uses the native Bash TCP redirection and process identifiers.")]

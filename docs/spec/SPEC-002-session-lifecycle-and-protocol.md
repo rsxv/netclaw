@@ -72,6 +72,53 @@ retains synchronous execution behavior. This internal composition does not
 change MCP schemas, persisted actor messages, approval outcomes, or model-facing
 tool results.
 
+### Tool Outcomes Without Progress
+
+`TurnStateTracker` owns an actor-local count of failed calls since the last
+successful batch. This rule supports PRD-001 and PRD-006. See
+[the engineering glossary](GLOSSARY.md) for shared terms.
+
+The tracker counts each actual failed call, including duplicates in one batch.
+It also keeps a weighted score and an escalation stage.
+A `NotFound` result adds half a point because a missing path can guide discovery.
+Each other failure adds one point. `InvalidInput` and `AccessDenied` therefore reach advice after four calls.
+The nudge text reports the actual call count, regardless of category.
+
+Any actual success in a batch resets the count, score, and stage.
+Synthetic cycle corrections and pending-job receipts neither increase nor reset them.
+The parent journal stores each receipt category and its synthetic and pending-job flags.
+An approval re-drive preserves the full batch and observes each outcome once at completion.
+A legacy sibling without receipt facts causes explicit batch abandonment before the re-drive.
+A child park stores the count, score, stage, and any sibling success or failure through the protobuf mapper.
+A sibling success applies until the feedback batch completes.
+
+The batch owner observes outcomes before it selects a nudge.
+Scores of 4, 6, and 8 select advice, escalation, and a quiet end of the turn.
+One completed batch advances at most one stage, so a wide batch cannot skip advice.
+The true count and score retain all failures, including those beyond the next threshold.
+The next response with tool calls ends the turn at the final stage.
+The model can still give a final text response.
+This rule adds no iteration limit or per-call refusal.
+
+The advice selector compares severity before detector priority.
+At equal severity, action advice wins over cause advice, and cause advice wins over budget advice.
+The cause detector retains six completed feedback batches and escalates only advice that the model receives.
+A batch without that cause retires its active advice. Recent evidence can still trigger a later first nudge.
+A consent park preserves the history, delivered advice, and unfinished cause facts through protobuf.
+See [the loop contract](tool-loop-detection.md) for examples and the complete decision flow.
+
+For example, four failures across four tools produce a progress nudge.
+Three failed edit attempts followed by a success produce no progress nudge.
+
+```text
+complete dispatch
+  -> observe actual outcomes once
+  -> reset on success, otherwise add failures
+  -> select one nudge from the stage, actual count, and repeat decision
+  -> ask the model for its next response
+  -> end quietly at the final stage if the response requests tools
+```
+
 ### Working Context and Child Runs
 
 For Team and Personal turns with a declared project directory, the session
@@ -140,22 +187,17 @@ Checked after each `TurnRecorded` persist callback.
 - Preserves reasoning/action history
 - Re-check threshold — may be sufficient without summarization
 
-**Phase 2: Pre-compaction memory flush** (LLM call)
-- Structured extraction prompt: key facts, decisions, action items
-- Persist extracted memories to external storage (MCP memorizer)
-- Ensures durable context survives the lossy summarization step
+**Phase 2: Extractive reduction and observation**
+- Keep recent messages and preserve tool call/result pairs.
+- Use the compaction model to observe discarded history.
+- Keep a prior summary when a later compaction runs.
+- Persist the `SessionCompacted` event.
+- Request a high-priority memory checkpoint when the actor resolves an audience.
+- Take a persistence snapshot.
+- Emit a compaction notification to subscribers.
 
-**Phase 3: Structured summarization** (LLM call)
-- Domain-specific section headings (not generic "summarize this"):
-  - Task overview and goals
-  - Current state and progress
-  - Key decisions and their rationale
-  - Pending actions and blockers
-  - User preferences and context to preserve
-- Anchored iterative merging when prior summary exists
-- Persist `SessionCompacted` event
-- Take persistence snapshot
-- Emit compaction notification to subscribers
+Background curation uses the checkpoint. The session does not wait for curation.
+See [the current memory contract](../../openspec/specs/netclaw-agent-memory/spec.md).
 
 ### Compaction Model
 

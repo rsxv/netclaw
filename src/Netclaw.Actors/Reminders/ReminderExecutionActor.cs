@@ -25,23 +25,10 @@ namespace Netclaw.Actors.Reminders;
 /// </summary>
 internal sealed class ReminderExecutionActor : ReceiveActor, IWithTimers
 {
-    /// <summary>
-    /// Timer keys for the two IWithTimers backstops. Distinct keys so arming
-    /// one never cancels the other.
-    /// </summary>
+    // The provenance source kind of a reminder fire. Session recovery uses it to restore the reminder id of a waiting input.
+    internal const string ReminderSourceKind = "reminder";
+
     private static readonly object ExecutionAttemptTimerKey = new();
-    private static readonly object DeliveryBackstopTimerKey = new();
-    /// <summary>
-    /// Backstop timeout for CurrentSession reminders with
-    /// <c>DeliveryRequired=true</c> waiting for a
-    /// <see cref="ReminderDeliveryResult"/> after session <see cref="CommandAck"/>.
-    /// The binding actor normally reports delivery success OR failure
-    /// explicitly (so failures redeliver fast); this timeout only fires when
-    /// the binding actor never responds at all — e.g. it crashed mid-turn.
-    /// It is deliberately generous: firing it early on a slow-but-live turn
-    /// would report a false failure and redeliver, duplicating the message.
-    /// </summary>
-    internal static TimeSpan DeliveryObservedTimeout = TimeSpan.FromHours(1);
 
     /// <summary>
     /// Backstop inactivity ceiling for the Mode A (Channel / own-pipeline) path.
@@ -52,8 +39,8 @@ internal sealed class ReminderExecutionActor : ReceiveActor, IWithTimers
     /// (see #1492). A <see cref="ReceiveTimeout"/> reset by every session output
     /// fires after this much silence and concludes the run as failed, releasing
     /// the guard so the next fire can run. Reset by real output, so it never
-    /// preempts a live turn. Mode B (CurrentSession) does NOT arm this — its wait
-    /// is bounded separately by <see cref="DeliveryObservedTimeout"/>.
+    /// preempts a live turn. CurrentSession reminders that resume a local
+    /// Reminder session also use this to bound terminal output after admission.
     /// </summary>
     internal static TimeSpan ExecutionStallTimeout = TimeSpan.FromMinutes(20);
 
@@ -73,13 +60,13 @@ internal sealed class ReminderExecutionActor : ReceiveActor, IWithTimers
     private readonly ExecutionOutputAccumulator _accumulator;
     private bool _completed;
     private string? _sessionIdValue;
-    private bool _awaitingDeliveryResult;
+    private bool _awaitingReminderSessionAck;
     private ReminderId? _expectedReminderDeliveryKey;
 
     /// <summary>
     /// Timer scheduler injected by Akka for <see cref="IWithTimers"/>. Timers
     /// are canceled automatically when the actor stops, so the one-shot
-    /// backstops can never fire after settlement stops the actor.
+    /// backstop can never fire after settlement stops the actor.
     /// </summary>
     public ITimerScheduler Timers { get; set; } = null!;
     private bool _settlementStarted;
@@ -124,8 +111,8 @@ internal sealed class ReminderExecutionActor : ReceiveActor, IWithTimers
 
         Receive<ExecutionOutput>(HandleOutput);
         Receive<ExecutionStarted>(_ => { });
-        Receive<ReminderDeliveryResult>(HandleDeliveryResult);
-        Receive<DeliveryBackstopTimeout>(HandleDeliveryBackstopTimeout);
+        Receive<CommandAck>(HandleReminderSessionAck);
+        Receive<CommandNack>(HandleReminderSessionNack);
         Receive<ExecutionAttemptTimeoutReached>(_ => HandleExecutionAttemptTimeout());
         Receive<OutputStreamTerminated>(HandleOutputStreamTerminated);
         Receive<ReminderExecutionAccepted>(HandleExecutionAccepted);
@@ -189,7 +176,7 @@ internal sealed class ReminderExecutionActor : ReceiveActor, IWithTimers
                     TransportAuthenticity.LocalProcess,
                     PayloadTaint.Trusted)
                 {
-                    SourceKind = new SourceKind("reminder")
+                    SourceKind = new SourceKind(ReminderSourceKind)
                 },
                 Contents = [new TextContent(prompt)],
                 ReceivedAt = _timeProvider.GetUtcNow(),
@@ -215,14 +202,11 @@ internal sealed class ReminderExecutionActor : ReceiveActor, IWithTimers
     }
 
     /// <summary>
-    /// Mode B dispatches the reminder as a <c>DeliverTrustedSessionTurn</c>
-    /// to the origin gateway. It reports success after the target session accepts the turn.
-    /// When <c>DeliveryRequired</c> is true, success also requires a
-    /// <see cref="ReminderDeliveryResult"/> reporting an actual successful
-    /// post (the binding actor tells it directly via
-    /// <c>MessageSource.DeliveryObserver</c>). On <c>CommandNack</c>, a
-    /// delivery failure, the backstop timeout, or an exception produces a failed outcome.
-    /// The reminder manager settles the Akka.Reminders occurrence.
+    /// Current-session reminders from channel origins use the origin gateway.
+    /// Reminder-origin sessions use the local session pipeline and settle on
+    /// terminal output. A gateway run ends when the session acknowledges the
+    /// fire (admission). A rejection, timeout, or exception produces a failed
+    /// outcome. The reminder manager settles the Akka.Reminders occurrence.
     /// </summary>
     private async Task InitializeCurrentSessionAsync()
     {
@@ -240,8 +224,8 @@ internal sealed class ReminderExecutionActor : ReceiveActor, IWithTimers
             // re-runs it (duplicate delivery). The envelope's scheduled fire time
             // (DueTimeUtc) is identical on every redelivery; _dispatchedAt is
             // captured fresh per execution actor and drifts, defeating the dedup.
-            var fireTimeMs = _envelope.DueTimeUtc.ToUnixTimeMilliseconds();
-            var reminderDeliveryKey = $"{_definition.Id}:{fireTimeMs}";
+            var reminderDeliveryKey = new ReminderFireKey(
+                _definition.Id, _envelope.DueTimeUtc.ToUnixTimeMilliseconds()).Value;
 
             _log.Info(
                 "ReminderExecution CurrentSession Initialized: execution_id={ExecutionId} reminder_id={ReminderId} session_id={SessionId} origin={Origin} audience={Audience}",
@@ -260,17 +244,17 @@ internal sealed class ReminderExecutionActor : ReceiveActor, IWithTimers
                     TransportAuthenticity.LocalProcess,
                     PayloadTaint.Trusted)
                 {
-                    SourceKind = new SourceKind("reminder")
+                    SourceKind = new SourceKind(ReminderSourceKind)
                 },
                 ReceivedAt = _dispatchedAt,
-                ReminderId = new ReminderId(reminderDeliveryKey),
-                // Only reminders that gate on delivery need a confirmation
-                // channel. The binding actor tells this ref a
-                // ReminderDeliveryResult on turn completion; leaving it null
-                // for non-required reminders avoids a dead-letter when this
-                // actor has already acked and stopped.
-                DeliveryObserver = _definition.DeliveryRequired ? Self : null
+                ReminderId = new ReminderId(reminderDeliveryKey)
             };
+
+            if (originChannelType == Channels.ChannelType.Reminder)
+            {
+                await DeliverToReminderSessionAsync(sessionId, source, BuildPrompt(_definition));
+                return;
+            }
 
             var gateway = ResolveGatewayFor(originChannelType);
             if (gateway is null)
@@ -291,18 +275,8 @@ internal sealed class ReminderExecutionActor : ReceiveActor, IWithTimers
                             "reminder_current_session_dispatch_acked execution_id={ExecutionId} reminder_id={ReminderId} session_id={SessionId}",
                             _executionId, _definition.Id, sessionId.Value);
 
-                        if (_definition.DeliveryRequired)
-                        {
-                            // Do NOT await the delivery result here: this runs
-                            // inside RunTask, which suspends the mailbox until
-                            // the task completes — the actor could not process
-                            // the ReminderDeliveryResult message it is waiting
-                            // for. Arm state + a backstop timer and return; the
-                            // result (or timeout) is handled as a normal message.
-                            BeginAwaitingDeliveryResult(new ReminderId(reminderDeliveryKey));
-                            break;
-                        }
-
+                        // Admission ends the run. What the session does with the fire
+                        // after the ack is the session's job, not the reminder system's.
                         ReportOutcome(true);
                         break;
 
@@ -336,69 +310,93 @@ internal sealed class ReminderExecutionActor : ReceiveActor, IWithTimers
         }
     }
 
-    /// <summary>
-    /// Enters the message-driven "waiting for delivery confirmation" state and
-    /// schedules a backstop timeout. Runs at the tail of the dispatch
-    /// <c>RunTask</c>; once that task returns, the actor resumes normal mailbox
-    /// processing and can handle the <see cref="ReminderDeliveryResult"/> the
-    /// binding actor tells it (or the <see cref="DeliveryBackstopTimeout"/>).
-    /// </summary>
-    private void BeginAwaitingDeliveryResult(ReminderId reminderDeliveryKey)
+    private async Task DeliverToReminderSessionAsync(
+        SessionId sessionId,
+        MessageSource source,
+        string content)
     {
-        _awaitingDeliveryResult = true;
-        _expectedReminderDeliveryKey = reminderDeliveryKey;
+        var self = Self;
+        var inputWriter = await _handle.InitializeWithChannelAsync(
+            Context,
+            sessionId,
+            new SessionPipelineOptions
+            {
+                ChannelType = Channels.ChannelType.Reminder,
+                Filter = OutputFilter.Text | OutputFilter.TextStreaming | OutputFilter.ToolCalls
+            },
+            output => self.Tell(new ExecutionOutput(output)),
+            (_, failure) => self.Tell(new OutputStreamTerminated(failure)));
+
+        _expectedReminderDeliveryKey = source.ReminderId;
+        _awaitingReminderSessionAck = true;
         Timers.StartSingleTimer(
-            DeliveryBackstopTimerKey,
-            new DeliveryBackstopTimeout(reminderDeliveryKey),
-            DeliveryObservedTimeout);
+            ExecutionAttemptTimerKey,
+            ExecutionAttemptTimeoutReached.Instance,
+            ReminderSettings.DefaultAckTimeout);
+
+        await inputWriter.WriteAsync(new ChannelInput
+        {
+            SenderId = source.SenderId,
+            ChannelId = source.ChannelId,
+            MessageId = source.MessageId,
+            Audience = source.Audience,
+            Boundary = source.Boundary,
+            Principal = source.Principal,
+            Provenance = source.Provenance,
+            Contents = [new TextContent(content)],
+            ReceivedAt = source.ReceivedAt,
+            ReminderId = source.ReminderId,
+            AckTarget = Self
+        });
+
+        Context.SetReceiveTimeout(ExecutionStallTimeout);
     }
 
-    private void HandleDeliveryResult(ReminderDeliveryResult result)
+    private void HandleReminderSessionAck(CommandAck ack)
     {
-        if (!_awaitingDeliveryResult || _expectedReminderDeliveryKey is not { } expectedKey)
+        if (!_awaitingReminderSessionAck
+            || _sessionIdValue is null
+            || !string.Equals(ack.SessionId.Value, _sessionIdValue, StringComparison.Ordinal))
             return;
 
-        // Correlate on the delivery key alone. The result was told point-to-
-        // point to this actor's own Self (via MessageSource.DeliveryObserver),
-        // and the key is unique per execution — matching the reported
-        // ChannelType too would only fail closed (e.g. a cold SignalR actor
-        // reports its default Tui rather than the origin SignalR), silently
-        // dropping a valid result and stalling on the backstop.
-        if (result.ReminderDeliveryKey != expectedKey)
-            return;
-
-        _awaitingDeliveryResult = false;
-        Timers.Cancel(DeliveryBackstopTimerKey);
-
-        if (result.Delivered)
+        _awaitingReminderSessionAck = false;
+        if (ack is RestartResumeNotNeeded)
         {
+            // This message resumes nothing, so no turn will run for it and no terminal output will come. The run is done.
             _log.Info(
-                "reminder_delivery_observed execution_id={ExecutionId} reminder_id={ReminderId} key={ReminderDeliveryKey} channel={ChannelType}",
-                _executionId, _definition.Id, result.ReminderDeliveryKey, result.ChannelType);
+                "reminder_restart_noop_settled execution_id={ExecutionId} session_id={SessionId}",
+                _executionId,
+                _sessionIdValue);
             ReportOutcome(true);
+            return;
         }
-        else
+
+        var remaining = ExecutionAttemptTimeout - (_timeProvider.GetUtcNow() - _dispatchedAt);
+        if (remaining <= TimeSpan.Zero)
         {
-            _log.Warning(
-                "reminder_delivery_failed execution_id={ExecutionId} reminder_id={ReminderId} key={ReminderDeliveryKey} channel={ChannelType} reason={Reason}",
-                _executionId, _definition.Id, result.ReminderDeliveryKey, result.ChannelType, result.FailureReason);
-            ReportOutcome(false, result.FailureReason ?? "channel reported delivery failure");
+            HandleExecutionAttemptTimeout();
+            return;
         }
+
+        Timers.StartSingleTimer(
+            ExecutionAttemptTimerKey,
+            ExecutionAttemptTimeoutReached.Instance,
+            remaining);
+        _log.Info(
+            "reminder_restart_session_accepted execution_id={ExecutionId} session_id={SessionId}",
+            _executionId,
+            _sessionIdValue);
     }
 
-    private void HandleDeliveryBackstopTimeout(DeliveryBackstopTimeout msg)
+    private void HandleReminderSessionNack(CommandNack nack)
     {
-        if (!_awaitingDeliveryResult || _expectedReminderDeliveryKey is not { } expectedKey)
+        if (!_awaitingReminderSessionAck
+            || _sessionIdValue is null
+            || !string.Equals(nack.SessionId.Value, _sessionIdValue, StringComparison.Ordinal))
             return;
 
-        if (msg.ReminderDeliveryKey != expectedKey)
-            return;
-
-        _awaitingDeliveryResult = false;
-        _log.Warning(
-            "reminder_delivery_observation_timeout execution_id={ExecutionId} reminder_id={ReminderId} key={ReminderDeliveryKey} timeout={Timeout}",
-            _executionId, _definition.Id, msg.ReminderDeliveryKey, DeliveryObservedTimeout);
-        ReportOutcome(false, $"delivery not observed within {DeliveryObservedTimeout}");
+        _awaitingReminderSessionAck = false;
+        ReportOutcome(false, $"Session rejected restart reminder: {nack.Reason}");
     }
 
     private IActorRef? ResolveGatewayFor(ChannelType originChannelType)
@@ -526,13 +524,41 @@ internal sealed class ReminderExecutionActor : ReceiveActor, IWithTimers
 
     private void HandleOutput(ExecutionOutput wrapper)
     {
+        var localReminderKey = _expectedReminderDeliveryKey;
+        if (localReminderKey is { } expectedKey)
+        {
+            if (wrapper.Output is TurnCompleted unrelatedTurn)
+            {
+                if (unrelatedTurn.SourceReminderId != expectedKey)
+                {
+                    _accumulator.Reset();
+                    return;
+                }
+
+                // Compaction and context recovery can emit ErrorOutput before a successful terminal.
+                if (unrelatedTurn.Outcome != TurnOutcome.Completed)
+                {
+                    var reason = _accumulator.LastErrorMessage
+                        ?? $"Reminder session turn ended with outcome {unrelatedTurn.Outcome}.";
+                    ReportOutcome(false, reason);
+                    return;
+                }
+            }
+            else if (wrapper.Output is ErrorOutput)
+            {
+                // ErrorOutput has no reminder key. Wait for its correlated terminal event.
+                _accumulator.ProcessOutput(wrapper.Output);
+                return;
+            }
+        }
+
         var action = _accumulator.ProcessOutput(wrapper.Output);
         switch (action)
         {
             case OutputAction.TurnCompleted:
                 {
                     // A failed turn emits its ErrorOutput first and a closing TurnCompleted(Failed) after it.
-                    // The error already settled the run as failed, so do not log it again as a success.
+                    // The correlated terminal settles the local Reminder route after its ErrorOutput.
                     if (_completed)
                         break;
 
@@ -582,6 +608,13 @@ internal sealed class ReminderExecutionActor : ReceiveActor, IWithTimers
     {
         if (_completed || _settlementStarted)
             return;
+
+        if (_awaitingReminderSessionAck)
+        {
+            _awaitingReminderSessionAck = false;
+            ReportOutcome(false, $"Timed out waiting for session recovery acknowledgement after {ReminderSettings.DefaultAckTimeout}.");
+            return;
+        }
 
         _log.Warning(
             "ReminderExecution reached its absolute limit: execution_id={0} reminder_id={1} title={2} timeout={3}.",
@@ -677,11 +710,4 @@ internal sealed class ReminderExecutionActor : ReceiveActor, IWithTimers
     {
         public static readonly ExecutionAttemptTimeoutReached Instance = new();
     }
-
-    /// <summary>
-    /// Self-scheduled backstop fired when no <see cref="ReminderDeliveryResult"/>
-    /// arrives within <see cref="DeliveryObservedTimeout"/> (e.g. the binding
-    /// actor crashed mid-turn).
-    /// </summary>
-    private sealed record DeliveryBackstopTimeout(ReminderId ReminderDeliveryKey) : INoSerializationVerificationNeeded;
 }

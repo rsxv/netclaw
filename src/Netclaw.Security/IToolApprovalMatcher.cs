@@ -56,6 +56,12 @@ public sealed record ApprovalCandidate(
     // projection removes it from approval and persistence candidates.
     internal CommandOccurrence? SourceOccurrence { get; init; }
 
+    // A compound file effect has no command occurrence. These references bind
+    // its exact candidate to parser nodes from this call until policy projection.
+    internal RedirectedCompoundSyntax? SourceCompoundOwner { get; init; }
+
+    internal CompoundRedirect? SourceCompoundRedirect { get; init; }
+
     /// <summary>
     /// How much of the command the parser could not prove. A candidate with an
     /// unresolved part is exact: its verb is the command text, and only a
@@ -79,6 +85,9 @@ public sealed record ApprovalCandidate(
     /// </summary>
     internal bool RunsNoProgram { get; init; }
 
+    /// <summary>True when file-tool policy owns the current run's proved scratch redirects.</summary>
+    internal bool UsesFileToolRedirects { get; init; }
+
     /// <summary>
     /// Parser source metadata does not change occurrence identity.
     /// </summary>
@@ -94,6 +103,7 @@ public sealed record ApprovalCandidate(
         Unresolved == other.Unresolved &&
         WordRewriteCanResolve == other.WordRewriteCanResolve &&
         RunsNoProgram == other.RunsNoProgram &&
+        UsesFileToolRedirects == other.UsesFileToolRedirects &&
         AssignmentDigest == other.AssignmentDigest &&
         Shell == other.Shell &&
         HasSameVerbTokens(other.VerbTokens);
@@ -118,20 +128,10 @@ public sealed record ApprovalCandidate(
 public interface IToolApprovalMatcher
 {
     /// <summary>
-    /// Returns the key used to look up this invocation's approval mode in
-    /// <c>ToolApprovalConfig.ToolOverrides</c>. Most matchers return the tool
-    /// name unchanged; argument-aware matchers may return a context-specific
-    /// key so different invocations of the same tool (e.g., a write to a
-    /// control-plane file vs. a write to a user file) can be gated
-    /// independently.
-    /// </summary>
-    string GetApprovalModeKey(ToolName toolName, IDictionary<string, object?>? arguments);
-
-    /// <summary>
     /// Returns true if this invocation must require interactive approval on
     /// the Personal audience when no explicit approval policy is configured.
     /// Encapsulates the fail-closed decision so callers do not have to inspect
-    /// tool names or approval-key string formats.
+    /// tool names.
     /// </summary>
     bool IsFailClosedOnPersonal(ToolName toolName, IDictionary<string, object?>? arguments);
 
@@ -240,9 +240,6 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
     }
 
     public ShellExecutionEnvironment Environment { get; }
-
-    public string GetApprovalModeKey(ToolName toolName, IDictionary<string, object?>? arguments)
-        => toolName.Value;
 
     public bool IsFailClosedOnPersonal(ToolName toolName, IDictionary<string, object?>? arguments)
         => true;
@@ -418,7 +415,8 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
             Environment.PathStyle,
             resolveUnknownPathsFromEffectiveValues: false,
             hostLinks,
-            fileWords: []);
+            fileWords: [],
+            includeRedirects: true);
         if (directories is null)
             return null;
 
@@ -618,6 +616,22 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
         string? workingDirectory,
         bool resolveUnknownPathsFromEffectiveValues,
         LinkRule hostLinks)
+        => ExtractCandidatesForOccurrence(occurrence, workingDirectory,
+            resolveUnknownPathsFromEffectiveValues, hostLinks, includeRedirects: true);
+
+    internal IReadOnlyList<ApprovalCandidate>? ExtractCommandScopesForOccurrence(
+        CommandOccurrence occurrence,
+        string? workingDirectory)
+        => ExtractCandidatesForOccurrence(occurrence, workingDirectory,
+            resolveUnknownPathsFromEffectiveValues: false,
+            LinkRule.FromVolumeRootExceptTemporaryAlias, includeRedirects: false);
+
+    private IReadOnlyList<ApprovalCandidate>? ExtractCandidatesForOccurrence(
+        CommandOccurrence occurrence,
+        string? workingDirectory,
+        bool resolveUnknownPathsFromEffectiveValues,
+        LinkRule hostLinks,
+        bool includeRedirects)
     {
         ArgumentNullException.ThrowIfNull(occurrence);
 
@@ -652,7 +666,8 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
             Environment.PathStyle,
             resolveUnknownPathsFromEffectiveValues,
             hostLinks,
-            commandWords.FileWords);
+            commandWords.FileWords,
+            includeRedirects);
         if (directories is null)
             return null;
 
@@ -885,7 +900,8 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
         ShellPathStyle pathStyle,
         bool resolveUnknownPathsFromEffectiveValues,
         LinkRule hostLinks,
-        IReadOnlyList<CommandFileWord> fileWords)
+        IReadOnlyList<CommandFileWord> fileWords,
+        bool includeRedirects)
     {
         var clause = occurrence.Clause;
         var directories = new List<string?>();
@@ -981,7 +997,7 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
             }
         }
 
-        foreach (var redirect in occurrence.Redirects)
+        foreach (var redirect in includeRedirects ? occurrence.Redirects : [])
         {
             var redirectDirectories = ResolveRedirectDirectories(
                 redirect,
@@ -992,6 +1008,10 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
 
             directories.AddRange(redirectDirectories);
         }
+
+        // Scratch composition must retain the command directory as well as every ordinary path operand.
+        if (!includeRedirects && clauseWorkingDirectory is not null)
+            directories.Add(clauseWorkingDirectory);
 
         if (directories.Count == 0)
         {
@@ -1290,15 +1310,15 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
 
         if (arg.Kind == ArgKind.Glob)
         {
-            var coveringDirectory = ResolveGlobCoveringDirectory(
+            var globDirectories = ResolveGlobDirectories(
                 occurrence,
                 arg,
                 workingDirectory,
                 pathStyle);
-            if (coveringDirectory is null)
+            if (globDirectories is null)
                 return false;
 
-            directories.Add(coveringDirectory);
+            directories.AddRange(globDirectories);
             return true;
         }
 
@@ -1521,7 +1541,7 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
             : token[..lastSeparator];
     }
 
-    private static string? ResolveGlobCoveringDirectory(
+    private static IReadOnlyList<string>? ResolveGlobDirectories(
         ShellSyntaxTree.CommandOccurrence occurrence,
         ShellSyntaxTree.Arg arg,
         string? workingDirectory,
@@ -1536,8 +1556,8 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
                        relativeBase: null,
                        pathStyle,
                        out var covering)
-                   && ShellGlobScope.IsLinkContained(covering, pattern.Glob!)
-                ? covering.Value
+                   && ShellGlobScope.ResolveReach(covering, pattern) is ShellGlobReach.Complete reach
+                ? reach.Scopes.Select(static path => path.Value).ToArray()
                 : null;
         }
 
@@ -1584,7 +1604,7 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
             return null;
         }
 
-        return coveringDirectory.Value;
+        return [coveringDirectory.Value];
     }
 
     private static string CoveringPath(
@@ -1791,12 +1811,17 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
 
         if (file.Target is ShellSyntaxTree.ShellValueDomain.PathPattern pattern)
         {
-            var coveringDirectory = pattern.CoveringDirectory;
-            var contained = CanonicalPath.TryCreate(coveringDirectory, relativeBase: null, pathStyle, out var covering)
-                && (ShellGlobScope.AsGlobPattern(pattern) is { } glob
-                    ? ShellGlobScope.IsLinkContained(covering, glob.Glob!)
-                    : FileSystemAuthority.HasOnlyContainedLinkEntries(covering));
-            return contained ? [coveringDirectory] : null;
+            if (!CanonicalPath.TryCreate(pattern.CoveringDirectory, relativeBase: null, pathStyle, out var covering))
+                return null;
+
+            if (ShellGlobScope.AsGlobPattern(pattern) is { } glob)
+            {
+                return ShellGlobScope.ResolveReach(covering, glob) is ShellGlobReach.Complete reach
+                    ? reach.Scopes.Select(static path => path.Value).ToArray()
+                    : null;
+            }
+
+            return FileSystemAuthority.HasOnlyContainedLinkEntries(covering) ? [covering.Value] : null;
         }
 
         IReadOnlyList<string> targets = file.Target switch
@@ -2207,7 +2232,7 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
 
         if (analysis.Commands.Any(command => command.Clause.Args
                 .Where(static arg => arg.IsPath && arg.Kind == ShellSyntaxTree.ArgKind.Glob)
-                .Any(arg => ResolveGlobCoveringDirectory(
+                .Any(arg => ResolveGlobDirectories(
                     command,
                     arg,
                     workingDirectory,
@@ -2226,7 +2251,8 @@ public sealed class ShellApprovalMatcher : IToolApprovalMatcher
                     resolveUnknownPathsFromEffectiveValues: false,
                     NoProgramLinks(analysis, command, hostLinks),
                     // A file word adds a known scope. It never makes a scope unresolved.
-                    fileWords: []) is null))
+                    fileWords: [],
+                    includeRedirects: true) is null))
         {
             return true;
         }
@@ -2532,9 +2558,6 @@ public sealed class DefaultApprovalMatcher : IToolApprovalMatcher
 {
     public static readonly DefaultApprovalMatcher Instance = new();
 
-    public string GetApprovalModeKey(ToolName toolName, IDictionary<string, object?>? arguments)
-        => toolName.Value;
-
     public bool IsFailClosedOnPersonal(ToolName toolName, IDictionary<string, object?>? arguments)
         => false;
 
@@ -2579,9 +2602,6 @@ public sealed class McpApprovalMatcher : IToolApprovalMatcher
     private const string Redacted = "***REDACTED***";
 
     private static DefaultApprovalMatcher Default => DefaultApprovalMatcher.Instance;
-
-    public string GetApprovalModeKey(ToolName toolName, IDictionary<string, object?>? arguments)
-        => Default.GetApprovalModeKey(toolName, arguments);
 
     public bool IsFailClosedOnPersonal(ToolName toolName, IDictionary<string, object?>? arguments)
         => Default.IsFailClosedOnPersonal(toolName, arguments);

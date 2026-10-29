@@ -5,6 +5,7 @@
 // -----------------------------------------------------------------------
 using Akka.Actor;
 using Akka.Event;
+using Akka.TestKit;
 using Microsoft.Extensions.AI;
 using Netclaw.Actors.Authorization.Consent;
 using Netclaw.Actors.Channels;
@@ -41,12 +42,15 @@ internal sealed class SessionToolPipelineTestFixture(
     private IReadOnlyList<string> _recentFiles = [];
     private bool _setWorkingDirectoryAvailable;
     private Func<string, ToolInvocationContext, bool>? _canDeclareWorkingDirectory;
-    private bool _streamResults;
     private ModelModality _modelInputModalities = ModelModality.Text;
     private IReadOnlyDictionary<string, IReadOnlyList<string>> _oneTimeApprovalPreSeed
         = new Dictionary<string, IReadOnlyList<string>>();
     private IReadOnlyDictionary<string, RefusalKind> _decisionOverrides
         = new Dictionary<string, RefusalKind>();
+    private IReadOnlyDictionary<string, string> _managedTemporaryDenialDirectories
+        = new Dictionary<string, string>();
+    private IReadOnlyDictionary<string, AuthorizationAttemptId> _authorizationAttemptIds
+        = new Dictionary<string, AuthorizationAttemptId>();
     private IReadOnlyList<ManagedTemporaryCorrectionKey> _managedTemporaryCorrectionKeys = [];
     private ILoggingAdapter _logger = NoLogger.Instance;
 
@@ -144,24 +148,23 @@ internal sealed class SessionToolPipelineTestFixture(
         return this;
     }
 
-    public SessionToolPipelineTestFixture StreamingResults()
-    {
-        _streamResults = true;
-        return this;
-    }
-
     public SessionToolPipelineTestFixture AcceptingModelInput(ModelModality modalities)
     {
         _modelInputModalities = modalities;
         return this;
     }
 
+    // The four maps of an ApprovalRedrivePlan, one entry for each re-driven call.
     public SessionToolPipelineTestFixture RedrivingApprovals(
         IReadOnlyDictionary<string, IReadOnlyList<string>> preSeed,
-        IReadOnlyDictionary<string, RefusalKind> overrides)
+        IReadOnlyDictionary<string, RefusalKind> overrides,
+        IReadOnlyDictionary<string, string> managedTemporaryDenialDirectories,
+        IReadOnlyDictionary<string, AuthorizationAttemptId> authorizationAttemptIds)
     {
         _oneTimeApprovalPreSeed = preSeed;
         _decisionOverrides = overrides;
+        _managedTemporaryDenialDirectories = managedTemporaryDenialDirectories;
+        _authorizationAttemptIds = authorizationAttemptIds;
         return this;
     }
 
@@ -183,7 +186,8 @@ internal sealed class SessionToolPipelineTestFixture(
             Storage = SessionStoragePaths.CreateLegacy(
                 _sessionDirectory,
                 Path.Combine(Path.GetTempPath(), "netclaw-test-session-logs"),
-                "test-session"),
+                "test-session", ManagedTemporaryLayout.InsideSessionStorage.Instance),
+            EffectiveAudience = turnContext.Audience,
             InlineOutputBudget = _inlineOutputBudget,
             ModelInputModalities = _modelInputModalities,
             SpawnChildActor = _spawnChildActor,
@@ -207,13 +211,37 @@ internal sealed class SessionToolPipelineTestFixture(
             BackgroundJobs = _backgroundJobs,
             SetWorkingDirectoryAvailable = _setWorkingDirectoryAvailable,
             CanDeclareWorkingDirectory = _canDeclareWorkingDirectory,
-            StreamResults = _streamResults,
             OneTimeApprovalPreSeed = _oneTimeApprovalPreSeed,
             DecisionOverrides = _decisionOverrides,
+            ManagedTemporaryDenialDirectories = _managedTemporaryDenialDirectories,
+            AuthorizationAttemptIds = _authorizationAttemptIds,
             ManagedTemporaryCorrections = new ManagedTemporaryCorrectionDispatch(_managedTemporaryCorrectionKeys),
             CancellationToken = cancellationToken
         };
 
         return pipeline.ExecuteAsync(batch);
+    }
+}
+
+internal static class StreamedToolReplyProbe
+{
+    public static async Task<IReadOnlyList<ToolCallResult>> ExpectAsync(
+        TestProbe probe,
+        int resultCount,
+        TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        var wait = timeout ?? TimeSpan.FromSeconds(5);
+        var results = new List<ToolCallResult>(resultCount);
+        for (var index = 0; index < resultCount; index++)
+        {
+            var reply = await probe.ExpectMsgAsync<ToolExecutionSingleCompleted>(
+                wait, cancellationToken: cancellationToken);
+            results.Add(reply.Result);
+        }
+
+        await probe.ExpectMsgAsync<ToolExecutionBatchCompleted>(
+            wait, cancellationToken: cancellationToken);
+        return results;
     }
 }

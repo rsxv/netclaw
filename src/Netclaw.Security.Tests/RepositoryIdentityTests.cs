@@ -140,6 +140,48 @@ public sealed class RepositoryIdentityTests
         }
     }
 
+    /// <summary>
+    /// A repository verb grant covers a command whose only path is the null
+    /// device. It does not cover the same command when a redirect names a real
+    /// file outside the repository. The null device writes no file, so it gives
+    /// the candidate no scope and the cwd half of the grant applies.
+    /// </summary>
+    [Fact]
+    public void Repository_verb_grant_keeps_the_null_device_outside_the_scope()
+    {
+        var root = CreateTestRoot("netclaw-repository-redirect-");
+        try
+        {
+            var main = Path.Combine(root.FullName, "main");
+            RunGit(root.FullName, "init", main);
+            Assert.True(RepositoryIdentity.TryResolve(candidateDirectory: null, main, out var identity));
+
+            var grant = ApprovalEntry.CreateRepositoryTokenPrefix(
+                ApprovalShell.Bash, ["uv", "export"], identity!.CommonDirectory);
+
+            var nullDevice = new ApprovalCandidate("uv export", Directory: null)
+            {
+                Shell = ApprovalShell.Bash,
+                VerbTokens = ["uv", "export"],
+            };
+            var outsideFile = nullDevice with { Directory = Path.Combine(root.FullName, "audit") };
+
+            Assert.True(ApprovalPatternMatching.MatchesShellApproval(nullDevice, main, [grant]));
+            Assert.False(ApprovalPatternMatching.MatchesShellApproval(outsideFile, main, [grant]));
+
+            var evaluation = ApprovalPatternMatching.EvaluateShellApproval(
+                outsideFile, main, [grant], maximumNearMisses: 1);
+            Assert.Null(evaluation.MatchedEntry);
+            Assert.Equal(
+                ShellApprovalNearMissReason.OutsideDirectory,
+                Assert.Single(evaluation.NearMisses).Reason);
+        }
+        finally
+        {
+            root.Delete(recursive: true);
+        }
+    }
+
     [Fact]
     public void Repository_scope_rejects_an_external_symbolic_link()
     {
@@ -236,7 +278,11 @@ public sealed class RepositoryIdentityTests
             process.StartInfo.ArgumentList.Add(argument);
 
         Assert.True(process.Start());
-        Assert.True(process.WaitForExit(10_000), "git timed out");
+        // Do not put a deadline here. On a loaded Windows runner, "git worktree
+        // add" can take more than 10 s. A deadline left git alive with its cwd
+        // in the fixture, so the cleanup delete failed and hid the timeout.
+        // The CI blame-hang timeout aborts a run in which git never exits.
+        process.WaitForExit();
         return process.ExitCode;
     }
 }

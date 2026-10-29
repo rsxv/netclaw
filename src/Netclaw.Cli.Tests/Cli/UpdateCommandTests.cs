@@ -331,9 +331,10 @@ public sealed class UpdateCommandTests : IDisposable
     {
         var manager = new FakeDaemonUpdateProcessManager();
         var systemd = new SystemdUserService(
+            SystemdUserService.DefaultHomePath,
             Path.Combine(_dir.Path, "missing.service"),
             new FakeSystemCommandRunner(),
-            enabledOnThisPlatform: true, homePath: SystemdUserService.DefaultHomePath);
+            enabledOnThisPlatform: true);
 
         var result = await UpdateCommand.StartDaemonAsync(manager, systemd);
 
@@ -368,7 +369,7 @@ public sealed class UpdateCommandTests : IDisposable
         var unitPath = Path.Combine(_dir.Path, "netclaw.service");
         File.WriteAllText(unitPath, "[Service]\nExecStart=/opt/netclaw/netclawd\n");
         var systemd = new SystemdUserService(
-            unitPath, runner, enabledOnThisPlatform: true, homePath: Path.Combine(_dir.Path, "scratch-home"));
+            Path.Combine(_dir.Path, "scratch-home"), unitPath, runner, enabledOnThisPlatform: true);
 
         var stop = await UpdateCommand.StopDaemonAsync(manager, systemd, "cli-stop", TestContext.Current.CancellationToken);
         var start = await UpdateCommand.StartDaemonAsync(manager, systemd);
@@ -518,8 +519,7 @@ public sealed class UpdateCommandTests : IDisposable
             serviceCreated = true;
             var unitPath = Path.Combine(_dir.Path, "netclaw.service");
             File.WriteAllText(unitPath, "[Service]\nExecStart=/opt/netclaw/netclawd\n");
-            return new SystemdUserService(unitPath, runner, enabledOnThisPlatform: true,
-                homePath: paths.BasePath,
+            return new SystemdUserService(paths.BasePath, unitPath, runner, enabledOnThisPlatform: true,
                 environReader: _ => $"NETCLAW_HOME={SystemdUserService.DefaultHomePath}\0");
         };
         using var stdout = new StringWriter();
@@ -591,6 +591,96 @@ public sealed class UpdateCommandTests : IDisposable
         Assert.Equal(1, exitCode);
         Assert.Contains("Unknown channel", stderr.ToString());
         Assert.False(File.Exists(_paths.NetclawConfigPath));
+    }
+
+    [Fact]
+    public async Task RunAsync_Check_ReportsTimeoutAsNetworkFailure_WhenManifestFetchTimesOut()
+    {
+        var handler = new RoutedHandler(_ => Task.FromException<HttpResponseMessage>(HttpClientTimeout()));
+        UpdateCommand.TestHttpMessageHandlerFactory = () => handler;
+
+        var (exitCode, stdout, stderr) = await RunUpdateAsync("update", "--check");
+
+        Assert.Equal(1, exitCode);
+        Assert.Equal(string.Empty, stdout);
+        Assert.Contains("Could not check for updates: Timed out after 10s fetching manifest from", stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain("tampering", stderr, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RunAsync_Update_AbortsAsNetworkFailure_WhenSignatureFetchFails(bool timeout)
+    {
+        var manifest = CreateManifest("99.0.0", UpdateCheckService.GetCurrentRid());
+        var json = JsonSerializer.Serialize(manifest);
+        var handler = new RoutedHandler(url => url == FeedConstants.BinaryManifestUrl
+            ? Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(json) })
+            : Task.FromException<HttpResponseMessage>(timeout
+                ? HttpClientTimeout()
+                : new HttpRequestException("Connection reset by peer")));
+        UpdateCommand.TestHttpMessageHandlerFactory = () => handler;
+        UpdateCommand.TestDaemonProcessManagerFactory = (_, _) =>
+            throw new InvalidOperationException("An aborted update must not touch the daemon.");
+
+        var (exitCode, stdout, stderr) = await RunUpdateAsync("update", "--force");
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("Could not check for updates:", stderr, StringComparison.Ordinal);
+        Assert.Contains("manifest signature", stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain("tampering", stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain("Update available", stdout, StringComparison.Ordinal);
+        Assert.DoesNotContain(handler.Requested, url => url == manifest.Releases[0].Assets[0].Url);
+    }
+
+    [Fact]
+    public async Task RunAsync_Update_AbortsWithTamperingWarning_WhenSignatureDoesNotMatchManifest()
+    {
+        var manifest = CreateManifest("99.0.0", UpdateCheckService.GetCurrentRid());
+        var json = JsonSerializer.Serialize(manifest);
+        var forgedSignature = SignContent(json + " ");
+        var handler = new RoutedHandler(url => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(url == FeedConstants.BinaryManifestUrl ? json : forgedSignature)
+        }));
+        UpdateCommand.TestHttpMessageHandlerFactory = () => handler;
+        UpdateCommand.TestDaemonProcessManagerFactory = (_, _) =>
+            throw new InvalidOperationException("An aborted update must not touch the daemon.");
+
+        var (exitCode, stdout, stderr) = await RunUpdateAsync("update", "--force");
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("This may indicate tampering.", stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain("Update available", stdout, StringComparison.Ordinal);
+        Assert.DoesNotContain(handler.Requested, url => url == manifest.Releases[0].Assets[0].Url);
+    }
+
+    private async Task<(int ExitCode, string Stdout, string Stderr)> RunUpdateAsync(params string[] args)
+    {
+        using var stdout = new StringWriter();
+        using var stderr = new StringWriter();
+        var exitCode = await UpdateCommand.RunAsync(
+            new CliContext(_paths, TimeProvider.System, TextReader.Null, stdout, stderr),
+            args, false, UpdateChannel.Stable);
+        return (exitCode, stdout.ToString(), stderr.ToString());
+    }
+
+    private static TaskCanceledException HttpClientTimeout()
+        => new("The request was canceled due to the configured HttpClient.Timeout.", new TimeoutException());
+
+    private sealed class RoutedHandler(Func<string, Task<HttpResponseMessage>> respond) : HttpMessageHandler
+    {
+        private readonly System.Collections.Concurrent.ConcurrentQueue<string> _requested = new();
+
+        public IReadOnlyCollection<string> Requested => _requested;
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var url = request.RequestUri!.ToString();
+            _requested.Enqueue(url);
+            return respond(url);
+        }
     }
 
     private string? ReadPersistedChannel()
@@ -862,7 +952,7 @@ public sealed class UpdateCommandTests : IDisposable
     {
         var unitPath = Path.Combine(_dir.Path, "netclaw.service");
         File.WriteAllText(unitPath, "[Service]\nExecStart=/opt/netclaw/netclawd\n");
-        return new SystemdUserService(unitPath, runner, enabledOnThisPlatform: true, homePath: homePath ?? SystemdUserService.DefaultHomePath);
+        return new SystemdUserService(homePath ?? SystemdUserService.DefaultHomePath, unitPath, runner, enabledOnThisPlatform: true);
     }
 
     private sealed class FakeDaemonUpdateProcessManager : IDaemonProcessLifecycle

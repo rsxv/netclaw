@@ -1,0 +1,700 @@
+// -----------------------------------------------------------------------
+// <copyright file="SessionExecutionLifetime.cs" company="Petabridge, LLC">
+//      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
+// </copyright>
+// -----------------------------------------------------------------------
+using Akka.Actor;
+using Netclaw.Actors.Channels;
+using Netclaw.Actors.Protocol;
+using Netclaw.Actors.Reminders;
+using Netclaw.Actors.SubAgents;
+using Netclaw.Configuration;
+using Netclaw.Tools;
+using static Netclaw.Actors.Sessions.SessionProtocol;
+
+namespace Netclaw.Actors.Sessions.Handlers;
+
+internal sealed record ModelStoppedForRestart(long CallId, Exception? Failure)
+    : INoSerializationVerificationNeeded;
+
+internal sealed record ToolPipelineStoppedForRestart(Task WorkTask, Exception? Failure)
+    : INoSerializationVerificationNeeded;
+
+internal sealed record RestartModelGraceExpired(long CallId) : INoSerializationVerificationNeeded;
+
+internal sealed record RestartChildWaitExpired : INoSerializationVerificationNeeded
+{
+    public static readonly RestartChildWaitExpired Instance = new();
+}
+
+internal enum RestartAction { Wait, EnterPassivation, StopToolTask, StartModelGrace }
+internal enum ModelStopAction { Ignore, CloseInputs, EnterPassivation }
+internal enum ToolStopAction { Ignore, FailTurn, EnterPassivation }
+internal enum ReminderEligibility { None, Eligible, EmittedText }
+internal enum PassivationWork { NoAction, WaitForReap, AttemptSnapshot }
+internal readonly record struct PassivationStart(long? ReapEpoch, bool RequestDistillation);
+internal sealed record FinalStopResult(IActorRef? ReplyTo, ReminderDefinition? Reminder, string? OmissionReason);
+internal sealed record RestartContextResult(TurnContext? Context, string? Reason, int ResumeCount);
+
+/// <summary>
+/// Owns model and tool resources, restart drain, and passivation policy on the session actor thread.
+/// Task stop acknowledgements require the exact call ID or task reference.
+/// </summary>
+internal sealed class SessionExecutionLifetime(ITimerScheduler timers, IActorRef actor)
+{
+    internal const string RestartReminderInstruction =
+        "Resume the work that was interrupted by the daemon restart.";
+
+    private static readonly TimeSpan RestartModelGracePeriod = TimeSpan.FromSeconds(2);
+
+    // The child wait of a restart drain (running-child-drain-park design D3). The session acknowledges the drain
+    // before the caller deadline, so it keeps its restart reminder. ChildWaitMargin must stay above ChildWait in the
+    // file, because static fields start in text order.
+    private static readonly TimeSpan ChildWaitMargin = TimeSpan.FromSeconds(2);
+    internal static readonly TimeSpan ChildWait = DaemonConfig.BoundedDrainTimeout - ChildWaitMargin;
+
+    // <child-drain-wait>
+    // The drain acknowledgement waits for the park or terminal record of each live child, until the child wait ends
+    // (running-child-drain-park design D4). The child-resume-gate Stryker script mutates this span.
+    internal static bool WaitsForChildren(bool drainRequested, bool hasLiveChildren, bool childWaitEnded)
+        => drainRequested && hasLiveChildren && !childWaitEnded;
+    // </child-drain-wait>
+
+    private static readonly TimeSpan RestartReminderLifetime = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan PassivationGracePeriod = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan PassivationFinalStopDelay = TimeSpan.FromMilliseconds(100);
+    private static readonly object RestartModelGraceTimerKey = new();
+    private static readonly object RestartChildWaitTimerKey = new();
+    private static readonly object PassivationTimerKey = new();
+    private static readonly object PassivationFinalStopTimerKey = new();
+
+    private enum AttemptMilestone { Distillation, Prerequisite, SnapshotReady, Grace, FinalEffectsClaimed }
+
+    private sealed class PassivationAttempt(long? reapEpoch)
+    {
+        public long? ReapEpoch { get; } = reapEpoch;
+        public AttemptMilestone Milestone { get; set; } = AttemptMilestone.Distillation;
+    }
+
+    private sealed class ReapOperation(long epoch)
+    {
+        public long Epoch { get; } = epoch;
+        public bool AwaitingCommit { get; set; }
+    }
+
+    private readonly ProcessingWatchdog _watchdog = new();
+    private readonly Dictionary<SubAgentRunId, (IActorRef Actor, ChildRunExecution Execution)> _children = [];
+
+    public ChildRunExecution TrackChild(SubAgentRunId runId, IActorRef child)
+    {
+        var execution = new ChildRunExecution(runId, actor);
+        _children.Add(runId, (child, execution));
+        return execution;
+    }
+
+    public bool HasLiveChildren => _children.Count > 0;
+    public int LiveChildCount => _children.Count;
+    public bool OwnsChild(SubAgentRunId runId, IActorRef child)
+        => _children.TryGetValue(runId, out var live) && live.Actor.Equals(child);
+    public SubAgentRunId? FindChild(IActorRef child)
+        => _children.Where(pair => pair.Value.Actor.Equals(child)).Select(pair => (SubAgentRunId?)pair.Key).FirstOrDefault();
+    public void CloseChild(SubAgentRunId runId)
+    {
+        if (_children.TryGetValue(runId, out var live))
+        {
+            live.Execution.Close();
+            _ = ObserveChildStop(runId, live.Execution, dispose: false);
+        }
+    }
+    public void ReleaseChild(SubAgentRunId runId)
+    {
+        if (_children.Remove(runId, out var live))
+            _ = ObserveChildStop(runId, live.Execution, dispose: true);
+    }
+    public void StopChildren()
+    {
+        foreach (var runId in _children.Keys.ToArray())
+            ReleaseChild(runId);
+    }
+    private async Task ObserveChildStop(SubAgentRunId runId, ChildRunExecution execution, bool dispose)
+    {
+        try { await execution.StopAsync(); }
+        catch (Exception error) { actor.Tell(new ChildStopFailed(runId, error), ActorRefs.NoSender); }
+        finally { if (dispose) execution.Dispose(); }
+    }
+    private CancellationTokenSource? _modelCts;
+    private Task? _modelTask;
+    private long _modelCallId;
+    private bool _modelStopRequested;
+    private bool _anyContentStreamed;
+    private CancellationTokenSource? _toolCts;
+    private Task? _toolTask;
+    private bool _toolStopRequested;
+    private IActorRef? _restartDrainReplyTo;
+    private string _restartDrainReason = string.Empty;
+    private DateTimeOffset? _restartInterruptionAt;
+    // The reminder wakes a session that only owes a child result. Its pending inputs, if any, wait behind an approval
+    // and do not resume.
+    private bool _restartResumesChildrenOnly;
+    private long _jobReapEpoch;
+    private ReapOperation? _reap;
+    private PassivationAttempt? _attempt;
+    private bool _idlePassivationAfterWaitingInput;
+    private bool _childWaitEnded;
+
+    public bool RestartDrainRequested => _restartDrainReplyTo is not null;
+    public bool WaitsForLiveChildren => WaitsForChildren(RestartDrainRequested, HasLiveChildren, _childWaitEnded);
+
+    public void EndChildWait() => _childWaitEnded = true;
+    public string RestartDrainReason => _restartDrainReason;
+
+    // The idle handler closed a parked batch while an acknowledged input waited behind it. The input runs first,
+    // because nothing would rebuild it after passivation. The idle decision completes when that work ends.
+    public void DeferIdlePassivationUntilWaitingInputEnds() => _idlePassivationAfterWaitingInput = true;
+
+    public bool ClaimDeferredIdlePassivation(SessionPhase phase)
+    {
+        if (!_idlePassivationAfterWaitingInput || phase != SessionPhase.Ready)
+            return false;
+
+        _idlePassivationAfterWaitingInput = false;
+        return true;
+    }
+    public bool NeedsAbruptStopNotification => _attempt?.Milestone != AttemptMilestone.FinalEffectsClaimed;
+
+    public RestartAction RequestRestart(
+        IActorRef replyTo,
+        string reason,
+        SessionPhase phase,
+        bool hasBufferedContinuation,
+        bool canParkDurableApprovals)
+    {
+        var firstRequest = !RestartDrainRequested;
+        _restartDrainReplyTo = replyTo;
+        _restartDrainReason = reason;
+        if (firstRequest && HasLiveChildren)
+        {
+            // Each live child parks at its next safe point. The wait ends before the caller deadline, so the session
+            // keeps its restart reminder when a child misses it.
+            foreach (var (child, _) in _children.Values)
+                child.Tell(ParkForDrain.Instance, actor);
+            timers.StartSingleTimer(RestartChildWaitTimerKey, RestartChildWaitExpired.Instance, ChildWait);
+        }
+        if (phase == SessionPhase.Ready)
+            return RestartAction.EnterPassivation;
+
+        if (TryStopDurableApprovalWaits(phase, hasBufferedContinuation, canParkDurableApprovals))
+            return RestartAction.StopToolTask;
+
+        // A tool batch clears the selected inputs, but the model call after it is still a live call of the turn.
+        // The grace period applies to each live model call, so that a tool loop cannot hold the drain (#2601).
+        if (phase == SessionPhase.Processing && HasLiveModel)
+        {
+            timers.StartSingleTimer(
+                RestartModelGraceTimerKey,
+                new RestartModelGraceExpired(_modelCallId),
+                RestartModelGracePeriod);
+            return RestartAction.StartModelGrace;
+        }
+
+        return RestartAction.Wait;
+    }
+
+    public bool TryStopDurableApprovalWaits(
+        SessionPhase phase,
+        bool hasBufferedContinuation,
+        bool canParkDurableApprovals)
+        => RestartDrainRequested
+           && phase == SessionPhase.Processing
+           && !hasBufferedContinuation
+           && canParkDurableApprovals
+           && RequestToolStop();
+
+    public long? PlanRestartModelStop(RestartModelGraceExpired message, SessionPhase phase)
+        => RestartDrainRequested
+           && phase == SessionPhase.Processing
+           && CanDispatchPreparedModel(message.CallId)
+            ? message.CallId
+            : null;
+
+    public ModelStopAction ObserveModelStop(ModelStoppedForRestart message, bool emittedText)
+    {
+        if (!AcceptModelStop(message))
+            return ModelStopAction.Ignore;
+
+        return message.Failure is not null || emittedText
+            ? ModelStopAction.CloseInputs
+            : ModelStopAction.EnterPassivation;
+    }
+
+    public ToolStopAction ObserveToolStop(ToolPipelineStoppedForRestart message)
+    {
+        if (!AcceptToolStop(message))
+            return ToolStopAction.Ignore;
+
+        return message.Failure is not null
+            ? ToolStopAction.FailTurn
+            : ToolStopAction.EnterPassivation;
+    }
+
+    // A session with a pending input, or with a child run whose result the parent has not received, needs the restart
+    // reminder. The reminder wakes the session after the restart, and the recovery then ends the lost child.
+    public ReminderEligibility MarkRestartReminderEligible(
+        int pendingInputCount,
+        int unreportedChildCount,
+        bool emittedText,
+        int selectedInputCount,
+        DateTimeOffset now)
+    {
+        if (pendingInputCount == 0 && unreportedChildCount == 0)
+            return ReminderEligibility.None;
+
+        if (emittedText && selectedInputCount > 0)
+            return ReminderEligibility.EmittedText;
+
+        _restartInterruptionAt = now;
+        _restartResumesChildrenOnly = pendingInputCount == 0;
+        return ReminderEligibility.Eligible;
+    }
+
+    public void ClearRestartReminderEligibility() => _restartInterruptionAt = null;
+
+    // The drain stopped a turn after a tool batch consumed its input. One continuation input without text keeps the
+    // turn pending under its recorded authority, and the restart reminder resumes it like any pending input (#2632).
+    // Security boundary: the turn continues only when nothing of it is unknown or lost.
+    //   - The person saw no text of the stopped model call.
+    //   - No other input waits. The reminder resumes the leading inputs of one requester only.
+    //   - No overflow replay waits. The rollback took the tool calls and results of the turn out of the history.
+    //   - No background job lives. Passivation stops it, and a resume could start it again.
+    //   - Each tool call has a recorded result, so the next model call sees what ran.
+    //   - The turn has a channel type, so the reminder can deliver to it.
+    // <stopped-turn-continuation>
+    internal static bool ContinuesStoppedTurn(
+        bool emittedText,
+        int pendingInputCount,
+        bool replayWaits,
+        bool hasLiveBackgroundJob,
+        bool hasUnansweredToolCall,
+        bool hasChannelType)
+        => !emittedText && pendingInputCount == 0 && !replayWaits && !hasLiveBackgroundJob && !hasUnansweredToolCall
+           && hasChannelType;
+    // </stopped-turn-continuation>
+
+    /// <summary>
+    /// The notice that tells the person that a restart drain stopped the turn, or null when the restart reminder
+    /// resumes the turn. The turn resumes only when the reminder replays the inputs of the turn, so
+    /// <paramref name="pendingTurnInputCount"/> counts the selected inputs of the stopped turn that stay pending. After a
+    /// tool batch, that is the one continuation input (<see cref="ContinuesStoppedTurn"/>, #2632).
+    /// <paramref name="drainReason"/> is <see cref="Protocol.PrepareForDaemonRestart.Reason"/>.
+    /// </summary>
+    internal static string? RestartStoppedTurnNotice(
+        ReminderEligibility eligibility,
+        int pendingTurnInputCount,
+        string drainReason)
+        => eligibility == ReminderEligibility.Eligible && pendingTurnInputCount > 0
+            ? null
+            : $"Netclaw stopped this turn because the daemon is {(drainReason == "daemon-stop" ? "stopping" : "restarting")}. "
+              + "The turn did not finish, and it will not continue by itself. Send a message to continue.";
+
+    public PassivationStart BeginPassivation(bool hasTrackedJobs, bool managerAvailable, bool observerAvailable)
+    {
+        long? reapEpoch = null;
+        if (hasTrackedJobs && managerAvailable)
+        {
+            reapEpoch = ++_jobReapEpoch;
+            _reap = new ReapOperation(reapEpoch.Value);
+        }
+
+        _attempt = new PassivationAttempt(reapEpoch);
+        var requestDistillation = !RestartDrainRequested && observerAvailable;
+        if (requestDistillation)
+            timers.StartSingleTimer(PassivationTimerKey, new PassivationTimeout(), PassivationGracePeriod);
+
+        return new PassivationStart(reapEpoch, requestDistillation);
+    }
+
+    public void CompleteDistillation() => timers.Cancel(PassivationTimerKey);
+
+    public PassivationWork CompletePassivationWork(SessionPhase phase)
+    {
+        if (phase != SessionPhase.Passivating || _attempt is null
+            || _attempt.Milestone is AttemptMilestone.SnapshotReady
+                or AttemptMilestone.Grace or AttemptMilestone.FinalEffectsClaimed)
+            return PassivationWork.NoAction;
+
+        if (_attempt.ReapEpoch is { } epoch && _reap?.Epoch == epoch)
+        {
+            _attempt.Milestone = AttemptMilestone.Prerequisite;
+            return PassivationWork.WaitForReap;
+        }
+
+        _attempt.Milestone = AttemptMilestone.SnapshotReady;
+        return PassivationWork.AttemptSnapshot;
+    }
+
+    public bool ObserveReapReply(long epoch)
+    {
+        if (_reap is not { } reap || reap.Epoch != epoch || reap.AwaitingCommit)
+            return false;
+
+        // One manager reply can cause one journal write. The callback owns the completion.
+        reap.AwaitingCommit = true;
+        return true;
+    }
+
+    public PassivationWork ReapCommitted(long epoch, SessionPhase phase)
+    {
+        if (_reap is not { } reap || reap.Epoch != epoch || !reap.AwaitingCommit)
+            return PassivationWork.NoAction;
+
+        _reap = null;
+        if (phase != SessionPhase.Passivating || _attempt is null
+            || _attempt.ReapEpoch != epoch || _attempt.Milestone != AttemptMilestone.Prerequisite)
+            return PassivationWork.NoAction;
+
+        _attempt.Milestone = AttemptMilestone.SnapshotReady;
+        return PassivationWork.AttemptSnapshot;
+    }
+
+    public bool AfterFinalSnapshotAttempt(SessionPhase phase)
+    {
+        if (phase != SessionPhase.Passivating || _attempt?.Milestone != AttemptMilestone.SnapshotReady)
+            throw new InvalidOperationException("The passivation attempt is not ready for a final snapshot.");
+
+        if (RestartDrainRequested)
+            return true;
+
+        _attempt.Milestone = AttemptMilestone.Grace;
+        timers.StartSingleTimer(
+            PassivationFinalStopTimerKey,
+            new PassivationFinalStop(),
+            PassivationFinalStopDelay);
+        return false;
+    }
+
+    public bool IsCurrentFinalStop(SessionPhase phase)
+        => phase == SessionPhase.Passivating && _attempt?.Milestone == AttemptMilestone.Grace;
+
+    public void AbortPassivation()
+    {
+        if (_attempt?.Milestone == AttemptMilestone.FinalEffectsClaimed)
+            return;
+
+        timers.Cancel(PassivationTimerKey);
+        timers.Cancel(PassivationFinalStopTimerKey);
+        _attempt = null;
+    }
+
+    public FinalStopResult? ClaimFinalStop(
+        SessionPhase phase,
+        SessionId sessionId,
+        IReadOnlyList<InputAdmitted> pending,
+        IReadOnlyList<BackgroundChildRun> unreportedChildren)
+    {
+        if (phase != SessionPhase.Passivating || _attempt is null
+            || _attempt.Milestone is not (AttemptMilestone.Grace or AttemptMilestone.SnapshotReady))
+            return null;
+
+        var (reminder, reason) = BuildRestartReminder(sessionId, pending, unreportedChildren);
+        _attempt.Milestone = AttemptMilestone.FinalEffectsClaimed;
+        return new FinalStopResult(_restartDrainReplyTo, reminder, reason);
+    }
+
+    // One turn serves one requester. The resume takes the leading pending inputs that share the requester of the
+    // first one. The other pending inputs run in their own turns after it. Only a damaged first input refuses the
+    // resume. A later damaged input ends the leading inputs, and the caller keeps it pending (#2576).
+    public RestartContextResult ValidateRestartResume(IReadOnlyList<InputAdmitted> pending)
+    {
+        TurnContext? first = null;
+        var count = 0;
+        foreach (var input in pending)
+        {
+            if (!TurnContext.TryFromRecord(input.TurnContext, out var candidate, out var reason)
+                || candidate is null)
+            {
+                if (first is null)
+                    return new RestartContextResult(null, reason, 0);
+                break;
+            }
+
+            if (first is null)
+            {
+                first = candidate;
+                count = 1;
+                continue;
+            }
+
+            if (!first.HasSameRequester(candidate))
+                break;
+            count++;
+        }
+
+        return new RestartContextResult(first, first is null ? "no pending input" : null, count);
+    }
+
+    private (ReminderDefinition? Reminder, string? Reason) BuildRestartReminder(
+        SessionId sessionId,
+        IReadOnlyList<InputAdmitted> pending,
+        IReadOnlyList<BackgroundChildRun> unreportedChildren)
+    {
+        if (_restartInterruptionAt is not { } interruptedAt)
+            return (null, null);
+
+        // A pending input supplies the recorded context. The continuation input of a stopped turn is one too (#2632).
+        // With no resumable input, the oldest unreported child supplies it. Its owner is the requester whose work the
+        // restart interrupted.
+        var fromChildren = _restartResumesChildrenOnly || pending.Count == 0;
+        if (fromChildren ? unreportedChildren.Count == 0 : pending.Count == 0)
+            return (null, null);
+        var contextResult = fromChildren
+            ? ChildRestartContext(unreportedChildren)
+            : ValidateRestartResume(pending);
+        if (contextResult.Context is not { } context)
+            return (null, contextResult.Reason ?? "invalid stored authority");
+
+        if (context.ChannelType is not { } channelType)
+            return (null, "the turn has no channel type");
+
+        return (new ReminderDefinition
+        {
+            Id = ReminderIdGenerator.Generate("restart resume"),
+            Title = "Resume after daemon restart",
+            Instructions = RestartReminderInstruction,
+            Schedule = new ReminderSchedule { Type = ReminderScheduleType.OneShot, FireAt = interruptedAt },
+            Delivery = new ReminderDelivery
+            {
+                Kind = DeliveryKind.CurrentSession,
+                SessionId = sessionId.Value,
+                OriginChannelType = channelType
+            },
+            DeliveryRequired = true,
+            Audience = context.Audience,
+            Boundary = context.Boundary,
+            CreatedBy = "system",
+            CreatedAt = interruptedAt,
+            UpdatedAt = interruptedAt,
+            ExpiresAt = interruptedAt + RestartReminderLifetime
+        }, null);
+    }
+
+    private static RestartContextResult ChildRestartContext(IReadOnlyList<BackgroundChildRun> unreportedChildren)
+    {
+        var oldest = unreportedChildren.MinBy(static run => run.AcceptedAtMs)
+            ?? throw new InvalidOperationException("A child restart context requires an unreported child run.");
+        return TurnContext.TryFromRecord(oldest.OriginalContext, out var context, out var reason) && context is not null
+            ? new RestartContextResult(context, null, 0)
+            : new RestartContextResult(null, reason, 0);
+    }
+
+    public long CurrentModelCallId => _modelCallId;
+    public bool HasLiveModel => _modelCts is not null;
+    public bool HasContentStreamed => _anyContentStreamed;
+    public bool IsCurrentWatchdog(ProcessingWatchdogExpired message) => _watchdog.IsCurrent(message);
+    public bool IsCurrentCompaction(long operationId)
+        => _watchdog.IsCurrentOperation(ProcessingWatchdog.Compaction, operationId);
+
+    public (long CallId, CancellationToken Token) BeginModel()
+    {
+        CancelAndDisposeModel();
+        _modelTask = null;
+        _modelCts = new CancellationTokenSource();
+        _modelCallId++;
+        _anyContentStreamed = false;
+        return (_modelCallId, _modelCts.Token);
+    }
+
+    public bool CanDispatchPreparedModel(long callId)
+        => callId == _modelCallId && _modelCts is not null && !_modelStopRequested;
+
+    public (long CallId, CancellationToken Token) ModelDispatch()
+    {
+        if (!CanDispatchPreparedModel(_modelCallId))
+            throw new InvalidOperationException("The current model call cannot dispatch.");
+
+        return (_modelCallId, _modelCts!.Token);
+    }
+
+    public void AttachModel(long callId, Task task)
+    {
+        if (!CanDispatchPreparedModel(callId) || _modelTask is { IsCompleted: false })
+            throw new InvalidOperationException("The model task does not match a live call.");
+
+        _modelTask = task;
+    }
+
+    public bool AcceptModelResult(long callId)
+    {
+        if (callId != _modelCallId || _modelStopRequested)
+            return false;
+
+        _modelTask = null;
+        StopWatchdog();
+        CancelAndDisposeModel();
+        return true;
+    }
+
+    public bool AcceptModelProgress(
+        long callId,
+        StreamActivity activity,
+        TimeSpan prefillTimeout,
+        TimeSpan interDeltaTimeout)
+    {
+        if (callId != _modelCallId || _modelStopRequested)
+            return false;
+
+        _anyContentStreamed = _watchdog.OnStreamProgress(
+            activity, _anyContentStreamed, prefillTimeout, interDeltaTimeout, timers);
+        return true;
+    }
+
+    public void StartModelWatchdog(TimeSpan prefillTimeout, TimeSpan noProgressTimeout)
+        => _watchdog.Start(ProcessingWatchdog.LlmCall, prefillTimeout, timers, noProgressTimeout);
+
+    public void StopModelForTimeout()
+    {
+        StopWatchdog();
+        CancelAndDisposeModel();
+    }
+
+    public bool RequestModelStop(long callId)
+    {
+        if (callId != _modelCallId || _modelCts is null || _modelStopRequested)
+            return false;
+
+        _modelStopRequested = true;
+        StopWatchdog();
+        _modelCts.Cancel();
+        if (_modelTask is { IsCompleted: false } task)
+            _ = ReportModelStopAsync(task, actor, callId);
+        else
+            actor.Tell(new ModelStoppedForRestart(callId, null));
+        return true;
+    }
+
+    public bool AcceptModelStop(ModelStoppedForRestart message)
+    {
+        if (!_modelStopRequested || message.CallId != _modelCallId)
+            return false;
+
+        _modelCallId++;
+        _modelTask = null;
+        CancelAndDisposeModel();
+        _modelStopRequested = false;
+        return true;
+    }
+
+    public CancellationToken BeginTool()
+    {
+        CancelAndDisposeTool();
+        _toolTask = null;
+        _toolCts = new CancellationTokenSource();
+        return _toolCts.Token;
+    }
+
+    public bool OwnsToolDispatch(CancellationToken token)
+        => _toolCts is not null && _toolCts.Token == token && !token.IsCancellationRequested;
+
+    public void AttachTool(Task task)
+    {
+        if (_toolCts is null || _toolTask is { IsCompleted: false })
+            throw new InvalidOperationException("The tool task does not match a live batch.");
+
+        _toolTask = task;
+    }
+
+    public void OnToolBatchMessage()
+    {
+        StopWatchdog();
+        CancelAndDisposeTool();
+        _toolTask = null;
+    }
+
+    public void OnToolFailure()
+    {
+        StopWatchdog();
+        CancelAndDisposeTool();
+    }
+
+    public bool CanRequestToolStop()
+        => !_toolStopRequested && _toolCts is not null && _toolTask is { IsCompleted: false };
+
+    public bool RequestToolStop()
+    {
+        if (!CanRequestToolStop())
+            return false;
+
+        _toolStopRequested = true;
+        _toolCts!.Cancel();
+        _ = ReportToolPipelineStopAsync(_toolTask!, actor);
+        return true;
+    }
+
+    public bool AcceptToolStop(ToolPipelineStoppedForRestart message)
+        => _toolStopRequested && ReferenceEquals(message.WorkTask, _toolTask);
+
+    public void ClearToolTracking()
+    {
+        _toolTask = null;
+        _toolStopRequested = false;
+    }
+
+    public void ReleaseTool() => CancelAndDisposeTool();
+
+    public void ReleaseAll()
+    {
+        CancelAndDisposeModel();
+        CancelAndDisposeTool();
+    }
+
+    public long StartCompactionWatchdog(TimeSpan timeout)
+    {
+        _watchdog.Start(ProcessingWatchdog.Compaction, timeout, timers);
+        return _watchdog.CurrentOperationId;
+    }
+
+    public void StopWatchdog() => _watchdog.Stop(timers);
+
+    private void CancelAndDisposeModel()
+    {
+        _modelCts?.Cancel();
+        _modelCts?.Dispose();
+        _modelCts = null;
+    }
+
+    private void CancelAndDisposeTool()
+    {
+        _toolCts?.Cancel();
+        _toolCts?.Dispose();
+        _toolCts = null;
+    }
+
+    private static async Task ReportModelStopAsync(Task task, IActorRef recipient, long callId)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
+            recipient.Tell(new ModelStoppedForRestart(callId, null), ActorRefs.NoSender);
+        }
+        catch (Exception ex)
+        {
+            recipient.Tell(new ModelStoppedForRestart(callId, ex), ActorRefs.NoSender);
+        }
+    }
+
+    private static async Task ReportToolPipelineStopAsync(Task task, IActorRef recipient)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
+            recipient.Tell(new ToolPipelineStoppedForRestart(task, null), ActorRefs.NoSender);
+        }
+        catch (OperationCanceledException)
+        {
+            recipient.Tell(new ToolPipelineStoppedForRestart(task, null), ActorRefs.NoSender);
+        }
+        catch (Exception ex)
+        {
+            recipient.Tell(new ToolPipelineStoppedForRestart(task, ex), ActorRefs.NoSender);
+        }
+    }
+}

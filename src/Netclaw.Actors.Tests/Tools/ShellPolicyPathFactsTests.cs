@@ -18,6 +18,161 @@ namespace Netclaw.Actors.Tests.Tools;
 
 public sealed class ShellPolicyPathFactsTests
 {
+    [Fact]
+    public void Incomplete_glob_path_view_retains_the_known_target_of_a_broken_chain()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        using var directory = new DisposableTempDir();
+        var covering = Directory.CreateDirectory(Path.Combine(directory.Path, "cover")).FullName;
+        var knownTarget = Path.Combine(covering, "missing");
+        Directory.CreateSymbolicLink(Path.Combine(covering, "alias"), knownTarget);
+        var environment = ShellExecutionEnvironment.CreateBash(ShellPlatform.Linux, new Version(5, 2));
+        var analysis = new ShellCommandAnalyzer(environment).Analyze($"cat {covering}/a*/x", directory.Path);
+        var occurrence = Assert.Single(analysis.Commands);
+        var pattern = Assert.IsType<ShellValueDomain.PathPattern>(
+            ShellGlobScope.FindGlobPattern(occurrence, occurrence.Clause.Args.Last()));
+        var source = new ShellPolicySourcePathFact(ShellPolicyPathOrigin.AuthoredArgument, pattern, ShellPathShape.Posix);
+
+        var resolved = ShellPolicyOccurrencePathFacts.Resolve(source, directory.Path, ShellPathStyle.Posix);
+
+        Assert.Equal(ShellPolicyPathResolutionState.InvalidKnownValue, resolved.State);
+        Assert.Contains(resolved.Paths, path => path.Value == covering);
+        Assert.Contains(resolved.Paths, path => path.Value == knownTarget);
+    }
+
+    [Theory]
+    [InlineData("/dev/tcp/host/80")]
+    [InlineData("/dev/udp/host/80")]
+    [InlineData("/dev/fd/9")]
+    public void Compound_redirects_reject_bash_special_device_targets(string target)
+    {
+        var environment = ShellExecutionEnvironment.CreateBash(ShellPlatform.Linux);
+        var analysis = new ShellCommandAnalyzer(environment)
+            .Analyze($"while false; do :; done > {target}", "/work/repo");
+
+        Assert.False(ShellPolicyPathFacts.TryCreateCompoundRedirectViews(analysis, out _));
+    }
+
+    [Fact]
+    public void Compound_redirect_to_dev_null_is_a_known_non_file_effect()
+    {
+        var environment = ShellExecutionEnvironment.CreateBash(ShellPlatform.Linux);
+        var analysis = new ShellCommandAnalyzer(environment)
+            .Analyze("while false; do :; done > /dev/null", "/work/repo");
+
+        Assert.True(ShellPolicyPathFacts.TryCreateCompoundRedirectViews(analysis, out var views));
+        var view = Assert.Single(Assert.IsAssignableFrom<IReadOnlyList<ShellPolicyCompoundRedirectPathFacts>>(views));
+        Assert.Equal("/dev/null", Assert.Single(view.PathFact.Paths).Value);
+    }
+
+    [Fact]
+    public void Compound_absolute_targets_do_not_require_an_owner_working_directory_but_relative_targets_do()
+    {
+        var environment = ShellExecutionEnvironment.CreateBash(ShellPlatform.Linux, new Version(5, 2));
+        var analyzer = new ShellCommandAnalyzer(environment);
+        var absolute = analyzer.Analyze("cd \"$target\" && while false; do :; done > /tmp/result.txt", "/work/repo");
+        var relative = analyzer.Analyze("cd \"$target\" && while false; do :; done > result.txt", "/work/repo");
+
+        Assert.True(ShellPolicyPathFacts.TryCreateCompoundRedirectViews(absolute, out var absoluteViews));
+        Assert.Equal("/tmp/result.txt", Assert.Single(Assert.IsAssignableFrom<IReadOnlyList<ShellPolicyCompoundRedirectPathFacts>>(absoluteViews)).PathFact.Paths[0].Value);
+        Assert.False(ShellPolicyPathFacts.TryCreateCompoundRedirectViews(relative, out _));
+    }
+
+    [Fact]
+    public void Compound_consent_candidates_must_name_the_retained_source_owner_and_operation()
+    {
+        const string source = "for item in one; do value=1; done > result.txt";
+        const string cwd = "/work/repo";
+        var environment = ShellExecutionEnvironment.CreateBash(ShellPlatform.Linux, new Version(5, 2));
+        var analysis = new ShellCommandAnalyzer(environment).Analyze(source, cwd);
+        var owner = Assert.Single(Assert.IsAssignableFrom<IReadOnlyList<ShellCompoundRedirectOwner>>(
+            GetOwners(analysis)));
+        var redirect = Assert.Single(owner.Syntax.Redirects);
+        var context = TestToolExecutionContext.CreateBound(
+            "signalr/compound-source-binding",
+            "/work/session",
+            TrustAudience.Personal);
+
+        var sourceBinder = SourceBinder(source, cwd, owner.Syntax);
+        var fileOperation = FileOperation("write /work/repo/result.txt", cwd, owner.Syntax, redirect);
+        Assert.True(TryCreate([sourceBinder, fileOperation], out var validProjection));
+        Assert.All(validProjection!.Candidates, candidate =>
+        {
+            Assert.False(candidate.CanRequestStoredGrant);
+            Assert.False(candidate.CanUseRealReviewedSafePolicy);
+        });
+        Assert.False(TryCreate([SourceBinder("for changed in one; do value=1; done > result.txt", cwd, owner.Syntax)], out _));
+
+        var foreignAnalysis = new ShellCommandAnalyzer(environment).Analyze(source, cwd);
+        var foreignOwner = Assert.Single(Assert.IsAssignableFrom<IReadOnlyList<ShellCompoundRedirectOwner>>(
+            GetOwners(foreignAnalysis)));
+        Assert.False(TryCreate([SourceBinder(source, cwd, foreignOwner.Syntax)], out _));
+
+        var wrongOperation = FileOperation("read /work/repo/result.txt", cwd, owner.Syntax, redirect);
+        Assert.False(TryCreate([wrongOperation], out _));
+
+        Assert.False(TryCreate([sourceBinder with { RunsNoProgram = true }], out _));
+        Assert.False(TryCreate([sourceBinder with { Unresolved = ShellUnresolvedPart.None }], out _));
+        Assert.False(TryCreate([sourceBinder with { UsesFileToolRedirects = true }], out _));
+        Assert.False(TryCreate([fileOperation with { RunsNoProgram = true }], out _));
+        Assert.False(TryCreate([fileOperation with { Unresolved = ShellUnresolvedPart.None }], out _));
+        Assert.False(TryCreate([fileOperation with { UsesFileToolRedirects = false }], out _));
+
+        bool TryCreate(IReadOnlyList<ApprovalCandidate> candidates, out ShellPolicyProjection? projection)
+        {
+            var approvalContext = new ToolApprovalContext(
+                ShellTool.ToolName,
+                source,
+                candidates.Select(static candidate => candidate.Verb).ToArray(),
+                candidates.Select(static candidate => candidate.Verb).ToArray(),
+                [],
+                Cwd: cwd,
+                Candidates: candidates);
+            return ShellPolicyProjection.TryCreate(
+                environment,
+                approvalContext,
+                directoryScopes: null,
+                context,
+                analysis,
+                out projection);
+        }
+
+        static IReadOnlyList<ShellCompoundRedirectOwner> GetOwners(ShellCommandAnalysis analysis)
+        {
+            Assert.True(analysis.TryGetCompoundRedirectOwners(out var owners));
+            return Assert.IsAssignableFrom<IReadOnlyList<ShellCompoundRedirectOwner>>(owners);
+        }
+
+        static ApprovalCandidate SourceBinder(
+            string text,
+            string directory,
+            RedirectedCompoundSyntax owner)
+            => new(text, directory)
+            {
+                Shell = ApprovalShell.Bash,
+                VerbTokens = null,
+                Unresolved = ShellUnresolvedPart.Command,
+                SourceCompoundOwner = owner,
+            };
+
+        static ApprovalCandidate FileOperation(
+            string text,
+            string directory,
+            RedirectedCompoundSyntax owner,
+            CompoundRedirect redirect)
+            => new(text, directory)
+            {
+                Shell = ApprovalShell.Bash,
+                VerbTokens = null,
+                Unresolved = ShellUnresolvedPart.Command,
+                UsesFileToolRedirects = true,
+                SourceCompoundOwner = owner,
+                SourceCompoundRedirect = redirect,
+            };
+    }
+
     [Theory]
     [InlineData(false, "head /external/file.log", "/work", "/external/file.log")]
     [InlineData(true, @"Get-Content C:\external\file.log", @"C:\work", @"C:\external\file.log")]
@@ -407,12 +562,14 @@ public sealed class ShellPolicyPathFactsTests
             "signalr/shell-policy-path-facts",
             "/work/session",
             TrustAudience.Personal);
+        var analysis = new ShellCommandAnalyzer(environment).Analyze("echo", "/work/repo");
 
         Assert.True(ShellPolicyProjection.TryCreate(
             environment,
             approvalContext,
             directoryScopes: null,
             context,
+            analysis,
             out var projection));
         return new ShellPolicyEvaluation(
             Assert.IsType<ShellPolicyProjection>(projection),

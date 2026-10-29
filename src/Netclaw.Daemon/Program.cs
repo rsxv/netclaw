@@ -32,6 +32,7 @@ using Netclaw.Channels;
 using Netclaw.Configuration;
 using Netclaw.Configuration.Http;
 using Netclaw.Providers;
+using Netclaw.Providers.Anthropic;
 using Netclaw.Providers.OAuth;
 using Netclaw.Providers.OpenAi;
 using Netclaw.Providers.OpenRouter;
@@ -139,7 +140,7 @@ catch (InvalidDataException ex)
     // duplicate key such as Models and models): also an operator error.
     StartupConfigurationFailure.Report(
         bootstrapPaths,
-        $"Cannot read netclaw.json or secrets.json: {ex.InnerException?.Message ?? ex.Message}",
+        DaemonConfigurationSources.DescribeLoadFailure(ex),
         Console.Error);
     Environment.ExitCode = 1;
 }
@@ -185,7 +186,7 @@ static async Task RunDaemonAsync(
     builder.WebHost.UseUrls($"http://{daemonConfig.Host}:{daemonConfig.Port}");
     var daemonLogLevel = builder.ConfigureNetclawLogging(paths);
     builder.AddNetclawTelemetry();
-    var configurationWarnings = ConfigureDaemonServices(
+    var (configurationWarnings, configurationNotices) = ConfigureDaemonServices(
         builder.Services,
         builder.Configuration,
         paths,
@@ -203,6 +204,7 @@ static async Task RunDaemonAsync(
     builder.Services.AddSingleton<BootstrapDeviceSeeder>();
     builder.Services.AddSingleton<LocalControlPairingProofProtector>();
     builder.Services.AddSingleton<LocalControlPairingProofValidator>();
+    builder.Services.AddSingleton<LocalControlRequests>();
     builder.Services.AddSingleton<PairingExchangeGuard>();
     builder.Services.AddSingleton<IRemoteAuthSchemeRegistration, DevicePairingSchemeRegistration>();
     builder.Services.AddNetclawAuthSchemes(daemonConfig);
@@ -211,8 +213,8 @@ static async Task RunDaemonAsync(
     // Add OpenAPI
     builder.Services.AddOpenApi();
 
-    // Rate limits bound both unauthenticated pairing endpoints.
-    // The exchange uses a long brute-force window. Local control uses a short load-shed window.
+    // The pairing exchange uses a long brute-force window. Local control counts only
+    // refused requests, in LocalControlRequests, so a valid proof is never refused.
     builder.Services.AddRateLimiter(options =>
     {
         options.AddPolicy("pairing-exchange", context =>
@@ -225,13 +227,12 @@ static async Task RunDaemonAsync(
                     QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
                     QueueLimit = 0,
                 }));
-        PairingEndpointRouteBuilderExtensions.AddLocalControlRateLimitPolicy(options);
         options.RejectionStatusCode = 429;
     });
     builder.Services.AddMattermostActionEndpointRateLimiting();
 
     // SignalR for remote clients (CLI thin client, Blazor ops console)
-    builder.Services.AddSignalR();
+    builder.Services.AddSessionHubSignalR();
     builder.Services.AddSingleton<SessionCatalogService>();
     builder.Services.AddSingleton<ISessionLifecycleObserver>(sp => sp.GetRequiredService<SessionCatalogService>());
     builder.Services.AddSingleton<ClaimsPrincipalMapper>();
@@ -242,6 +243,9 @@ static async Task RunDaemonAsync(
     builder.Services.AddSingleton<Netclaw.Actors.Telemetry.ISessionMetrics>(sp => sp.GetRequiredService<DailyStatsPublisher>());
     builder.Services.AddSingleton<DaemonStatsService>();
     builder.Services.AddSingleton<SessionIngressGate>();
+    // The layout is a required dependency of the resolver. On POSIX it is the short per-user base
+    // /tmp/netclaw-<uid> (issue #2554). A host that cannot read its user ID fails at startup.
+    builder.Services.AddSingleton<ManagedTemporaryLayout>(_ => ManagedTemporaryLayout.ForHost());
     builder.Services.AddSingleton<ISessionStorageResolver, SqliteSessionStorageResolver>();
     builder.Services.AddSingleton<RestartManifestStore>();
     builder.Services.AddSingleton<RejectedConfigState>();
@@ -266,6 +270,8 @@ static async Task RunDaemonAsync(
         shellResolution.Environment.PowerShellDialect?.ToString() ?? "not-applicable");
     foreach (var warning in configurationWarnings)
         startupLogger.LogWarning("Configuration warning: {ConfigurationWarning}", warning);
+    foreach (var notice in configurationNotices)
+        startupLogger.LogInformation("Configuration notice: {ConfigurationNotice}", notice);
 
     if (shellResolution.FallbackReason is { } fallbackReason)
     {
@@ -424,7 +430,8 @@ static (NetclawPaths Paths, ModelSelection Models) ConfigureConfigServices(
     // 1. netclaw.json (base config, optional)
     // 2. secrets.json (credentials overlay, optional)
     // 3. NETCLAW_* environment variables (highest priority)
-    configuration.AddNetclawDaemonSources(bootstrapPaths);
+    var netclawJson = ConfigReloadBaseline.ReadNetclawJson(bootstrapPaths);
+    services.AddSingleton(ConfigReloadBaseline.Load(configuration, bootstrapPaths, netclawJson));
 
     // Re-create paths with config-driven overrides (e.g. custom workspaces directory).
     var workspacesDir = configuration.GetValue<string>("Workspaces:Directory");
@@ -459,7 +466,7 @@ static (NetclawPaths Paths, ModelSelection Models) ConfigureConfigServices(
 // ═══════════════════════════════════════════════════════════════════════
 
 // Returns configuration warnings. The caller logs them after the host builds its loggers.
-static IReadOnlyList<string> ConfigureDaemonServices(
+static (IReadOnlyList<string> Warnings, IReadOnlyList<string> Notices) ConfigureDaemonServices(
     IServiceCollection services,
     IConfigurationManager configuration,
     NetclawPaths paths,
@@ -523,25 +530,6 @@ static IReadOnlyList<string> ConfigureDaemonServices(
     // no providers are configured we never reach a real plugin, the No-Op
     // client supersedes, and capabilities default to text-only below.
     var providers = ProviderConfigurationLoader.Load(configuration.GetSection("Providers"));
-    var mainProviderType = providers.TryGetValue(models.Main.Provider, out var mainProvider)
-        ? mainProvider.Type
-        : null;
-    var ollamaEndpoint = mainProviderType?.Equals("ollama", StringComparison.OrdinalIgnoreCase) == true
-        ? (string.IsNullOrWhiteSpace(mainProvider!.Endpoint)
-            ? OllamaDescriptor.DefaultEndpointValue
-            : mainProvider.Endpoint)
-        : null;
-    var openAiCompatibleEndpoint = mainProviderType?.Equals("openai-compatible", StringComparison.OrdinalIgnoreCase) == true
-        ? (string.IsNullOrWhiteSpace(mainProvider!.Endpoint)
-            ? "http://localhost:11434"
-            : mainProvider.Endpoint)
-        : null;
-    var openAiCompatibleApiKey = mainProviderType?.Equals("openai-compatible", StringComparison.OrdinalIgnoreCase) == true
-        ? mainProvider?.AuthMethod is AuthMethod.ApiKey
-            ? mainProvider.ApiKey?.Value
-            : null
-        : null;
-
     services.AddSingleton<ModelCapabilities>(sp =>
     {
         var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("Netclaw.Startup");
@@ -557,7 +545,7 @@ static IReadOnlyList<string> ConfigureDaemonServices(
         }
 
         var resolver = sp.GetRequiredService<IModelCapabilityResolver>();
-        var detected = resolver.ResolveAsync(models.Main.ModelId, CancellationToken.None)
+        var detected = resolver.ResolveAsync(models.Main, CancellationToken.None)
             .GetAwaiter().GetResult();
         var resolved = ModelCapabilityResolution.ResolveModelCapabilities(models, detected, logger: logger);
 
@@ -610,6 +598,7 @@ static IReadOnlyList<string> ConfigureDaemonServices(
     services.AddSingleton(effectivePolicyDefaults);
     var toolConfig = policyConfiguration.Tools;
     var toolConfigWarnings = policyConfiguration.ToolWarnings;
+    var toolConfigNotices = policyConfiguration.ToolNotices;
     services.AddSingleton(toolConfig);
     services.AddSingleton<TrustContextDeriver>();
 
@@ -794,8 +783,6 @@ static IReadOnlyList<string> ConfigureDaemonServices(
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<EmbeddingWarmupHostedService>());
     }
 
-    services.AddSingleton<IMemoryExtractor>(NullMemoryExtractor.Instance);
-
     services.AddDaemonToolExecutor(toolRegistry, toolAccessPolicy);
     // Operational notification webhooks
     var notificationsConfig = configuration.GetSection("Notifications")
@@ -953,55 +940,52 @@ static IReadOnlyList<string> ConfigureDaemonServices(
     var promptProvider = new FileSystemPromptProvider(paths);
     services.AddSingleton<ISystemPromptProvider>(promptProvider);
 
-    // Model capability resolution chain:
-    // [Ollama →] [OpenAI-compat →] OpenRouter oracle → HuggingFace → text-only default.
-    // When the main provider is Ollama, query it first — it knows the true context window
-    // for locally hosted models that may not be indexed by external oracles.
+    // Model capability resolution: one chain for each configured provider, so each definition
+    // resolves against its own endpoint. A chain is [native probe of that provider →]
+    // OpenRouter oracle → HuggingFace → text-only default. The native probe knows the true
+    // context window of a locally hosted model that the catalogs may not index.
     services.AddHttpClient<OpenRouterOracleResolver>().AddNetclawHeaders("capability-probe");
     services.AddHttpClient<HuggingFaceCapabilityResolver>().AddNetclawHeaders("capability-probe");
-    if (ollamaEndpoint is not null)
-    {
-        services.AddHttpClient(nameof(OllamaCapabilityResolver)).AddNetclawHeaders("capability-probe");
-        services.AddSingleton(sp =>
-            new OllamaCapabilityResolver(
-                sp.GetRequiredService<IHttpClientFactory>().CreateClient(nameof(OllamaCapabilityResolver)),
-                sp.GetRequiredService<ILogger<OllamaCapabilityResolver>>(),
-                ollamaEndpoint));
-    }
-    if (openAiCompatibleEndpoint is not null)
-    {
-        services.AddHttpClient(nameof(OpenAiCompatibleCapabilityResolver)).AddNetclawHeaders("capability-probe");
-        services.AddSingleton(sp =>
-            new OpenAiCompatibleCapabilityResolver(
-                sp.GetRequiredService<IHttpClientFactory>().CreateClient(nameof(OpenAiCompatibleCapabilityResolver)),
-                sp.GetRequiredService<ILogger<OpenAiCompatibleCapabilityResolver>>(),
-                openAiCompatibleEndpoint,
-                openAiCompatibleApiKey));
-    }
-    // modelId → provider type lookup for CompositeCapabilityResolver scoping.
-    // Covers Main + optional Compaction independently so multi-provider
-    // deployments resolve each model's capabilities against the right backend.
-    var modelProviderLookup = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
-    if (!string.IsNullOrWhiteSpace(models.Main.ModelId))
-        modelProviderLookup[models.Main.ModelId] = mainProviderType;
-    if (models.Compaction is { ModelId: { Length: > 0 } compactionId } &&
-        providers.TryGetValue(models.Compaction.Provider, out var compactionProvider))
-        modelProviderLookup[compactionId] = compactionProvider.Type;
-
+    services.AddHttpClient(nameof(OllamaCapabilityResolver)).AddNetclawHeaders("capability-probe");
+    services.AddHttpClient(nameof(OpenAiCompatibleCapabilityResolver)).AddNetclawHeaders("capability-probe");
+    services.AddHttpClient(nameof(AnthropicCapabilityResolver)).AddNetclawHeaders("capability-probe");
     services.AddSingleton<IModelCapabilityResolver>(sp =>
     {
-        var resolvers = new List<IModelCapabilityResolver>();
-        if (ollamaEndpoint is not null)
-            resolvers.Add(sp.GetRequiredService<OllamaCapabilityResolver>());
-        if (openAiCompatibleEndpoint is not null)
-            resolvers.Add(sp.GetRequiredService<OpenAiCompatibleCapabilityResolver>());
-        resolvers.Add(sp.GetRequiredService<OpenRouterOracleResolver>());
-        resolvers.Add(sp.GetRequiredService<HuggingFaceCapabilityResolver>());
+        var http = sp.GetRequiredService<IHttpClientFactory>();
+        var loggers = sp.GetRequiredService<ILoggerFactory>();
+        IModelCapabilityResolver[] catalogs =
+        [
+            sp.GetRequiredService<OpenRouterOracleResolver>(),
+            sp.GetRequiredService<HuggingFaceCapabilityResolver>(),
+        ];
 
-        return new CompositeCapabilityResolver(
-            resolvers,
-            sp.GetRequiredService<ILogger<CompositeCapabilityResolver>>(),
-            modelId => modelProviderLookup.TryGetValue(modelId, out var pt) ? pt : null);
+        IModelCapabilityResolver? Native(ProviderEntry entry) => entry.Type.ToLowerInvariant() switch
+        {
+            "ollama" => new OllamaCapabilityResolver(
+                http.CreateClient(nameof(OllamaCapabilityResolver)),
+                loggers.CreateLogger<OllamaCapabilityResolver>(),
+                string.IsNullOrWhiteSpace(entry.Endpoint) ? OllamaDescriptor.DefaultEndpointValue : entry.Endpoint),
+            "openai-compatible" => new OpenAiCompatibleCapabilityResolver(
+                http.CreateClient(nameof(OpenAiCompatibleCapabilityResolver)),
+                loggers.CreateLogger<OpenAiCompatibleCapabilityResolver>(),
+                string.IsNullOrWhiteSpace(entry.Endpoint) ? "http://localhost:11434" : entry.Endpoint,
+                entry.AuthMethod is AuthMethod.ApiKey ? entry.ApiKey?.Value : null),
+            "anthropic" when entry.ApiKey?.Value is { Length: > 0 } apiKey => new AnthropicCapabilityResolver(
+                http.CreateClient(nameof(AnthropicCapabilityResolver)),
+                loggers.CreateLogger<AnthropicCapabilityResolver>(),
+                string.IsNullOrWhiteSpace(entry.Endpoint) ? "https://api.anthropic.com" : entry.Endpoint,
+                apiKey),
+            _ => null,
+        };
+
+        var chains = providers.ToDictionary(
+            pair => pair.Key,
+            pair => (IModelCapabilityResolver)new CompositeCapabilityResolver(
+                Native(pair.Value) is { } native ? [native, .. catalogs] : catalogs,
+                sp.GetRequiredService<ILogger<CompositeCapabilityResolver>>(),
+                _ => pair.Value.Type),
+            StringComparer.OrdinalIgnoreCase);
+        return new ProviderCapabilityResolver(chains, models);
     });
 
     // Composite dependency records for LlmSessionActor DI resolution
@@ -1026,7 +1010,6 @@ static IReadOnlyList<string> ConfigureDaemonServices(
         sp.GetService<FileSubAgentDefinitionLoader>()));
 
     services.AddSingleton(sp => new SessionMemoryServices(
-        sp.GetService<IMemoryExtractor>() ?? NullMemoryExtractor.Instance,
         sp.GetService<IMemoryRecallCoordinator>() ?? NullMemoryRecallCoordinator.Instance,
         sp.GetService<IMemoryCheckpointSink>() ?? NullMemoryCheckpointSink.Instance,
         sp.GetService<SQLiteMemoryStore>(),
@@ -1053,9 +1036,7 @@ static IReadOnlyList<string> ConfigureDaemonServices(
         akkaBuilder = akkaBuilder.WithNetclawActorLogging(daemonLogLevel);
 
         var connectionString = $"Data Source={sqlitePath}";
-        akkaBuilder = akkaBuilder.WithSqlPersistence(
-            connectionString: connectionString,
-            providerName: "SQLite.MS");
+        akkaBuilder = akkaBuilder.WithDaemonSqlPersistence(connectionString);
 
         var reminderStorage = new NetclawAkkaHostingExtensions.ReminderStorageOptions
         {
@@ -1073,6 +1054,7 @@ static IReadOnlyList<string> ConfigureDaemonServices(
         akkaBuilder.WithDailyStatsActor();
         akkaBuilder.WithServerFeedSkillSyncActor();
         akkaBuilder.WithDataRetentionActor();
+        akkaBuilder.WithConfigWatcherActor();
 
         // Register reminder tools after actors start (needs ReminderManagerActor ref)
         akkaBuilder.StartActors((system, registry, _) =>
@@ -1167,10 +1149,6 @@ static IReadOnlyList<string> ConfigureDaemonServices(
     // lookups) whenever at least one remote chat channel is enabled.
     services.AddChannelIntegrations(configuration);
 
-    // Config hot-reload watcher
-    services.AddSingleton<ConfigWatcherService>();
-    services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<ConfigWatcherService>());
-
     // Warm previously active sessions after a coordinated restart.
     services.AddSingleton<RestartRecoveryService>();
     services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<RestartRecoveryService>());
@@ -1190,7 +1168,7 @@ static IReadOnlyList<string> ConfigureDaemonServices(
 
     // Expired data is cleared by DataRetentionActor, which runs every RetentionJob registered here.
     var retentionWarnings = services.AddRetentionJobs(configuration, paths);
-    return [.. toolConfigWarnings, .. retentionWarnings];
+    return ([.. toolConfigWarnings, .. retentionWarnings, .. OAuthTokenExpiryStorage.RetiredKeyWarnings(paths)], toolConfigNotices);
 }
 
 static ISearchBackend? CreateSearchBackend(SearchConfig config)

@@ -4,6 +4,7 @@
 // </copyright>
 // -----------------------------------------------------------------------
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -39,9 +40,9 @@ namespace Netclaw.Actors.SubAgents;
 /// </summary>
 public sealed class SubAgentActor : ReceiveActor, IWithTimers
 {
-    internal const int DefaultMaxToolIterations = 30;
 
     private const string EmptyResponseMarker = "(no response)";
+    private const string TruncatedOutputArtifactName = "truncated-output.md";
     private const string MalformedFinalOutputMessage = "Subagent produced malformed final output: it emitted unexecuted tool calls as text. This was not a timeout.";
     private const string MalformedFinalOutputNudge =
         "The previous response emitted unexecuted tool-call markup as plain text. "
@@ -74,7 +75,6 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
     private readonly IToolApprovalService? _approvalService;
     private readonly ILogger? _toolExecutorLogger;
     private readonly ISystemPromptProvider _promptProvider;
-    private readonly int _maxToolIterations;
 
     // Process-wide daily-stats sink (the same singleton the parent session records
     // to). Nullable because a hosting configuration without the daemon stats backend
@@ -91,6 +91,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
     private readonly MemoryPolicyEvaluator _policyEvaluator = new();
     private readonly TurnStateTracker _turnState = new();
     private PreparedToolCycleBatch? _activeCycleBatch;
+    // The repeat nudge for the active batch. The child adds it after the batch results.
+    private (RefusedRepeatAction Stage, string Text)? _activeRepeatNudge;
 
     // Stopwatch tracking the total wall-clock duration of the sub-agent run.
     // Used for the summary log on completion (ProcessingWatchdog is only a
@@ -105,25 +107,22 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
 
     // Conversation state (not persisted — ephemeral)
     private readonly List<AiChatMessage> _history = [];
+    // Every message after the system message, in the serializable form that a park carries (M12).
+    private readonly List<SerializableChatMessage> _transcript = [];
     private readonly ManagedTemporaryCorrectionState _managedTemporaryCorrections = new();
     private long _llmCallId;
+    private ChildRunExecution? _ownedRun;
+    private int _checkpointRound;
+    // running-child-drain-park design D2: after ParkForDrain the child starts no model call and no tool batch. A batch
+    // that runs ends first, so its results enter the park.
+    private bool _parkForDrain;
+    private bool _toolBatchRuns;
     private IActorRef _replyTo = ActorRefs.Nobody;
     private CancellationTokenSource? _executionCts;
 
-    // Threaded into approval-bridge waits so a slow human approver does not
-    // let the internal inactivity watchdog cancel a legitimate await on user
-    // input. The watchdog itself never touches this CTS — it only cancels
-    // _executionCts. Other terminal paths (Complete, PostStop, SubAgentCancelled)
-    // cancel both for symmetric cleanup, but those paths are already heading
-    // for actor stop, so the bridge wait is being torn down anyway.
+    // Cancelled only by a stop of the run (SubAgentCancelled, Complete, PostStop), never by the watchdog. A tool
+    // cancellation under this token is not a tool error, so it ends the batch instead of a tool result.
     private CancellationTokenSource? _externalCts;
-
-    // Mailbox-thread only. Tracks tool batches that can enter parent approval
-    // waits and the concrete number of waits currently in-flight. Waiting for
-    // human approval is legitimate work, so the watchdog re-arms instead of
-    // cancelling while this state says a wait is active.
-    private ToolExecutionWatchdogState _toolExecutionWatchdogState = ToolExecutionWatchdogState.None;
-    private int _pendingApprovalWaits;
 
     private IParentApprovalBridge? _approvalBridge;
     private ChannelWriter<ToolActivityUpdate>? _activitySink;
@@ -165,14 +164,12 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         => _toolExecutionContext
            ?? throw new InvalidOperationException("Sub-agent tool context is unavailable before a run is admitted.");
     private bool _malformedFinalOutputRepairAttempted;
-    private SubAgentOutcomeReason? _forcedFinalOutcomeReason;
 
     public SubAgentActor(
         SubAgentDefinition definition,
         IChatClient chatClient,
         ToolAccessPolicy toolAccessPolicy,
         IToolApprovalService? approvalService = null,
-        int maxToolIterations = DefaultMaxToolIterations,
         Telemetry.ISessionMetrics? sessionMetrics = null)
         : this(
             definition,
@@ -180,7 +177,6 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             toolAccessPolicy,
             NullSystemPromptProvider.Instance,
             approvalService,
-            maxToolIterations,
             sessionMetrics,
             coreToolNames: null,
             toolExecutorLogger: null)
@@ -193,15 +189,10 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         ToolAccessPolicy toolAccessPolicy,
         ISystemPromptProvider promptProvider,
         IToolApprovalService? approvalService,
-        int maxToolIterations,
         Telemetry.ISessionMetrics? sessionMetrics,
         IReadOnlySet<string>? coreToolNames,
         ILogger? toolExecutorLogger)
     {
-        if (maxToolIterations <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maxToolIterations), maxToolIterations,
-                "Sub-agent tool iteration budget must be greater than zero.");
-
         // A sub-agent must run under a fully-wired access policy — never a
         // degraded default that drops the deny-list / protected-path checks.
         // Callers (SubAgentSpawner) inject the session's real policy; the
@@ -213,7 +204,6 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         _promptProvider = promptProvider;
         _approvalService = approvalService;
         _toolExecutorLogger = toolExecutorLogger;
-        _maxToolIterations = maxToolIterations;
         _projectInstructions = definition.ProjectInstructions;
         _log = Context.GetLogger();
 
@@ -266,7 +256,6 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         IChatClient chatClient,
         ToolAccessPolicy toolAccessPolicy,
         IToolApprovalService? approvalService = null,
-        int maxToolIterations = DefaultMaxToolIterations,
         Telemetry.ISessionMetrics? sessionMetrics = null)
     {
         return Props.Create(() => new SubAgentActor(
@@ -274,7 +263,6 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             chatClient,
             toolAccessPolicy,
             approvalService,
-            maxToolIterations,
             sessionMetrics));
     }
 
@@ -284,7 +272,6 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         ToolAccessPolicy toolAccessPolicy,
         ISystemPromptProvider promptProvider,
         IToolApprovalService? approvalService = null,
-        int maxToolIterations = DefaultMaxToolIterations,
         Telemetry.ISessionMetrics? sessionMetrics = null,
         IReadOnlySet<string>? coreToolNames = null,
         ILogger? toolExecutorLogger = null)
@@ -296,7 +283,6 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             toolAccessPolicy,
             promptProvider,
             approvalService,
-            maxToolIterations,
             sessionMetrics,
             coreToolNames,
             toolExecutorLogger));
@@ -308,7 +294,6 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         ToolAccessPolicy toolAccessPolicy,
         ISystemPromptProvider promptProvider,
         IToolApprovalService? approvalService,
-        int maxToolIterations,
         Telemetry.ISessionMetrics? sessionMetrics,
         IReadOnlySet<string>? coreToolNames,
         ILogger? toolExecutorLogger) : IIndirectActorProducer
@@ -322,8 +307,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                 toolAccessPolicy,
                 promptProvider,
                 approvalService,
-                maxToolIterations,
-                sessionMetrics,
+                    sessionMetrics,
                 coreToolNames,
                 toolExecutorLogger);
 
@@ -368,6 +352,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         Receive<RunSubAgent>(msg =>
         {
             _replyTo = Sender;
+            _ownedRun = msg.OwnedRun;
 
             _approvalBridge = msg.Scope.Authority.InteractiveApproval is InteractiveApprovalCapability.Available available
                 ? available.Bridge
@@ -428,36 +413,50 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                     _definition,
                     _projectInstructions,
                     CanDeclareProjectScope())));
-            _history.Add(new AiChatMessage(Microsoft.Extensions.AI.ChatRole.User,
-                BuildUserMessage(
-                    msg.RuntimeContext,
-                    BuildModelContext(
-                        msg.Scope.InitialWorkingSnapshot,
-                        subAgentAudience,
-                        ToolExecutionContext.SessionStorage),
-                    msg.Task)));
-
-            _log.Info("SubAgent [{AgentName}] starting (tools={ToolCount}, prefill={Prefill}, interDelta={InterDelta}, noProgress={NoProgress})",
+            _log.Info("SubAgent [{AgentName}] starting (tools={ToolCount}, prefill={Prefill}, interDelta={InterDelta}, noProgress={NoProgress}, resume={Resume})",
                 _definition.Name, _aiTools.Count, _prefillBudget, _interDeltaBudget,
-                _noProgressBudget?.ToString() ?? "unbounded");
+                _noProgressBudget?.ToString() ?? "unbounded", msg.Resume is not null);
             LogToolExposure();
-
-            FireLlmCall();
+            // Become first: a resume that ends the run at once hands over, and that behavior must win.
             Become(Processing);
+            if (msg.Resume is { } resume)
+                ResumeFromPark(resume);
+            else
+            {
+                AddMessage(new SerializableChatMessage
+                {
+                    Role = Protocol.ChatRole.User,
+                    Content = BuildUserMessage(msg.RuntimeContext,
+                        BuildModelContext(msg.Scope.InitialWorkingSnapshot, subAgentAudience, ToolExecutionContext.SessionStorage),
+                        msg.Task)
+                });
+                FireLlmCall();
+            }
         });
     }
 
     private void Processing()
     {
+        Receive<ChildCheckpointCommitted>(_ => FireLlmCall());
+        Receive<ChildTerminalCommitted>(_ => Context.Stop(Self));
+        Receive<ParkForDrain>(_ =>
+        {
+            _parkForDrain = true;
+            // A model call has no outside effect, so the park cancels it, and the resumed child makes the call again.
+            if (!_toolBatchRuns)
+                ParkForDrainNow();
+        });
         Receive<LlmResponseReceived>(msg =>
         {
+            if (msg.CallId != _llmCallId)
+                return;
             // The streaming call finished; re-baseline to the inter-delta budget for
             // the synchronous processing that follows (tool dispatch or completion).
             RestartWatchdog(_interDeltaBudget);
             var response = msg.Response;
 
             // Record this call's token usage before branching so EVERY call is billed —
-            // tool-call turns, retries, the forced-no-tools final turn, and repair turns
+            // tool-call turns, retries, and repair turns
             // all flow through here exactly once. Mirrors the main session, which records
             // its own per-call usage; without this the sub-agent's tokens never reach the
             // daily-stats pipeline and `netclaw stats` under-counts by the whole sub-run.
@@ -465,22 +464,6 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
 
             var lastMessage = response.Messages[^1];
             var analysis = LlmResponseClassifier.Analyze(lastMessage);
-
-            if (analysis.Kind == LlmResponseKind.ToolCalls && _turnState.ForceNoToolsActive)
-            {
-                _log.Warning(
-                    "SubAgent [{AgentName}] requested {ToolCallCount} tool(s) after tool execution was disabled (budgetUsed={BudgetUsed}, max={Max})",
-                    _definition.Name,
-                    analysis.ToolCalls.Count,
-                    _turnState.ToolCallCount,
-                    _maxToolIterations);
-                Complete(
-                    false,
-                    "Subagent exceeded its tool iteration budget and continued requesting tools after tools were disabled.",
-                    SubAgentRunOutcome.Failed,
-                    SubAgentOutcomeReason.ToolIterationBudgetExceededAfterDisable);
-                return;
-            }
 
             _log.Info(
                 $"SubAgent [{_definition.Name}] LLM response callId={msg.CallId} kind={analysis.Kind} "
@@ -525,6 +508,28 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                 }
             }
 
+            // A reply that ended on the output limit is cut off. Its text is a stub,
+            // not a result, so it is never a success. A retry would meet the same limit.
+            if (response.FinishReason == ChatFinishReason.Length)
+            {
+                var stub = ExtractText(lastMessage);
+                _log.Warning(
+                    "SubAgent [{AgentName}] reply was truncated (finishReason=length, text={TextChars}ch, thinking={ThinkingChars}ch, toolCalls=0) — reporting failure",
+                    _definition.Name,
+                    analysis.TextChars,
+                    analysis.ThinkingChars);
+                var savedAt = SaveTruncatedOutput(stub);
+                Complete(
+                    false,
+                    "Subagent output was truncated: the model reached its output limit before it finished, "
+                    + "and it made no tool call. The text is cut off and is not a result. "
+                    + (savedAt is null ? "" : $"The full cut-off text is saved at {savedAt}. ")
+                    + $"Cut-off text: {PreviewRedacted(stub, 300)}",
+                    SubAgentRunOutcome.Failed,
+                    SubAgentOutcomeReason.OutputTruncated);
+                return;
+            }
+
             // Final text response — we're done.
             var text = ExtractText(lastMessage);
             if (string.IsNullOrWhiteSpace(text) || text == EmptyResponseMarker)
@@ -548,7 +553,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                         "SubAgent [{AgentName}] emitted unexecuted tool-call markup as final text; retrying with repair nudge",
                         _definition.Name);
                     AddSystemNudge(MalformedFinalOutputNudge);
-                    FireLlmCall(forceNoTools: _turnState.ForceNoToolsActive);
+                    FireLlmCall();
                     return;
                 }
 
@@ -562,105 +567,110 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             Complete(
                 true,
                 text,
-                _forcedFinalOutcomeReason.HasValue ? SubAgentRunOutcome.Partial : SubAgentRunOutcome.Completed,
-                _forcedFinalOutcomeReason);
+                SubAgentRunOutcome.Completed);
         });
 
         Receive<ToolExecutionCompleted>(msg =>
         {
-            _toolExecutionWatchdogState = ToolExecutionWatchdogState.None;
+            if (msg.CallId != _llmCallId)
+                return;
+            _toolBatchRuns = false;
             RecordProgress("processing tool results");
+            // H3: a parked call runs later in the directories of this batch, before a finished call changes them.
+            var batchDirectories = new ChildParkScopeDirectories(ToolExecutionContext.RunScope.ProjectDirectory,
+                ToolExecutionContext.RunScope.InheritedCwd);
+            var parked = msg.Results.Where(static result => result.Parked is not null).ToArray();
 
-            if (_activeCycleBatch is { } cycleBatch)
-            {
-                var cycleResults = msg.ToolResults.ToDictionary(
-                    result => result.ToolCallId is { } callId
-                        ? callId.Value
-                        : throw new InvalidOperationException("A tool cycle result requires a call identity."),
-                    result =>
-                    {
-                        var callId = result.ToolCallId
-                            ?? throw new InvalidOperationException("A tool cycle result requires a call identity.");
-                        msg.ToolReceipts.TryGetValue(callId.Value, out var receipt);
-                        return new ToolCycleResult(
-                            receipt?.Category ?? ToolInvocationOutcomeCategory.Success,
-                            result.Content ?? string.Empty);
-                    },
-                    StringComparer.Ordinal);
+            var cycleResults = msg.Results.Where(static result => result.Parked is null).ToDictionary(
+                result => result.Message.ToolCallId is { } callId
+                    ? callId.Value
+                    : throw new InvalidOperationException("A tool cycle result requires a call identity."),
+                result => ToolCycleResult.FromInvocation(result.Message, result.Receipt, result.FailureCode),
+                StringComparer.Ordinal);
+            // A park omits cycle history. Its finished calls and each resumed call still affect progress once.
+            if (_activeCycleBatch is { } cycleBatch && parked.Length == 0)
                 _turnState.ObserveCompleted(ToolCycleSignatureFactory.Complete(cycleBatch, cycleResults));
-                _activeCycleBatch = null;
-            }
+            else
+                _turnState.ObserveProgress(cycleResults.Values, batchComplete: parked.Length == 0);
+            _activeCycleBatch = null;
 
-            // Append tool results as MEAI messages and log each result.
-            foreach (var result in msg.ToolResults)
+            // Append tool results as MEAI messages and log each result. A parked call has no result yet.
+            foreach (var result in msg.Results.Where(static result => result.Parked is null))
             {
-                _history.Add(ChatMessageConverter.ToAiMessage(result));
-                if (result.ToolCallId is { } callId)
+                var message = result.Message;
+                AddMessage(cycleResults[message.ToolCallId!.Value.Value].WithMessageFacts(message));
+                if (message.ToolCallId is { } callId)
                 {
-                    msg.ToolReceipts.TryGetValue(callId.Value, out var receipt);
+                    var receipt = result.Receipt;
                     _fileActivity.Apply(receipt);
-                    TryApplyProjectDirectory(result.Name, receipt);
-                    if (msg.AuthorizationAttemptIds.TryGetValue(callId.Value, out var authorizationAttemptId))
-                    {
-                        _log.Info(
-                            "SubAgent authorization attempt result authorizationAttemptId={AuthorizationAttemptId} " +
-                            "sessionId={SessionId} subSessionId={SubSessionId} callId={CallId} " +
-                            "outcomeCategory={OutcomeCategory} remediationCode={RemediationCode}",
-                            authorizationAttemptId.Value,
-                            _parentSessionId,
-                            _subSessionId,
-                            callId.Value,
-                            receipt?.Category.ToString(),
-                            (receipt as ToolInvocationReceipt.Correction)?.RemediationCode.ToString());
-                    }
-                    if (msg.ToolExposureRequests.TryGetValue(callId.Value, out var exposureRequest))
+                    TryApplyProjectDirectory(message.Name, receipt);
+                    _log.Info(
+                        "SubAgent authorization attempt result authorizationAttemptId={AuthorizationAttemptId} " +
+                        "sessionId={SessionId} subSessionId={SubSessionId} callId={CallId} " +
+                        "outcomeCategory={OutcomeCategory} remediationCode={RemediationCode}",
+                        result.AuthorizationAttemptId.Value,
+                        _parentSessionId,
+                        _subSessionId,
+                        callId.Value,
+                        receipt?.Category.ToString(),
+                        (receipt as ToolInvocationReceipt.Correction)?.RemediationCode.ToString());
+                    if (result.ExposureRequest is { } exposureRequest)
                         TryActivateDiscoveredTool(exposureRequest.ToolName.Value);
                 }
-                if (result.Name is "load_tool" && result.Content is not null)
-                    TryActivateDiscoveredTool(result.Content.Trim());
+                if (message.Name is "load_tool" && message.Content is not null)
+                    TryActivateDiscoveredTool(message.Content.Trim());
             }
 
-            foreach (var change in msg.ManagedTemporaryCorrectionChanges)
-                _managedTemporaryCorrections.Apply(change);
-
-            AddModelInputMediaNudge(msg.ModelInputMediaReferences);
-
-            var budgetStatus = _turnState.RecordToolCompletion(msg.ToolResults.Count, _maxToolIterations);
-            switch (budgetStatus)
+            foreach (var result in msg.Results)
             {
-                case ToolBudgetStatus.Exhausted exhausted:
-                    _log.Warning("SubAgent [{AgentName}] hit tool iteration limit ({Count}), forcing text response",
-                        _definition.Name, _turnState.ToolIterationCount);
-                    _forcedFinalOutcomeReason = SubAgentOutcomeReason.ToolIterationBudgetExhausted;
-                    AddSystemNudge(exhausted.NudgeText);
-                    FireLlmCall(forceNoTools: true);
-                    return;
-                case ToolBudgetStatus.NudgeNeeded nudge:
-                    _log.Info(
-                        "SubAgent [{AgentName}] nearing tool iteration limit ({Used}/{Max}, remaining={Remaining})",
-                        _definition.Name,
-                        _turnState.ToolIterationCount,
-                        _maxToolIterations,
-                        nudge.Remaining);
-                    AddSystemNudge(nudge.NudgeText);
-                    break;
+                if (result.ManagedTemporaryCorrectionUpdate is { } change)
+                    _managedTemporaryCorrections.Apply(change);
             }
+
+            // The nudges come after all results, so a park drops them (cut plan: no deferred media, no repeat nudge).
+            if (parked.Length > 0)
+            {
+                Park(parked.Select(static result => result.Parked!).ToArray(), batchDirectories);
+                return;
+            }
+
+            AddModelInputMediaNudge(msg.Results
+                .SelectMany(result => result.ModelInputMediaReferences)
+                .ToArray());
+            var nudge = _turnState.CreateNudgeAfterResults(_activeRepeatNudge, childRun: true);
+            // Keep repeat advice until another nudge replaces it. Retire cause advice when its cause leaves the batch.
+            if (nudge is not null)
+            {
+                RemoveLoopNudges(ToolCycleMessages.IsLoopNudge);
+                AddSystemNudge(nudge);
+            }
+            else
+                RemoveLoopNudges(_turnState.CallsSinceProgress == 0
+                    ? ToolCycleMessages.IsProgressOrCauseNudge : ToolCycleMessages.IsCauseNudge);
+            _activeRepeatNudge = null;
+
+            _turnState.RecordToolCompletion(msg.Results.Length);
 
             _log.Debug("SubAgent [{AgentName}] tool iteration {Count}, continuing",
                 _definition.Name, _turnState.ToolIterationCount);
             FireLlmCall();
         });
 
-        Receive<ToolExecutionFailed>(msg =>
+        Receive<ChildToolExecutionFailed>(msg =>
         {
-            _toolExecutionWatchdogState = ToolExecutionWatchdogState.None;
+            if (msg.CallId != _llmCallId)
+                return;
+            _toolBatchRuns = false;
             _activeCycleBatch = null;
+            _activeRepeatNudge = null;
             _log.Error(msg.Cause, "SubAgent [{AgentName}] tool execution failed", _definition.Name);
             Complete(false, $"Tool execution failed: {msg.Cause.Message}", SubAgentRunOutcome.Failed, SubAgentOutcomeReason.ToolExecutionFailed);
         });
 
         Receive<LlmCallFailed>(msg =>
         {
+            if (msg.CallId != _llmCallId)
+                return;
             _toolExposure.EvictAll();
             _loadedDeferredToolNames.Clear();
             _log.Error(msg.Cause, "SubAgent [{AgentName}] LLM call failed callId={CallId}", _definition.Name, msg.CallId);
@@ -691,7 +701,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                 // approval suppression or grace — it is only armed during an active
                 // LLM stream and is never refreshed by keepalives, so reaching it
                 // means a genuine wedge.
-                var noProgress = _noProgressBudget?.TotalSeconds ?? 0;
+                var noProgress = RequireNoProgressBudget().TotalSeconds;
                 _executionCts?.Cancel();
                 _watchdog.Stop(Timers);
                 _log.Warning(
@@ -701,22 +711,18 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                 return;
             }
 
-            if (_toolExecutionWatchdogState == ToolExecutionWatchdogState.WaitingForParentApproval)
+            if (msg.ThinkingCap)
             {
-                _log.Debug(
-                    "SubAgent [{AgentName}] watchdog tick suppressed while waiting on parent approval ({WaitCount} pending)",
-                    _definition.Name,
-                    _pendingApprovalWaits);
-                return;
-            }
-
-            if (_toolExecutionWatchdogState == ToolExecutionWatchdogState.RunningApprovalCapableTools)
-            {
-                _log.Debug(
-                    "SubAgent [{AgentName}] watchdog tick granted one-cycle grace while tool execution resolves whether parent approval is needed",
-                    _definition.Name);
-                _toolExecutionWatchdogState = ToolExecutionWatchdogState.None;
-                RestartWatchdog(_interDeltaBudget);
+                // One model call streamed only thinking for the whole cap. Thinking
+                // resets the no-progress deadline, so only this cap stops the call.
+                // Like the no-progress deadline, it gets no approval grace.
+                var cap = RequireNoProgressBudget().TotalSeconds * ProcessingWatchdog.ThinkingCapMultiplier;
+                _executionCts?.Cancel();
+                _watchdog.Stop(Timers);
+                _log.Warning(
+                    "SubAgent [{AgentName}] timed out: one model call streamed only thinking for {Budget:F0}s after {Iterations} tool iterations",
+                    _definition.Name, cap, _turnState.ToolIterationCount);
+                Complete(false, $"Subagent timed out: one model call streamed only thinking for {cap:F0}s, with no text and no tool call.", SubAgentRunOutcome.Failed, SubAgentOutcomeReason.ThinkingOnlyTimeout);
                 return;
             }
 
@@ -732,49 +738,6 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             Complete(false, $"Subagent timed out: no activity for {activeBudget.TotalSeconds:F0}s.", SubAgentRunOutcome.Failed, SubAgentOutcomeReason.NoActivityTimeout);
         });
 
-        Receive<SubAgentApprovalWaitStarted>(_ =>
-        {
-            // Stop the watchdog outright on first wait — re-armed by
-            // SubAgentApprovalWaitCompleted when the last wait clears. The
-            // ProcessingWatchdogExpired handler's WaitingForParentApproval state
-            // check is belt-and-braces for a stale timer fire that arrived ahead
-            // of this message in the mailbox.
-            if (_pendingApprovalWaits == 0)
-                _watchdog.Stop(Timers);
-
-            _toolExecutionWatchdogState = ToolExecutionWatchdogState.WaitingForParentApproval;
-            _pendingApprovalWaits++;
-            EmitActivity("awaiting human approval");
-        });
-
-        Receive<SubAgentApprovalWaitCompleted>(_ =>
-        {
-            // Started/Completed are sent as a try/finally pair from
-            // ExecuteToolsAsync; FIFO mailbox delivery from a single sender
-            // guarantees Started lands first. An underflow means the pairing
-            // invariant is broken (orphan Tell, double Completed) — log loudly
-            // rather than silently clamping, since hiding the imbalance would
-            // re-introduce the watchdog-vs-approval bug this PR fixes.
-            if (_pendingApprovalWaits <= 0)
-            {
-                _log.Warning(
-                    "SubAgent [{AgentName}] received ApprovalWaitCompleted with no pending wait (counter={Counter}); ignoring",
-                    _definition.Name, _pendingApprovalWaits);
-                return;
-            }
-
-            _pendingApprovalWaits--;
-            _toolExecutionWatchdogState = _pendingApprovalWaits == 0
-                ? ToolExecutionWatchdogState.RunningApprovalCapableTools
-                : ToolExecutionWatchdogState.WaitingForParentApproval;
-
-            // Re-baseline only when the last approval clears, so concurrent
-            // approval waits don't each rearm the same single-key timer
-            // (Akka's StartSingleTimer cancels-and-reschedules each call).
-            if (_pendingApprovalWaits == 0)
-                RecordProgress("approval resolved");
-        });
-
         // Liveness ping from a streaming LLM call — progress, even before the
         // full response message arrives. Keepalives (content-free heartbeats)
         // refresh whichever budget is in force; the first substantive delta
@@ -782,18 +745,20 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         // budget. This is the two-phase behavior shared with the main session.
         Receive<SubAgentStreamPing>(msg =>
         {
+            if (msg.CallId != _llmCallId)
+                return;
             _log.Debug(
                 $"SubAgent [{_definition.Name}] LLM stream progress callId={msg.CallId} "
                 + $"updates={msg.UpdateCount} emptyUpdates={msg.EmptyUpdateCount} "
                 + $"text={msg.TextDeltaCount}/{msg.TextChars}ch "
                 + $"thinking={msg.ThinkingDeltaCount}/{msg.ThinkingChars}ch "
                 + $"toolCalls={msg.ToolCallDeltaCount} finishReason={msg.FinishReason ?? "null"} "
-                + $"substantive={msg.IsSubstantive}");
+                + $"activity={msg.Activity}");
 
             // Same two-phase policy as the main session: keepalives refresh the
             // current budget, the first substantive delta promotes off prefill.
             _anyContentStreamed = _watchdog.OnStreamProgress(
-                msg.IsSubstantive,
+                msg.Activity,
                 _anyContentStreamed,
                 _prefillBudget,
                 _interDeltaBudget,
@@ -830,58 +795,70 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         // The child keeps the provider alias in transient history.
         // Internal dispatch and cycle state use the canonical name.
         _toolRegistry.CanonicalizeToolCalls(toolCalls);
-        var executor = _toolExecutorLogger is null
-            ? new DispatchingToolExecutor(_toolRegistry, _toolAccessPolicy, _approvalService)
-            : DispatchingToolExecutor.CreateWithLogger(
-                _toolRegistry,
-                _toolAccessPolicy,
-                _approvalService,
-                _toolExecutorLogger);
+        var executor = CreateExecutor();
         var preparedCycleBatch = ToolCycleSignatureFactory.Prepare(toolCalls, executor);
-        var cycleDecision = _turnState.EvaluateBeforeDispatch(preparedCycleBatch.Action);
+        var cycleDecision = _turnState.EvaluateBeforeDispatch(preparedCycleBatch);
         if (cycleDecision.Kind != ToolCycleDecisionKind.Execute)
         {
             Logging.GetLogger(Context.System, typeof(TurnStateTracker)).Warning(
-                "Subagent tool cycle decision kind={DecisionKind} period={Period} repetitions={Repetitions}",
+                "Subagent tool cycle decision kind={DecisionKind} refusedCalls={RefusedCalls} repeatedCalls={RepeatedCalls}",
                 cycleDecision.Kind,
-                cycleDecision.Period,
-                cycleDecision.Repetitions);
+                cycleDecision.RefusedCallIds.Count,
+                cycleDecision.RepeatedCallIds.Count);
         }
 
-        if (cycleDecision.Kind == ToolCycleDecisionKind.Stop)
+        if (cycleDecision.RefusedRepeat == RefusedRepeatAction.EndTurn)
         {
-            _forcedFinalOutcomeReason = SubAgentOutcomeReason.ToolCycleStopped;
-            AddSystemNudge(ToolCycleMessages.Final);
-            FireLlmCall(forceNoTools: true);
+            // The child ignored the escalated nudge (Aaron, 18 Oct 2026). The run ends with no dispatch and no
+            // model request. It is a successful partial run, so the parent gets the child text and no error.
+            Complete(true, LastChildText(assistantMessage), SubAgentRunOutcome.Partial,
+                SubAgentOutcomeReason.ToolCycleStopped);
             return;
         }
+
+        // The progress axis: the calls already ran and failed, so this refuses nothing. At the end threshold
+        // the run ends as a partial run, the same way an ignored escalation does.
+        if (cycleDecision.Progress == RefusedRepeatAction.EndTurn)
+        {
+            Complete(true, LastChildText(assistantMessage), SubAgentRunOutcome.Partial,
+                SubAgentOutcomeReason.ToolCycleStopped);
+            return;
+        }
+
+        // A repeat of a refused call does not stop the child at once. The call is refused again, and the child
+        // nudge follows the batch results. The child nudge offers no background job: a child has none.
+        var repeatNudge = ToolCycleMessages.ForRefusedRepeat(cycleDecision, toolCalls, childRun: true);
+        _activeRepeatNudge = repeatNudge is null ? null : (cycleDecision.RefusedRepeat, repeatNudge);
 
         // Add assistant message (with tool calls) to history
         _history.Add(assistantMessage);
-
-        if (cycleDecision.Kind == ToolCycleDecisionKind.Correct)
-        {
-            EmitToolCycleCorrection(toolCalls);
-            return;
-        }
+        _transcript.Add(ChatMessageConverter.FromAiMessage(assistantMessage));
 
         _activeCycleBatch = preparedCycleBatch;
+        RunTools(executor, toolCalls, cycleDecision.RefusedCallIds, answers: null);
+    }
 
+    private DispatchingToolExecutor CreateExecutor() => _toolExecutorLogger is null
+        ? new DispatchingToolExecutor(_toolRegistry, _toolAccessPolicy, _approvalService)
+        : DispatchingToolExecutor.CreateWithLogger(_toolRegistry, _toolAccessPolicy, _approvalService, _toolExecutorLogger);
+
+    private void RunTools(DispatchingToolExecutor executor, List<FunctionCallContent> toolCalls,
+        IReadOnlySet<string> refusedCallIds, IReadOnlyDictionary<string, ApprovalRedriveEntry>? answers)
+    {
         var toolNames = string.Join(", ", toolCalls.Select(tc => tc.Name));
         RecordProgress($"running tools: {toolNames}");
         _log.Info("SubAgent [{AgentName}] calling tools: [{ToolNames}]",
             _definition.Name, toolNames);
 
+        _toolBatchRuns = true;
         var self = Self;
         var setWorkingDirectoryTool =
             _toolRegistry.GetByName(SetWorkingDirectoryTool.ToolName) as SetWorkingDirectoryTool;
         var setWorkingDirectoryAvailable = setWorkingDirectoryTool is not null
             && _toolAccessPolicy.IsToolExposed(setWorkingDirectoryTool, ToolExecutionContext.Invocation);
-        _toolExecutionWatchdogState = _approvalBridge is null
-            ? ToolExecutionWatchdogState.None
-            : ToolExecutionWatchdogState.RunningApprovalCapableTools;
 
         _ = ExecuteToolsAsync(
+            _ownedRun,
             executor,
             toolCalls,
             ToolExecutionContext,
@@ -894,43 +871,96 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             _log,
             _definition.Name,
             _parentSessionId,
-            _subSessionId);
+            _subSessionId,
+            _llmCallId,
+            refusedCallIds,
+            answers);
     }
 
-    private void EmitToolCycleCorrection(IReadOnlyList<FunctionCallContent> toolCalls)
+    // Design D4: a resumed child starts from the park. It keeps the round and the loop guard (H1, M10) and runs only
+    // the parked calls, each once, with its recorded answer. The gate checks each call again.
+    private void ResumeFromPark(ChildRunResume resume)
     {
-        var receipts = new Dictionary<string, ToolInvocationReceipt>(StringComparer.Ordinal);
-        var authorizationAttemptIds = new Dictionary<string, AuthorizationAttemptId>(StringComparer.Ordinal);
-        var results = new List<SerializableChatMessage>(toolCalls.Count);
-        foreach (var call in toolCalls)
+        var park = resume.Park;
+        foreach (var message in park.Transcript)
+            AddMessage(message);
+        _turnState.RestoreLoopGuard(park.LoopGuard);
+        _checkpointRound = park.LoopGuard.ToolIterationCount;
+        _fileActivity.Restore(park.FileActivity);
+        // The parked calls of the park are the calls of its last assistant message with no result. A consent park has
+        // one for each request, and a drain park has none, so the child follows the same rule as the owner.
+        var lastAssistant = _history.FindLastIndex(static message => message.Role == Microsoft.Extensions.AI.ChatRole.Assistant);
+        var answered = _history.Skip(lastAssistant + 1).SelectMany(static message => message.Contents)
+            .OfType<FunctionResultContent>().Select(static result => result.CallId).ToHashSet(StringComparer.Ordinal);
+        List<FunctionCallContent> parkedCalls = lastAssistant < 0 ? [] : _history[lastAssistant].Contents.OfType<FunctionCallContent>()
+            .Where(call => !answered.Contains(call.CallId)).ToList();
+        switch (ChildParkRules.ResumeStart(parkedCalls.Count, resume.Answers.Count))
         {
-            var receipt = new ToolInvocationReceipt.Correction(ToolRemediationCode.BreakToolCycle);
-            receipts.Add(call.CallId, receipt);
-            authorizationAttemptIds.Add(call.CallId, AuthorizationAttemptId.New());
-            results.Add(ToolRemediationPresenter.Present(
-                new SerializableChatMessage
-                {
-                    Role = Protocol.ChatRole.Tool,
-                    Content = ToolCycleMessages.Correction,
-                    ToolCallId = new ToolCallId(call.CallId),
-                    Name = call.Name
-                },
-                receipt,
-                setWorkingDirectoryAvailable: false));
+            case ChildResumeStart.ModelCall:
+                FireLlmCall();
+                return;
+            case ChildResumeStart.ParkedCalls when parkedCalls.All(call => resume.Answers.ContainsKey(call.CallId)):
+                break;
+            default:
+                // The owner checks the same rule before the resume, so this is damage. The run ends loudly, and no
+                // parked call runs.
+                var damage = $"The resume has {resume.Answers.Count} answer(s) that do not match the {parkedCalls.Count} parked call(s) of the park.";
+                _log.Error("SubAgent [{AgentName}] cannot resume: {Damage}", _definition.Name, damage);
+                Complete(false, damage, SubAgentRunOutcome.Failed, SubAgentOutcomeReason.ParkDamaged);
+                return;
         }
-
-        Self.Tell(new ToolExecutionCompleted
-        {
-            ToolResults = results,
-            ToolReceipts = receipts,
-            AuthorizationAttemptIds = authorizationAttemptIds
-        });
+        _toolRegistry.CanonicalizeToolCalls(parkedCalls);
+        RunTools(CreateExecutor(), parkedCalls, new HashSet<string>(StringComparer.Ordinal), resume.Answers);
+        // Design D2: the parked calls run in the directories of the batch (RunTools took that context). A finished
+        // set_working_directory call of the batch applies after them, and a parked one applies when its result comes.
+        if (park.FileActivity.ProjectDirectory is { } projectDirectory
+            && projectDirectory != park.ScopeDirectories.ProjectDirectory)
+            ApplyProjectDirectory(projectDirectory);
     }
 
-    private void FireLlmCall(bool forceNoTools = false)
+    // Design D1: the batch ended and one or more calls need consent. The child hands its state to the owner, waits for
+    // ChildTerminalCommitted, and stops. The owner asks the run requester and starts a new incarnation after the answers.
+    private void Park(IReadOnlyList<ParentApprovalRequest> requests, ChildParkScopeDirectories directories)
     {
-        _turnState.ForceNoToolsActive |= forceNoTools;
-        forceNoTools = _turnState.ForceNoToolsActive;
+        var owned = _ownedRun ?? throw new InvalidOperationException("Only an owned child run can park.");
+        var park = new ChildRunPark
+        {
+            Transcript = _transcript.ToArray(), LoopGuard = _turnState.ExportLoopGuard(), ScopeDirectories = directories,
+            FileActivity = _fileActivity.BuildResult(), SkillOverlay = _definition.SkillOverlay
+        };
+        EndRun();
+        _log.Info("SubAgent [{AgentName}] parked with {Count} consent request(s) after {Iterations} tool iterations",
+            _definition.Name, requests.Count, _turnState.ToolIterationCount);
+        HandOver(owned, new ChildParkReached(owned.RunId, park, requests));
+    }
+
+    // A drain park holds no request. It keeps the current directories, so the resume applies no directory change.
+    private void ParkForDrainNow()
+        => Park([], new ChildParkScopeDirectories(ToolExecutionContext.RunScope.ProjectDirectory,
+            ToolExecutionContext.RunScope.InheritedCwd));
+
+    private void HandOver(ChildRunExecution owned, object message)
+    {
+        owned.Close();
+        Become(() => Receive<ChildTerminalCommitted>(_ => Context.Stop(Self)));
+        owned.Owner.Tell(message, Self);
+    }
+
+    private void FireLlmCall()
+    {
+        if (_parkForDrain)
+        {
+            ParkForDrainNow();
+            return;
+        }
+        if (_ownedRun is { } owned && _turnState.ToolIterationCount > _checkpointRound)
+        {
+            _checkpointRound = _turnState.ToolIterationCount;
+            var checkpoint = new ChildRunCheckpoint(_checkpointRound,
+                $"Completed {_checkpointRound} tool rounds.", _fileActivity.BuildResult());
+            _ = CommitCheckpointAsync(owned, checkpoint, Self);
+            return;
+        }
         // Each LLM call starts fresh on the generous prefill budget; the watchdog
         // promotes to the inter-delta budget on the first substantive delta. The
         // no-progress deadline is armed alongside it and only real tokens reset it.
@@ -949,21 +979,40 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         ChatOptions? options = _parentSessionId is { Length: > 0 } sid
             ? new SessionScopedChatOptions { SessionId = sid, SubSessionId = _subSessionId }
             : null;
-        if (!forceNoTools && _aiTools.Count > 0)
+        if (_aiTools.Count > 0)
         {
             options ??= new ChatOptions();
             options.Tools = [.. _aiTools];
         }
 
         _log.Info(
-            "SubAgent [{AgentName}] LLM call start callId={CallId} iteration={Iteration} messages={MessageCount} toolsEnabled={ToolsEnabled} forceNoTools={ForceNoTools}",
+            "SubAgent [{AgentName}] LLM call start callId={CallId} iteration={Iteration} messages={MessageCount} toolsEnabled={ToolsEnabled}",
             _definition.Name,
             callId,
             _turnState.ToolIterationCount,
             messages.Count,
-            options?.Tools?.Count > 0,
-            forceNoTools);
-        _ = InvokeLlmAsync(client, messages, options, self, callId, _executionCts?.Token ?? CancellationToken.None);
+            options?.Tools?.Count > 0);
+        var token = _executionCts?.Token ?? CancellationToken.None;
+        // Read the scheduler on the actor thread. Context is not valid inside the
+        // owned-run continuation, which runs on the thread pool.
+        var clock = Context.System.Scheduler;
+        if (_ownedRun is { } ownedRun)
+            _ = ownedRun.Enter(async () => { await InvokeLlmAsync(client, messages, options, self, clock, callId, token); return true; });
+        else
+            _ = InvokeLlmAsync(client, messages, options, self, clock, callId, token);
+    }
+
+    private static async Task CommitCheckpointAsync(ChildRunExecution owned, ChildRunCheckpoint checkpoint,
+        IActorRef self)
+    {
+        try
+        {
+            await owned.Owner.Ask<SessionProtocol.CommandAck>(
+                new ChildCheckpointReached(owned.RunId, checkpoint, self), Timeout.InfiniteTimeSpan, owned.Token);
+            self.Tell(new ChildCheckpointCommitted());
+        }
+        catch (Exception error) when (!FatalExceptionPolicy.IsFatal(error))
+        { self.Tell(SubAgentCancelled.Instance); }
     }
 
     private IReadOnlyList<AITool> ResolveCoreAiTools()
@@ -1031,21 +1080,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         // races mailbox-thread Stop). The second call would send a duplicate
         // SubAgentResult and log a misleading "completed" line. The first
         // caller wins; subsequent calls are no-ops.
-        if (_completed) return;
-        _completed = true;
-        _managedTemporaryCorrections.Clear();
-
-        _toolExecutionWatchdogState = ToolExecutionWatchdogState.None;
-        _pendingApprovalWaits = 0;
-        _executionCts?.Cancel();
-        _externalCts?.Cancel();
-        _watchdog.Stop(Timers);
-        _externalCancellationRegistration.Dispose();
-        _executionCts?.Dispose();
-        _externalCts?.Dispose();
-        _executionCts = null;
-        _externalCts = null;
-        _pendingApprovalWaits = 0;
+        if (!EndRun())
+            return;
 
         var resolvedOutcome = outcome ?? (success ? SubAgentRunOutcome.Completed : SubAgentRunOutcome.Failed);
 
@@ -1070,16 +1106,38 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             : [];
 
         var workingContextResult = BuildWorkingContextResult(success);
-        _replyTo.Tell(new SubAgentResult
+        var result = new SubAgentResult
         {
             Completion = ChildRunCompletion.FromReportedOutcome(resolvedOutcome, outcomeReason, workingContextResult),
             Output = output,
             AgentName = _definition.Name,
             Findings = findings,
             FindingsCount = findings.Count,
-        });
+        };
+        if (_ownedRun is { } owned)
+            HandOver(owned, new ChildTerminalReturned(owned.RunId, result));
+        else
+        {
+            _replyTo.Tell(result);
+            Context.Stop(Self);
+        }
+    }
 
-        Context.Stop(Self);
+    private bool EndRun()
+    {
+        if (_completed)
+            return false;
+        _completed = true;
+        _managedTemporaryCorrections.Clear();
+        _executionCts?.Cancel();
+        _externalCts?.Cancel();
+        _watchdog.Stop(Timers);
+        _externalCancellationRegistration.Dispose();
+        _executionCts?.Dispose();
+        _externalCts?.Dispose();
+        _executionCts = null;
+        _externalCts = null;
+        return true;
     }
 
     /// <summary>
@@ -1173,8 +1231,22 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
     }
 
     private void AddSystemNudge(string nudge)
+        => AddMessage(new SerializableChatMessage { Role = Protocol.ChatRole.User, Content = $"[system: {nudge}]" });
+
+    private void RemoveLoopNudges(Func<string, bool> matches)
     {
-        _history.Add(new AiChatMessage(Microsoft.Extensions.AI.ChatRole.User, $"[system: {nudge}]"));
+        _history.RemoveAll(message => message.Role == Microsoft.Extensions.AI.ChatRole.User
+            && matches(message.Text));
+        _transcript.RemoveAll(message => message.Role == Protocol.ChatRole.User
+            && matches(message.Content));
+    }
+
+    private void AddMessage(SerializableChatMessage message)
+    {
+        // reinjectMeta: the model wrote the timeout and background hints in its call, and the serializable form strips
+        // them. Put them back, so the history matches the model message and a resumed parked call keeps its hints.
+        _history.Add(ChatMessageConverter.ToAiMessage(message, ToolExecutionContext.SessionDirectory, reinjectMeta: true));
+        _transcript.Add(message);
     }
 
     private void AddModelInputMediaNudge(IReadOnlyList<SerializableMediaReference> mediaReferences)
@@ -1190,7 +1262,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                       "Use the attached media along with the tool result to complete the delegated task.]",
             MediaReferences = mediaReferences
         };
-        _history.Add(ChatMessageConverter.ToAiMessage(message, ToolExecutionContext.SessionDirectory));
+        AddMessage(message);
     }
 
     /// <summary>
@@ -1249,6 +1321,11 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             return;
         }
 
+        ApplyProjectDirectory(projectDirectory);
+    }
+
+    private void ApplyProjectDirectory(string projectDirectory)
+    {
         var nextScope = ToolExecutionContext.RunScope with
         {
             ProjectDirectory = projectDirectory
@@ -1276,6 +1353,15 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             projectDirectory);
     }
 
+    // The last text that the child model wrote in this run: the text of the final response, or else the latest
+    // earlier assistant text. The parent did not see the earlier text, so the child returns it. Empty when none.
+    private string LastChildText(AiChatMessage finalResponse)
+        => new[] { finalResponse }
+            .Concat(Enumerable.Reverse(_history).Where(static message => message.Role == Microsoft.Extensions.AI.ChatRole.Assistant))
+            .Select(ExtractText)
+            .FirstOrDefault(static text => text != EmptyResponseMarker && !string.IsNullOrWhiteSpace(text))
+            ?? string.Empty;
+
     private static string ExtractText(AiChatMessage message)
     {
         var sb = new StringBuilder();
@@ -1298,14 +1384,16 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         List<AiChatMessage> messages,
         ChatOptions? options,
         IActorRef self,
+        ITimeProvider clock,
         CancellationToken ct)
-        => InvokeLlmAsync(client, messages, options, self, callId: 0, ct);
+        => InvokeLlmAsync(client, messages, options, self, clock, callId: 0, ct);
 
     internal static async Task InvokeLlmAsync(
         IChatClient client,
         List<AiChatMessage> messages,
         ChatOptions? options,
         IActorRef self,
+        ITimeProvider clock,
         long callId,
         CancellationToken ct)
     {
@@ -1318,7 +1406,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             // TextContent and causing the subagent to report empty "(no response)".
             // The loop, counting, and response assembly are shared with the main
             // session path via StreamingResponseReader.
-            var pingThrottle = Stopwatch.StartNew();
+            var pingGate = new StreamPingGate(clock, StreamPingInterval);
 
             var result = await StreamingResponseReader.ReadAsync(
                 client,
@@ -1330,10 +1418,10 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                     // watchdog can promote off the generous prefill budget;
                     // otherwise throttle pings. Keepalives are forwarded too (the
                     // actor refreshes whichever budget is in force) so a healthy
-                    // slow prefill is never mistaken for a hang.
-                    if (cls.IsFirstSubstantive || pingThrottle.Elapsed >= StreamPingInterval)
+                    // slow prefill is never mistaken for a hang. The gate never
+                    // drops an answer update: that update resets the thinking cap.
+                    if (pingGate.TryPing(cls, out var pingActivity))
                     {
-                        pingThrottle.Restart();
                         self.Tell(new SubAgentStreamPing(
                             callId,
                             diag.UpdateCount,
@@ -1344,7 +1432,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                             diag.ThinkingChars,
                             diag.ToolCallDeltaCount,
                             diag.FinishReason,
-                            IsSubstantive: cls.HasSubstantiveContent));
+                            Activity: pingActivity));
                     }
                 },
                 ct);
@@ -1385,16 +1473,76 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         return PreviewForLog(rendered, 500);
     }
 
-    private static string PreviewForLog(string? text, int maxChars)
-        => SecretOutputRedactor.Redact(PreviewText(text, maxChars));
+    // The no-progress and thinking-cap timers arm only when a budget exists. An expiry
+    // without a budget is a bug, so it must fail loudly and not report a zero-second timeout.
+    private TimeSpan RequireNoProgressBudget()
+        => _noProgressBudget
+           ?? throw new InvalidOperationException(
+               "A no-progress watchdog expiry arrived, but the sub-agent has no no-progress budget.");
 
-    private static string PreviewText(string? text, int maxChars)
+    // Keeps the whole cut-off answer text, so the parent can use the partial work. The
+    // text takes the same redaction as the preview. A write failure is logged and returns
+    // null: it must not hide the output_truncated failure.
+    private string? SaveTruncatedOutput(string? stub)
+    {
+        if (string.IsNullOrWhiteSpace(stub))
+            return null;
+
+        try
+        {
+            var storage = ToolExecutionContext.SessionStorage
+                ?? throw new InvalidOperationException("The child run has no session storage.");
+            var path = Path.Combine(storage.ArtifactDirectory.Value, TruncatedOutputArtifactName);
+            // Redact the real text, so the file keeps its line breaks. The escaped pass catches a secret
+            // that spans two lines. It replaces the body only when it found one.
+            var single = SecretOutputRedactor.Redact(stub);
+            var escaped = single.ReplaceLineEndings("\\n");
+            var escapedRedacted = SecretOutputRedactor.Redact(escaped);
+            var redacted = escapedRedacted == escaped ? single : escapedRedacted;
+            var content = "# Partial output (cut off at the model output limit)\n\n"
+                + "This file is partial. The model reached its output limit, so the text ends early. It is not a result.\n\n"
+                + redacted + "\n";
+            ChildRunDocuments.WriteAtomic(path, content);
+            return path;
+        }
+        catch (Exception ex) when (!FatalExceptionPolicy.IsFatal(ex))
+        {
+            _log.Warning(ex, "SubAgent [{AgentName}] could not save its truncated output as an artifact", _definition.Name);
+            return null;
+        }
+    }
+
+    internal static string PreviewForLog(string? text, int maxChars)
+        => PreviewRedacted(text, maxChars);
+
+    // Redaction sees the whole text first. A cut before redaction can leave a prefix of a
+    // secret that no pattern matches. The first pass must come before the line break
+    // escape: an escaped break puts the letter "n" before a secret at the start of a line,
+    // and a rule that starts with a word boundary then misses it. The second pass must
+    // come after the escape: it joins a key at the end of a line to its value on the next
+    // line ("API_KEY=\n<value>"), and then a rule can match the whole pair. The cut falls
+    // on a text-element boundary, so it never splits a surrogate pair. The cut can still
+    // shorten a secret mask, which is safe.
+    private static string PreviewRedacted(string? text, int maxChars)
     {
         if (string.IsNullOrEmpty(text))
             return "";
 
-        var normalized = text.ReplaceLineEndings("\\n");
-        return normalized.Length <= maxChars ? normalized : normalized[..maxChars] + "...";
+        var escaped = SecretOutputRedactor.Redact(SecretOutputRedactor.Redact(text).ReplaceLineEndings("\\n"));
+        if (escaped.Length <= maxChars)
+            return escaped;
+
+        var end = 0;
+        var elements = StringInfo.GetTextElementEnumerator(escaped);
+        while (elements.MoveNext())
+        {
+            var next = elements.ElementIndex + ((string)elements.Current).Length;
+            if (next > maxChars)
+                break;
+            end = next;
+        }
+
+        return escaped[..end] + "...";
     }
 
     internal static bool ContainsUnexecutedToolCallMarkup(string text)
@@ -1451,6 +1599,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
     }
 
     private static async Task ExecuteToolsAsync(
+        ChildRunExecution? ownedRun,
         IToolExecutor executor,
         List<FunctionCallContent> toolCalls,
         ToolExecutionContext executionContext,
@@ -1463,7 +1612,10 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         ILoggingAdapter logger,
         AgentName agentName,
         string? parentSessionId,
-        string? subSessionId)
+        string? subSessionId,
+        long callId,
+        IReadOnlySet<string> refusedCallIds,
+        IReadOnlyDictionary<string, ApprovalRedriveEntry>? answers)
     {
         try
         {
@@ -1472,10 +1624,11 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             {
                 // Same execution-preflight seam as the main pipeline: validate +
                 // extract in one step (the sub-agent previously skipped extraction
-                // entirely, silently dropping timeout hints). meta.Background and
-                // meta.Rationale are intentionally not consumed here — sub-agents
-                // have no background-job manager or audit logger; only the timeout
-                // hint is materialized into the immutable per-tool context.
+                // entirely, silently dropping timeout hints). meta.Background is
+                // intentionally not consumed here — sub-agents have no
+                // background-job manager. meta.Rationale goes only to the
+                // "Invoking tool" log line. Only the timeout hint is materialized
+                // into the immutable per-tool context.
                 var interpretation = executor.InterpretToolCall(tc);
                 var toolContext = CreatePerToolExecutionContext(executionContext, interpretation.Meta);
                 logger.Info(
@@ -1488,11 +1641,53 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                     subSessionId,
                     tc.CallId,
                     tc.Name);
+                // Same line and same redaction helper as SessionToolExecutionPipeline.
+                // The OTLP exporter sends it off the host.
+                if (logger.IsInfoEnabled)
+                {
+                    logger.Info(
+                        "Invoking tool [{ToolName}] (call={CallId}) args={Args} rationale={Rationale} " +
+                        "authorizationAttemptId={AuthorizationAttemptId} sessionId={SessionId}",
+                        tc.Name,
+                        tc.CallId,
+                        ToolCallLogFormatter.FormatArguments(tc.Arguments),
+                        ToolCallLogFormatter.FormatRationale(interpretation.Meta?.Rationale),
+                        toolContext.Approval.AuthorizationAttemptId.Value,
+                        parentSessionId);
+                }
                 if (interpretation.Rejection is { } rejection)
                 {
-                    toolContext.Outputs.TryComplete(
-                        new ToolInvocationReceipt.OtherOutcome(ToolInvocationOutcomeCategory.InvalidInput));
-                    return BuildToolResult(tc, rejection.Message, toolContext, modelInputBudget);
+                    var refused = refusedCallIds.Contains(tc.CallId);
+                    toolContext.Outputs.TryComplete(refused
+                        ? new ToolInvocationReceipt.Correction(ToolRemediationCode.BreakToolCycle)
+                        : new ToolInvocationReceipt.OtherOutcome(ToolInvocationOutcomeCategory.InvalidInput));
+                    var message = refused ? $"{rejection.Message}\n{ToolCycleMessages.Correction}" : rejection.Message;
+                    return BuildToolResult(tc, message, toolContext, modelInputBudget, failureCode: rejection.DenyReason);
+                }
+
+                if (refusedCallIds.Contains(tc.CallId))
+                    return new SubAgentToolCallResult(
+                        new SerializableChatMessage
+                        {
+                            Role = Protocol.ChatRole.Tool,
+                            Content = ToolCycleMessages.Correction,
+                            ToolCallId = new ToolCallId(tc.CallId),
+                            Name = tc.Name
+                        }, [], null,
+                        new ToolInvocationReceipt.Correction(ToolRemediationCode.BreakToolCycle),
+                        null, toolContext.Approval.AuthorizationAttemptId);
+
+                // A resumed parked call (design D4): a refused call never dispatches. An approved call gets its
+                // one-time consent, and the gate still checks it.
+                if (answers is not null && answers.TryGetValue(tc.CallId, out var answer))
+                {
+                    if (answer.TryGetRefusalText(tc.Name, out var refusalText))
+                    {
+                        toolContext.Outputs.TryComplete(
+                            new ToolInvocationReceipt.OtherOutcome(ToolInvocationOutcomeCategory.AccessDenied));
+                        return BuildToolResult(tc, refusalText, toolContext, modelInputBudget);
+                    }
+                    answer.ApplyTo(toolContext.Approval, tc.Name);
                 }
 
                 var meta = interpretation.Meta;
@@ -1513,7 +1708,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                 }
                 try
                 {
-                    var result = await executor.ExecuteAsync(tc, toolContext, ct);
+                    var result = await (ownedRun is null ? executor.ExecuteAsync(tc, toolContext, ct)
+                        : ownedRun.Enter(() => executor.ExecuteAsync(tc, toolContext, ct)));
                     return BuildToolResult(
                         cleanedTc,
                         result,
@@ -1539,13 +1735,24 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                             ? new ToolExposureRequest(nativeTool)
                             : null);
                 }
-                // A child without an approval bridge never needs consent: the
-                // authorizer denies the call first (approval_required_unattended,
-                // D2). A request here is a defect: log it and deny the call.
-                catch (ToolApprovalRequiredException) when (approvalBridge is null)
+                // Design D1: an owned child parks a call that needs consent. The call does not run now. The other
+                // calls of the batch finish, and the owner asks the run requester.
+                catch (ToolApprovalRequiredException approvalEx) when (approvalBridge is not null && ownedRun is not null)
+                {
+                    var request = new ParentApprovalRequest(toolContext.Approval.AuthorizationAttemptId,
+                        new ToolCallId(tc.CallId), tc.Name, approvalEx.ApprovalContext);
+                    return new SubAgentToolCallResult(new SerializableChatMessage
+                    {
+                        Role = Protocol.ChatRole.Tool, ToolCallId = request.CallId, Name = tc.Name
+                    }, [], null, null, null, request.AuthorizationAttemptId) { Parked = request };
+                }
+                // A child without an approval bridge never needs consent: the authorizer denies the call first
+                // (approval_required_unattended, D2). A child with no owner cannot park. A request here is a defect:
+                // log it and deny the call.
+                catch (ToolApprovalRequiredException)
                 {
                     logger.Error(
-                        "SubAgent tool {0} asked for consent with no approval bridge; denied as a defect.",
+                        "SubAgent tool {0} asked for consent with no approval bridge or no owner; denied as a defect.",
                         tc.Name);
                     toolContext.Outputs.TryComplete(
                         new ToolInvocationReceipt.OtherOutcome(ToolInvocationOutcomeCategory.AccessDenied));
@@ -1557,84 +1764,6 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                         consumedManagedTemporaryKey is { } defectConsumed
                             ? new ManagedTemporaryCorrectionChange.Consume(defectConsumed)
                             : null);
-                }
-                catch (ToolApprovalRequiredException approvalEx) when (approvalBridge is not null)
-                {
-                    var ctx = approvalEx.ApprovalContext;
-                    if (approvalBridge is not IParentConsentBridge consentBridge)
-                    {
-                        throw new ParentApprovalUnavailableException(
-                            $"Tool '{tc.Name}' requires interactive approval, but the parent approval bridge cannot ask for consent.");
-                    }
-
-                    // Signal the actor that an approval wait is starting BEFORE
-                    // the await so the inactivity watchdog cannot cancel the
-                    // wait. The wait ends with an answer, the session's approval
-                    // timeout, or explicit external cancellation (parent
-                    // passivation, daemon restart, user cancel). The internal
-                    // watchdog cannot cancel it.
-                    self.Tell(SubAgentApprovalWaitStarted.Instance);
-
-                    ConsentStep step;
-                    try
-                    {
-                        step = await consentBridge.RequestConsentAsync(
-                            new ParentApprovalRequest(
-                                toolContext.Approval.AuthorizationAttemptId,
-                                new ToolCallId(tc.CallId),
-                                tc.Name,
-                                ctx),
-                            externalCt);
-                    }
-                    finally
-                    {
-                        self.Tell(SubAgentApprovalWaitCompleted.Instance);
-                    }
-
-                    if (step.RetryConsent is { } retryConsent)
-                    {
-                        // The retry gets its own context, so the one-time consent
-                        // cannot reach a parallel tool call or a later iteration.
-                        var retryContext = CreatePerToolExecutionContext(executionContext, meta);
-                        retryContext.Approval.RestoreAuthorizationAttemptId(
-                            toolContext.Approval.AuthorizationAttemptId);
-                        retryContext.Approval.SeedOneTimeConsent(retryConsent);
-                        var result = await executor.ExecuteAsync(tc, retryContext, ct);
-                        return BuildToolResult(
-                            cleanedTc,
-                            ConsentAnswerCodec.AppendResultNote(result, step.Answer),
-                            retryContext,
-                            modelInputBudget,
-                            consumedManagedTemporaryKey is { } approvedConsumed
-                                ? new ManagedTemporaryCorrectionChange.Consume(approvedConsumed)
-                                : null);
-                    }
-
-                    var refusal = (ConsentAnswer.Refused)step.Answer;
-                    var reason = ConsentRefusalText.For(
-                        refusal.Kind,
-                        "Tool access denied: approval_denied_by_user");
-                    if (refusal.Kind == RefusalKind.Denied
-                        && consumedManagedTemporaryKey is { } deniedManagedTemporaryRetry)
-                    {
-                        reason = $"{reason}\n{ManagedTemporaryCorrection.BuildDenialHint(deniedManagedTemporaryRetry.Target.ManagedTemporaryDirectory)}";
-                    }
-
-                    toolContext.Outputs.TryComplete(
-                        new ToolInvocationReceipt.OtherOutcome(ToolInvocationOutcomeCategory.AccessDenied));
-
-                    return BuildToolResult(
-                        tc,
-                        reason,
-                        toolContext,
-                        modelInputBudget,
-                        consumedManagedTemporaryKey is { } deniedConsumed
-                            ? new ManagedTemporaryCorrectionChange.Consume(deniedConsumed)
-                            : null);
-                }
-                catch (ParentApprovalUnavailableException)
-                {
-                    throw;
                 }
                 catch (OperationCanceledException) when (externalCt.IsCancellationRequested)
                 {
@@ -1683,40 +1812,11 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                         setWorkingDirectoryAvailable)
                 };
             }
-            self.Tell(new ToolExecutionCompleted
-            {
-                ToolResults = [.. results.Select(r => r.Message)],
-                ModelInputMediaReferences = [.. results.SelectMany(r => r.ModelInputMediaReferences)],
-                ManagedTemporaryCorrectionChanges = [.. results.Where(r => r.ManagedTemporaryCorrectionUpdate is not null).Select(r => r.ManagedTemporaryCorrectionUpdate!)],
-                ToolReceipts = results
-                    .Where(result => result.Receipt is not null)
-                    .ToDictionary<SubAgentToolCallResult, string, ToolInvocationReceipt>(
-                        result => result.Message.ToolCallId is { } callId
-                            ? callId.Value
-                            : throw new InvalidOperationException("A child tool receipt requires a call identity."),
-                        result => result.Receipt
-                            ?? throw new InvalidOperationException("A selected child tool result requires a receipt."),
-                        StringComparer.Ordinal),
-                ToolExposureRequests = results
-                    .Where(result => result.ExposureRequest is not null)
-                    .ToDictionary<SubAgentToolCallResult, string, ToolExposureRequest>(
-                        result => result.Message.ToolCallId is { } callId
-                            ? callId.Value
-                            : throw new InvalidOperationException("A child tool exposure request requires a call identity."),
-                        result => result.ExposureRequest
-                            ?? throw new InvalidOperationException("A selected child tool result requires an exposure request."),
-                        StringComparer.Ordinal),
-                AuthorizationAttemptIds = results.ToDictionary<SubAgentToolCallResult, string, AuthorizationAttemptId>(
-                    result => result.Message.ToolCallId is { } callId
-                        ? callId.Value
-                        : throw new InvalidOperationException("A child authorization attempt requires a call identity."),
-                    result => result.AuthorizationAttemptId,
-                    StringComparer.Ordinal)
-            });
+            self.Tell(new ToolExecutionCompleted(callId, results));
         }
         catch (Exception ex)
         {
-            self.Tell(new ToolExecutionFailed { Cause = ex });
+            self.Tell(new ChildToolExecutionFailed(callId, ex));
         }
     }
 
@@ -1736,7 +1836,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         ToolExecutionContext toolContext,
         ModelInputBatchBudget modelInputBudget,
         ManagedTemporaryCorrectionChange? managedTemporaryCorrectionUpdate = null,
-        ToolExposureRequest? exposureRequest = null)
+        ToolExposureRequest? exposureRequest = null,
+        string? failureCode = null)
     {
         var materialization = MaterializeModelInputFiles(toolContext, modelInputBudget);
         if (materialization.RequestedCount > materialization.MediaReferences.Count)
@@ -1760,7 +1861,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             managedTemporaryCorrectionUpdate,
             receipt,
             exposureRequest,
-            toolContext.Approval.AuthorizationAttemptId);
+            toolContext.Approval.AuthorizationAttemptId,
+            failureCode);
     }
 
     private static ModelInputMaterializationResult MaterializeModelInputFiles(
@@ -1786,7 +1888,37 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         ManagedTemporaryCorrectionChange? ManagedTemporaryCorrectionUpdate,
         ToolInvocationReceipt? Receipt,
         ToolExposureRequest? ExposureRequest,
-        AuthorizationAttemptId AuthorizationAttemptId);
+        AuthorizationAttemptId AuthorizationAttemptId,
+        string? FailureCode = null)
+    {
+        /// <summary>The consent request of a parked call. A parked call has no result yet.</summary>
+        public ParentApprovalRequest? Parked { get; init; }
+    }
+
+    private sealed record ChildToolExecutionFailed(long CallId, Exception Cause) : INoSerializationVerificationNeeded;
+
+    private sealed record ToolExecutionCompleted : INoSerializationVerificationNeeded
+    {
+        public ToolExecutionCompleted(long modelCallId, SubAgentToolCallResult[] results)
+        {
+            var callIds = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var result in results)
+            {
+                var callId = result.Message.ToolCallId
+                    ?? throw new InvalidOperationException("A child tool result requires a call identity.");
+                // Validate before mailbox delivery so the normal task can report a malformed batch.
+                ArgumentNullException.ThrowIfNull(callId.Value);
+                if (!callIds.Add(callId.Value))
+                    throw new ArgumentException("A child tool result has a duplicate call identity.", nameof(results));
+            }
+
+            CallId = modelCallId;
+            Results = results;
+        }
+
+        public long CallId { get; }
+        public SubAgentToolCallResult[] Results { get; }
+    }
 
     private string BuildSystemPrompt(
         SubAgentDefinition definition,
@@ -1801,9 +1933,12 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             projectInstructions: projectInstructions);
 
         // Append the sub-agent's own system prompt (markdown body + optional skill overlay)
-        var rolePrompt = string.IsNullOrWhiteSpace(basePrompt)
+        var agentPrompt = string.IsNullOrWhiteSpace(definition.SkillOverlay)
             ? definition.SystemPrompt
-            : string.Concat(basePrompt.TrimEnd(), "\n\n", definition.SystemPrompt);
+            : string.Concat(definition.SystemPrompt.TrimEnd(), "\n\n[Skill Overlay]\n", definition.SkillOverlay.Trim());
+        var rolePrompt = string.IsNullOrWhiteSpace(basePrompt)
+            ? agentPrompt
+            : string.Concat(basePrompt.TrimEnd(), "\n\n", agentPrompt);
         var toolIndex = _toolRegistry.GenerateCompressedIndex(
             ToolExecutionContext.Audience,
             _toolAccessPolicy);
@@ -1853,6 +1988,14 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         public void SetProjectDirectory(string projectDirectory)
             => _workingContext = _workingContext.WithProjectDirectory(projectDirectory);
 
+        // A resumed child continues the file activity of its park (design D2).
+        public void Restore(WorkingContextDelta activity)
+        {
+            _workingContext = _workingContext.WithProjectDirectory(activity.ProjectDirectory);
+            _readFiles.UnionWith(activity.ReadFiles);
+            _confirmedChangedFiles.UnionWith(activity.ConfirmedChangedFiles);
+        }
+
         public WorkingContextDelta BuildResult() => new()
         {
             ProjectDirectory = _workingContext.ProjectDirectory,
@@ -1869,42 +2012,12 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         private SubAgentCancelled() { }
     }
 
-    private enum ToolExecutionWatchdogState
-    {
-        None,
-        RunningApprovalCapableTools,
-        WaitingForParentApproval
-    }
-
-    /// <summary>
-    /// Sent by <see cref="ExecuteToolsAsync"/> immediately before awaiting the
-    /// parent approval bridge. Increments the in-flight approval-wait counter
-    /// so the <see cref="ProcessingWatchdogExpired"/> handler ignores stale timer
-    /// ticks while a human is deciding.
-    /// </summary>
-    private sealed class SubAgentApprovalWaitStarted
-    {
-        public static readonly SubAgentApprovalWaitStarted Instance = new();
-        private SubAgentApprovalWaitStarted() { }
-    }
-
-    /// <summary>
-    /// Sent by <see cref="ExecuteToolsAsync"/> in a <c>finally</c> after the
-    /// approval bridge call returns or throws. Decrements the counter and
-    /// re-baselines the inactivity watchdog so post-approval inactivity is
-    /// still governed.
-    /// </summary>
-    private sealed class SubAgentApprovalWaitCompleted
-    {
-        public static readonly SubAgentApprovalWaitCompleted Instance = new();
-        private SubAgentApprovalWaitCompleted() { }
-    }
-
     /// <summary>
     /// Throttled self-message: the streaming LLM call is still alive.
-    /// <see cref="IsSubstantive"/> is false for content-free keepalives, so the
-    /// watchdog refreshes the current budget on them but only promotes off the
-    /// prefill budget on real output.
+    /// <see cref="Activity"/> is <see cref="StreamActivity.Keepalive"/> for content-free
+    /// keepalives, so the watchdog refreshes the current budget on them but only
+    /// promotes off the prefill budget on real output. It separates thinking from
+    /// answer output so the thinking cap can reset.
     /// </summary>
     private sealed record SubAgentStreamPing(
         long CallId,
@@ -1916,7 +2029,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         int ThinkingChars,
         int ToolCallDeltaCount,
         string? FinishReason,
-        bool IsSubstantive);
+        StreamActivity Activity);
 
     // ── Reuse LlmSessionActor's internal message types ──
     // These are internal to Netclaw.Actors so accessible here.

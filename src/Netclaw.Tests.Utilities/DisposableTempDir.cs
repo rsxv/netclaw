@@ -38,25 +38,28 @@ internal sealed class DisposableTempDir : IDisposable
             return;
 
         // Windows refuses to delete a file or a working directory that a process
-        // still holds. A killed process tree and a pooled SQLite connection can hold
-        // one for a short time after the test ends. Retry for a few seconds.
+        // still holds. A killed process tree can hold one for a short time
+        // after the test ends. SQLite owners must clear their own pools.
+        // Retry for a few seconds.
         // The delete succeeds on the first try on Linux and macOS.
         for (var i = 0; i < MaxAttempts; i++)
         {
             try
             {
                 Directory.Delete(path, recursive: true);
+                // On Windows, a recursive delete ignores ERROR_DIR_NOT_EMPTY and returns
+                // without an error (dotnet/runtime FileSystem.Windows.cs, RemoveDirectoryRecursive).
+                // A file that a writer adds during the delete, or a file that stays
+                // delete-pending, then leaves the tree in place. Linux and macOS throw
+                // IOException for the same state. Throw it here too, so the loop below
+                // handles both platforms the same way and a real leak fails its own test.
+                if (Directory.Exists(path))
+                    throw new IOException($"The folder '{path}' still exists after a recursive delete. "
+                        + $"Entries left: {DescribeEntries(path)}");
                 return;
             }
             catch (IOException) when (i < MaxAttempts - 1) // slopwatch-ignore: SW003 test cleanup retry
             {
-                // Clear the pools only after a failure. The call closes the idle
-                // connections of every database in the process, which other tests
-                // can observe. The first call in a process also loads the SQLite
-                // native library, which a test without SQLite does not need.
-                if (i == 0)
-                    Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-
                 Thread.Sleep(100 * (i + 1));
             }
             catch (UnauthorizedAccessException) when (i < MaxAttempts - 1) // slopwatch-ignore: SW003 test cleanup retry
@@ -71,6 +74,15 @@ internal sealed class DisposableTempDir : IDisposable
                 return;
             }
         }
+    }
+
+    private static string DescribeEntries(string root)
+    {
+        var entries = Directory.EnumerateFileSystemEntries(root, "*", SearchOption.AllDirectories)
+            .Select(entry => System.IO.Path.GetRelativePath(root, entry))
+            .Take(10)
+            .ToArray();
+        return entries.Length == 0 ? "(none)" : string.Join(", ", entries);
     }
 
     private static void ClearReadOnlyAttributes(string root)

@@ -70,6 +70,76 @@ model requests, tool exposure set, and ephemeral working context.
 
 **Code anchors:** `SubAgentActor`, `SubAgentSpawner`
 
+### Open child run
+
+An open child run is a child run whose result has not yet had its follow-up
+parent turn. It becomes open at durable acceptance. It closes when the parent
+records the turn that consumes its result. A failed follow-up turn also closes
+it, because the session records the failure as the decision for that result.
+The session reports its open child runs in each `TurnCompleted`.
+A headless run ends only on a completed turn that reports none. A background
+shell job is not a child run.
+
+**Code anchors:** `TurnCompleted.OpenChildRunIds`, `ChildRunLifecycle`,
+`HeadlessChannel`
+
+### Agent event
+
+An agent event is a typed fact between the agents of one session, for example
+"child approval requested". It has an envelope with a sender, a target, and a
+send time. Only the session that owns a child run builds an event about that
+run. An event never carries consent and never holds text that an agent wrote.
+The model sees a notice that the runtime renders from events. Added by
+`child-approval-events-and-parent-pause` (#2583).
+
+**Code anchors:** `AgentEvent`, `AgentEnvelope`, `AgentAddress`,
+`AgentEventFactory`, `AgentEventRenderer` (`src/Netclaw.Actors/Sessions/AgentEvents.cs`)
+
+### Child consent pause
+
+The child consent pause is the state of a whole session while any child
+consent request of the session is open. The session refuses `spawn_agent`, and
+automated input waits. The current turn can finish. A person's message starts a
+turn, but it does not end the pause. No request expires. Only the close of
+every open child request (an answer, a refusal, or a withdrawal) ends the pause.
+Added by `child-approval-events-and-parent-pause` (#2583).
+
+**Code anchors:** `SessionToolWorkflow.IsChildConsentPaused`,
+`SessionInputFlow.MoveHeldInputBehind`, `LlmSessionActor.StartInputsHeldByThePause`
+
+### Parked child run
+
+A parked child run is a child run that waits for consent with no actor. The
+parent run record holds its park (the conversation, the loop guard, the working
+directories, the file activity, and the skill overlay), its consent requests,
+and their answers, so the session journal and the snapshot keep it across a
+restart and passivation. When every parked request has an answer, the session
+records the resume and starts a new child from the park, under the authority of
+the run record, and runs only the parked calls, each once
+(`durable-child-consent-wait` and `durable-child-park-recovery`, #2572).
+
+A parked run can hold zero consent requests. This is a drain park: a child that
+ran at a graceful drain stopped at a safe point, after its tool batch or in
+place of its model call. A drain park asks nobody. The session resumes it after
+the restart, and the new child starts with a model call
+(`running-child-drain-park`, #2655).
+
+**Code anchors:** `ChildRunLifecycle.Parked`, `ChildRunEvent.Parked`, `ChildRunEvent.Resumed`, `ChildParkRules`
+
+### Child journal
+
+A child journal is the Akka.Persistence journal of one child run, with the
+persistence ID `subagent-{escaped session ID}/{run ID}`. A run writes it at its
+first park only, so a run that never parks has none. Its first event freezes
+the system prompt, the resolved provider and model, the tool set, the project
+instructions, the operating rules, and the findings flag. The parent purges it
+last: after the run end, `result.md`, and the result notice, with a closing
+event and then a delete of all messages. Match the prefix of one session with
+an ordinal comparison, because the escaped ID can hold `%`. Planned in PR 3 of
+`child-approval-events-and-parent-pause` (#2572). This part is not on `dev` yet.
+
+**Code anchor (planned):** `SubAgentRunProtocol`
+
 ### Working context
 
 The working context is actor-local state that helps later model turns. It
@@ -117,6 +187,31 @@ Processes share this authority only when they use the same Netclaw home and key 
 
 **Code anchor:** `LocalControlPairingProofProtector`
 
+### Operator
+
+The Operator is the person who runs a Netclaw host and answers its consent
+requests. This entry defines the person. The [Operator principal](#operator-principal)
+entry defines the value that the daemon gives to a request.
+
+### Operator principal
+
+The Operator principal is the `PrincipalClassification.Operator` value in the
+claims of an authenticated request. It states that the request has the authority
+of the [Operator](#operator). A local-trust scheme or a paired device gives the
+value. The daemon gives it to a [loopback request](#loopback-request) in `local`
+exposure mode only after the Host and Origin test passes.
+
+**Code anchor:** `PrincipalClassification.Operator`
+
+### Loopback request
+
+A loopback request reaches the daemon from a loopback source address
+(`127.0.0.0/8` or `::1`). The source address alone does not prove that the
+Operator made the request, because a web page in the Operator's browser can
+reach the same address. The daemon also checks the `Host` and `Origin` headers.
+
+**Code anchor:** `LoopbackAuthenticationHandler`
+
 ### Pairing code
 
 A pairing code is a temporary credential for one device registration.
@@ -135,6 +230,17 @@ The token remains valid until the operator revokes the device.
 The token has no refresh flow, and pairing-code expiration does not affect it.
 
 **Code anchor:** `DeviceRegistry`
+
+### Reminder tombstone
+
+A reminder tombstone is the durable record of an ended one-shot reminder.
+The reminder manager writes it before it deletes the definition.
+It keeps the id, the title, the audience, the fire time, the outcome, the end time, and the last error.
+A tombstone with the outcome `Failed` also keeps the reminder prompt. No tombstone keeps the delivery target, and a tombstone never runs.
+The audience gates every history and status read of the ended reminder, and the read of the prompt.
+The manager deletes the history and then the tombstone 12 days after the end time.
+
+**Code anchors:** `ReminderTombstone`, `ReminderManagerActor`, `ReminderDefinitionStore`
 
 ## Tool Lifecycle Terms
 
@@ -471,6 +577,53 @@ consent mode. Do not call an audience a "trust".
 
 **Code anchor:** `TrustAudience`
 
+### Requester
+
+A requester is the person or system that asks for an action in a session. Six
+facts identify a requester: the session, the audience, the trust boundary, the
+channel type, the sender ID, and the principal classification.
+
+A requester is not the full turn authority. The turn ID, provenance, delivery
+targets, and adopted context belong to one message. They can change between
+turns of the same requester. Work that a requester starts, such as a child run,
+belongs to that requester in each later turn.
+
+The consent answer check (`ApprovalButtonValueCodec.CanApprove`) is different.
+It compares only the sender ID of the answer with the recorded requester sender
+ID. It lets any sender answer when the requester principal is
+`VerifiedAutomation` or when the recorded requester has no sender ID.
+
+Example:
+
+```text
+Alice starts a child in turn 1 (quotes thread context)
+Alice asks for status in turn 2 (no quoted context)  -> same requester, allowed
+Bob asks for status in the same thread               -> other requester, denied
+```
+
+One exception covers child status and cancel. A reminder turn (principal
+`VerifiedAutomation`, source kind `reminder`, transport authenticity
+`LocalProcess`) and any other turn of one session manage each other's child
+runs. The other turn can be a person turn or an automated turn, such as the
+delivery turn of a background job. A webhook turn can carry the source kind
+`reminder`, but it has the authenticity `Verified`, so it is not a reminder turn. When the requester or the turn that started the
+run is a reminder turn, the check ignores the sender ID and the principal
+classification. It still requires the same session, audience, trust boundary,
+and channel type.
+
+```text
+An operator starts a child in a TUI session
+A reminder fire in the same session asks for status  -> allowed
+A reminder fire starts a child; the operator asks    -> allowed
+A background job delivery turn asks for that status  -> allowed
+A reminder fire in another session asks for status   -> denied
+A webhook with the event header "reminder" asks      -> denied
+Alice starts a child; Bob asks (both people)         -> denied
+```
+
+**Code anchors:** `TurnContext.HasSameRequester`, `TurnContext.CanControlChildRunOf`,
+`ApprovalButtonValueCodec.CanApprove`
+
 ### Consent mode
 
 A consent mode states what a tool call needs before it runs, per audience and
@@ -483,7 +636,7 @@ The configuration key is `ApprovalPolicy` and stays so.
 
 A candidate is one unit of a tool call that needs coverage. A shell call has
 one candidate per command occurrence. A non-shell tool has one candidate: its
-tool name, or a path-scoped name for a protected write target.
+tool name.
 
 **Code anchors:** `ApprovalCandidate`, `ShellPolicyCandidate`
 
@@ -599,22 +752,24 @@ A session storage envelope is the one physical directory that contains all
 session-owned files for a new-layout session. Its path is fixed when the
 session binds its versioned storage binding. Its contents are mutable.
 
-The envelope contains distinct working, artifact, temporary, worktree, log,
-and child-run areas. Netclaw supplies the current envelope as an implicit
-trusted root. It is not a project scope, the default shell cwd, or an
-unconditional shell grant.
+The envelope contains distinct working, artifact, worktree, log, and child-run
+areas. On Windows it also contains the temporary areas. On Linux and macOS the
+[managed temporary directory](#managed-temporary-directory) is outside the
+envelope. Netclaw supplies the current envelope as an implicit trusted root.
+It is not a project scope, the default shell cwd, or an unconditional shell
+grant.
 
 ```text
 <session-envelope>/
 ├── attachment-staging/        # untrusted inbound bytes before admission
 ├── workspace/                 # default no-project working directory
 ├── artifacts/                 # retained parent outputs
-├── tmp/parent/                # disposable parent files
+├── tmp/parent/                # disposable parent files (Windows only)
 ├── worktrees/                 # managed source worktrees
 ├── logs/session.log           # raw parent log
 └── subagents/<run-id>/
     ├── artifacts/
-    ├── tmp/
+    ├── tmp/                   # Windows only
     └── logs/session.log       # raw child log
 ```
 
@@ -676,11 +831,19 @@ use a separate activity projection or log-specific redaction layer.
 ### Managed temporary directory
 
 A managed temporary directory contains disposable files for one parent or
-subagent run. Netclaw places it inside the session storage envelope. Each run
-receives a different directory.
+subagent run. Each run receives a different directory.
+
+- On Linux and macOS it is `<base>/<key>/p` for a parent and `<base>/<key>/c<h>`
+  for a child. The base is `/tmp/netclaw-<uid>` (`/private/tmp/...` on macOS).
+  All runs of one session share the key folder `<base>/<key>`.
+- On Windows it is inside the session storage envelope.
 
 Netclaw sets `TMPDIR`, `TMP`, and `TEMP` to this directory for child processes.
-The managed temporary directory is not a project scope or an authority grant.
+The directory is not a project scope. Its key folder is an implicit trusted root
+of its session for every audience. The base is not a root.
+
+**Code anchors:** `ManagedTemporaryLocation`, `ManagedTemporaryLayout`,
+`ManagedTemporaryEnvironment`
 
 ### Artifact directory
 
@@ -750,6 +913,15 @@ itself grant access.
 
 A resolved path is a canonical path after link resolution. Do not call a
 resolved path "canonical".
+
+### Resolved home path
+
+A resolved home path is the full path of a Netclaw home with no trailing separator and every link resolved,
+one path component at a time, as `realpath(3)` does. A relative link target is joined to the folder that the
+walk already resolved, so a `..` in a target leaves that folder. A walk that follows more than 40 links fails.
+`HomeIdentity.Canonical` returns it. The daemon and the CLI compare two home paths only through this form
+(`HomeIdentity.Same`), so two different folders never compare as one home. The method name says "canonical"
+for historical reasons. By the term "Canonical path" above, this value is a resolved path, not a canonical path.
 
 ### Path relationship
 
@@ -832,3 +1004,56 @@ large result
 ```
 
 The model does not receive the internal spill path.
+
+## Model Request Terms
+
+### Thinking level
+
+A thinking level is the provider-neutral thinking depth of a model
+definition: `Off`, `Low`, `Medium`, `High`, or `Max`. `Max` is the highest
+level that the provider offers. An unset level means the model's default. A
+call site can set its own level, and that level wins.
+
+Code anchor: `ThinkingLevel` (`Netclaw.Configuration`).
+
+### Thinking dialect
+
+A thinking dialect is the wire form that a provider uses for a thinking level
+and for the reasoning suppression intent. It states the levels that the wire
+can send. Netclaw rejects a level that the dialect cannot send. It never sends
+a nearby level instead.
+
+```text
+Native             -> ChatOptions.Reasoning; the SDK writes the wire field
+DeepSeek           -> thinking.type + reasoning_effort (no medium)
+ReasoningEffort    -> reasoning_effort (no max)
+ChatTemplateKwargs -> chat_template_kwargs.enable_thinking (off only)
+OllamaThink        -> think (no max)
+None, Unresolved   -> no level
+```
+
+The provider descriptor owns the dialect. An OpenAI-compatible provider reads
+it from `Providers:<name>:VendorOptions:ThinkingDialect`.
+
+Code anchor: `ThinkingDialectMap` (`Netclaw.Providers`).
+
+### Thinking capability
+
+A thinking capability is what a model accepts: `Unknown`, `None`, `AlwaysOn`,
+or `Controllable` with a set of levels. A capability resolver or a provider
+probe reports it. Netclaw offers a level only when the dialect can send it and
+the capability includes it.
+
+Example:
+
+```text
+dialect DeepSeek, capability Controllable(all levels)
+  -> offered: off, low, high, max
+  -> medium: "the DeepSeek dialect cannot send medium"
+
+dialect ReasoningEffort, capability Unknown
+  -> offered: off
+  -> low: "thinking support unknown for this endpoint"
+```
+
+Code anchor: `ThinkingSupport` (`Netclaw.Configuration`).

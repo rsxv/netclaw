@@ -4,6 +4,7 @@
 // </copyright>
 // -----------------------------------------------------------------------
 using System.Diagnostics;
+using System.Globalization;
 using Netclaw.Tests.Utilities;
 using Xunit;
 
@@ -34,8 +35,8 @@ public sealed class StartupConfigurationFailureProcessTests : IDisposable
         { "{\"Providers\":{\"p\":{\"Type\":\"openai\"}},\"Models\":{" + Definitions + ",\"Roles\":{\"Main\":\"d\"}}}", "requires authentication" },
         { "{\"Providers\":{\"p\":{\"Type\":\"ollama\",\"AuthMethod\":\"banana\"}},\"Models\":{" + Definitions + ",\"Roles\":{\"Main\":\"d\"}}}", "Providers:p is invalid" },
         // The configuration source cannot read the file
-        { "{\"Models\":{\"Roles\":{\"Main\":\"a\"}},\"models\":{\"Roles\":{\"Main\":\"b\"}}}", "Cannot read netclaw.json or secrets.json" },
-        { "{ broken json", "Cannot read netclaw.json or secrets.json" },
+        { "{\"Models\":{\"Roles\":{\"Main\":\"a\"}},\"models\":{\"Roles\":{\"Main\":\"b\"}}}", "Couldn't read netclaw.json:" },
+        { "{ broken json", "Couldn't read netclaw.json:" },
     };
 
     [Theory]
@@ -57,6 +58,11 @@ public sealed class StartupConfigurationFailureProcessTests : IDisposable
         foreach (var key in psi.Environment.Keys.Where(k => k.StartsWith("NETCLAW_", StringComparison.Ordinal)).ToList())
             psi.Environment.Remove(key);
         psi.Environment["NETCLAW_HOME"] = home;
+        // The daemon must exit on the invalid config. If a regression lets a config pass, the daemon
+        // binds this port. Without it, the daemon binds 5199, the port of the real daemon. The
+        // environment value applies even when netclaw.json cannot be read.
+        psi.Environment["NETCLAW_Daemon__Port"] = StandInDaemon.GetFreePort().ToString(CultureInfo.InvariantCulture);
+        StandInDaemon.RequireDaemonBindPort(psi.Environment);
 
         using var process = Process.Start(psi)!;
         var stdout = process.StandardOutput.ReadToEndAsync(TestContext.Current.CancellationToken);

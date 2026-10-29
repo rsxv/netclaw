@@ -182,7 +182,8 @@ The design reuses these owners:
 | Data or decision | Owner | Lifetime |
 |---|---|---|
 | Accepted input and original authority | Session journal | Durable |
-| Active model and tool cancellation | `LlmSessionActor` | Actor-local |
+| Selected input and current turn authority | `SessionInputFlow` | Actor-local |
+| Active model and tool cancellation | `SessionExecutionLifetime` | Actor-local |
 | Wakeup schedule and delivery | Reminder manager | Durable |
 | Cross-process handoff | Restart manifest | Durable until startup reads it |
 
@@ -191,10 +192,10 @@ The record contains its ID, content, media, source ID, and `TurnContextRecord`.
 Journal order supplies input order.
 Terminal turn events close the consumed input IDs.
 
-The actor gives an active model call a two-second completion grace.
+The session lifetime owner gives an active model call a two-second completion grace.
 It then cancels the call and waits for that exact task to stop.
 A durable approval wait uses the existing tool pipeline cancellation token.
-The actor does not cancel a tool with an uncertain effect.
+The lifetime owner does not cancel a tool with an uncertain effect.
 
 The actor returns one standard `ReminderDefinition` after a safe interruption.
 The reminder uses `DeliveryKind.CurrentSession` and expires after ten minutes.
@@ -466,6 +467,19 @@ Done when:
 **Spec:** `openspec/specs/tool-authorization/spec.md`
 **Surface area:** shell authorization, approval matching, security corpus
 **Verification:** L2
+
+#### Verified implementation: contained glob directory aliases
+
+N1 keeps contained directory aliases within the existing shell authority model.
+`openspec/changes/archive/2026-10-28-allow-contained-glob-directory-aliases/` defines target protection,
+source and target scopes, incomplete reach, and the 4096-unit work bound.
+Each intermediate directory visit and each link hop consumes one unit.
+The implementation carries known targets even when another branch remains unresolved.
+Only complete reach can support reusable approval.
+The final proof includes independent authorizer cases, focused mutants, and the maintained corpus.
+The coordinator owns the corpus audit and publication decisions.
+The changed skill guidance passes its retained targeted case, five of five trials.
+Broader model attempts remain incomplete or canceled at the user's request.
 
 #### Active delivery: complete compound scopes
 

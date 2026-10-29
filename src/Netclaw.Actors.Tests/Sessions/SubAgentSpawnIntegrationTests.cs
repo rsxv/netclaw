@@ -5,6 +5,7 @@
 // -----------------------------------------------------------------------
 using Akka.Actor;
 using Akka.Hosting;
+using Akka.Persistence.Journal;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.AI;
@@ -23,6 +24,7 @@ using Netclaw.Security;
 using Netclaw.Tests.Utilities;
 using Netclaw.Tools;
 using Xunit;
+using AkkaPersistence = Akka.Persistence.Persistence;
 using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Actors.Tests.Sessions;
@@ -207,7 +209,7 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
             new WorkingContextSnapshotProvider(
                 new GitWorkingContextInspector(TimeProvider.System),
                 Microsoft.Extensions.Logging.Abstractions.NullLogger<WorkingContextSnapshotProvider>.Instance),
-            Microsoft.Extensions.Logging.Abstractions.NullLogger<SubAgentSpawner>.Instance);
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<SubAgentSpawner>.Instance, new SessionConfig());
 
         // This fixture drives spawn_agent directly from the main model. Mark only that
         // test seam as Core; production registration keeps spawn_agent deferred.
@@ -233,8 +235,11 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
     }
 
     [Fact]
-    public async Task Spawn_agent_runs_under_session_and_emits_subagent_events()
+    public async Task Spawn_agent_returns_durable_acceptance_then_wakes_parent_with_a_result_notice()
     {
+        var childGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var parentWakeGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _clientProvider.Compaction.NextResponseGate = childGate;
         _clientProvider.Main.ToolCallsOnFirstCall =
         [
             CreateToolCall(
@@ -247,6 +252,8 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
                 })
         ];
 
+        try
+        {
         var sessionId = new SessionId("console/subagent-integration");
         var sessionManager = ActorRegistry.Get<SessionManagerActorKey>();
         var subscriber = CreateTestProbe("subagent-events");
@@ -272,23 +279,60 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         Assert.Equal(SubAgentPhase.Started, started.Phase);
         Assert.Equal("summarizer", started.AgentName.Value);
         Assert.Equal(4, started.ToolCount);
+        await _clientProvider.Compaction.FirstCallEntered.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
-        var completed = await subscriber.ExpectMsgAsync<SubAgentOutput>(TimeSpan.FromSeconds(3), cancellationToken: TestContext.Current.CancellationToken);
-        Assert.Equal(SubAgentPhase.Completed, completed.Phase);
-        Assert.Equal("summarizer", completed.AgentName.Value);
-        Assert.True(completed.Success);
-        Assert.Equal(0, completed.FindingsCount);
-        Assert.Null(completed.MemoryDecision);
-
-        // Drain the tool result output for spawn_agent emitted after tool execution
-        await subscriber.ExpectMsgAsync<ToolResultOutput>(TimeSpan.FromSeconds(3), cancellationToken: TestContext.Current.CancellationToken);
+        var acceptance = await subscriber.ExpectMsgAsync<ToolResultOutput>(TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal("call-spawn", acceptance.CallId.Value);
+        Assert.Equal("spawn_agent", acceptance.ToolName.Value);
+        string runId;
+        using (var acceptedJson = JsonDocument.Parse(acceptance.Result))
+        {
+            Assert.Equal("accepted", acceptedJson.RootElement.GetProperty("state").GetString());
+            Assert.Equal("check_agent_run", acceptedJson.RootElement.GetProperty("control_tool").GetString());
+            runId = acceptedJson.RootElement.GetProperty("run_id").GetString()!;
+            Assert.False(string.IsNullOrWhiteSpace(runId));
+        }
 
         var text = await subscriber.ExpectMsgAsync<TextOutput>(TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
         Assert.Contains("fake", text.Text, StringComparison.OrdinalIgnoreCase);
 
         await subscriber.ExpectMsgAsync<TurnCompleted>(TimeSpan.FromSeconds(3), cancellationToken: TestContext.Current.CancellationToken);
 
+        // The child model stays behind a barrier until the parent returns its acceptance.
+        Assert.Equal(1, _clientProvider.Compaction.CallCount);
         Assert.Equal(2, _clientProvider.Main.CallCount);
+        _clientProvider.Main.NextResponseGate = parentWakeGate;
+        childGate.TrySetResult();
+
+        var completed = await subscriber.ExpectMsgAsync<SubAgentOutput>(TimeSpan.FromSeconds(10), cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal(SubAgentPhase.Completed, completed.Phase);
+        Assert.Equal("summarizer", completed.AgentName.Value);
+        Assert.True(completed.Success);
+        Assert.Equal(SubAgentRunOutcome.Completed, completed.Outcome);
+        Assert.True(completed.TimestampMs >= started.TimestampMs);
+        Assert.True(completed.Duration >= TimeSpan.FromMilliseconds(completed.TimestampMs - started.TimestampMs));
+        Assert.Equal(0, completed.FindingsCount);
+
+        await AwaitAssertAsync(() => Assert.True(_clientProvider.Main.CallCount >= 3,
+            $"Expected a parent wake with the child result notice, saw {_clientProvider.Main.CallCount} calls."),
+            cancellationToken: TestContext.Current.CancellationToken);
+        var parentWake = _clientProvider.Main.ReceivedMessages[2];
+        Assert.DoesNotContain(parentWake.SelectMany(message => message.Contents.OfType<FunctionCallContent>()),
+            call => call.Name == "child_run_result");
+        var notice = Assert.Single(NoticeTexts(parentWake), text => text.Contains(runId, StringComparison.Ordinal));
+        Assert.Contains("agent=summarizer", notice, StringComparison.Ordinal);
+        Assert.Contains("outcome=completed", notice, StringComparison.Ordinal);
+        Assert.DoesNotContain("[fake]", notice, StringComparison.Ordinal);
+        var resultText = ReadNoticeFile(notice);
+        Assert.Contains(runId, resultText, StringComparison.Ordinal);
+        Assert.Contains("[fake]", resultText, StringComparison.Ordinal);
+        Assert.Single(parentWake, message => message.Role == Microsoft.Extensions.AI.ChatRole.User
+            && message.Text == "Use a subagent to summarize the file");
+        parentWakeGate.TrySetResult();
+        var finalText = await subscriber.ExpectMsgAsync<TextOutput>(TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Contains("fake", finalText.Text, StringComparison.OrdinalIgnoreCase);
+        await subscriber.ExpectMsgAsync<TurnCompleted>(TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+
         Assert.Equal(1, _clientProvider.Compaction.CallCount);
 
         var subagentCall = Assert.Single(_clientProvider.Compaction.ReceivedMessages);
@@ -328,6 +372,169 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
             childToolNames);
         Assert.Contains("attach_file", mainToolNames);
         Assert.DoesNotContain("attach_file", childToolNames);
+
+        }
+        finally
+        {
+            childGate.TrySetResult();
+            parentWakeGate.TrySetResult();
+        }
+    }
+
+    [Fact]
+    public async Task Child_result_delivered_in_the_middle_of_a_refused_loop_does_not_reset_the_refused_repeat_count()
+    {
+        // S1 of the re-review: a child result that the session delivers in the middle of the tool loop clears the
+        // recurrence evidence, so the refused call runs two more times. It must not clear the count. Otherwise
+        // the model could start a child next to each refused repeat and never reach the quiet end.
+        var childGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var parentGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _clientProvider.Compaction.NextResponseGate = childGate;
+        List<AIContent> Search(int round)
+            => [CreateToolCall($"search-{round}", "search_tools", new Dictionary<string, object?> { ["query"] = "browser" })];
+        // Request 1 starts the child. Requests 2 and 3 run. Request 4 is the first correction. Requests 5 to 7 are
+        // refused repeats 1 to 3. Request 7 waits at the parent gate. The child ends, and the runtime writes
+        // result.md off the actor thread. The test opens the parent gate only after the journal holds the admission
+        // of the notice, so the notice joins the loop at the next tool boundary: request 8. The refused call then runs
+        // again, the next request is the correction, and the later requests are repeats. The count keeps its value
+        // across the notice, so the loop reaches repeat 5. The model answers the final nudge in text.
+        var request = 0;
+        _clientProvider.Main.ResponseContentsSelector = messages =>
+        {
+            var number = Interlocked.Increment(ref request);
+            // The next request waits at the gate, so the child can finish while the parent loop runs.
+            if (number == 6)
+                _clientProvider.Main.NextResponseGate = parentGate;
+            if (number == 1)
+                return [CreateToolCall("call-spawn", "spawn_agent", new Dictionary<string, object?>
+                {
+                    ["agent"] = "summarizer",
+                    ["task"] = "Summarize src/README.md"
+                })];
+            return messages[^1].Text.Contains("Stop trying this action.", StringComparison.Ordinal)
+                ? [new TextContent("The search stays blocked.")]
+                : Search(number);
+        };
+
+        try
+        {
+            var sessionId = new SessionId("console/child-mid-loop-count");
+            var sessionManager = ActorRegistry.Get<SessionManagerActorKey>();
+            var subscriber = CreateTestProbe("child-mid-loop-events");
+            await sessionManager.Ask<SessionJoined>(new JoinSession(subscriber)
+            {
+                SessionId = sessionId,
+                Filter = OutputFilter.Full
+            }, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await subscriber.ExpectMsgAsync<SessionJoined>(cancellationToken: TestContext.Current.CancellationToken);
+
+            await sessionManager.Ask<CommandAck>(new SendUserMessage
+            {
+                SessionId = sessionId,
+                Content = "Start a helper and repeat the search.",
+                Source = BuildPersonalSource()
+            }, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
+
+            var outputs = new List<object>();
+            await AwaitAssertAsync(
+                () => Assert.True(_clientProvider.Main.CallCount >= 7, $"Request 7 is not in flight yet ({_clientProvider.Main.CallCount})."),
+                TimeSpan.FromSeconds(20), cancellationToken: TestContext.Current.CancellationToken);
+            childGate.TrySetResult();
+            await subscriber.FishForMessageAsync<object>(message =>
+            {
+                outputs.Add(message);
+                return message is SubAgentOutput { Phase: SubAgentPhase.Completed };
+            }, TimeSpan.FromSeconds(10), cancellationToken: TestContext.Current.CancellationToken);
+            // The Completed output comes before result.md and before the admission of the notice. A slow runner
+            // takes several loop rounds for that work, so the test waits for the durable admission. The session
+            // buffers the notice in the persist callback, and the callback runs before the actor reads the reply
+            // to request 7. Thus the notice is in the buffer before the loop reaches the next tool boundary.
+            var journalProbe = CreateTestProbe("child-mid-loop-journal");
+            await AwaitAssertAsync(async () => Assert.True(
+                    await HasChildNoticeAdmissionAsync(journalProbe, sessionId),
+                    "The journal holds no admission of the child notice yet."),
+                TimeSpan.FromSeconds(20), cancellationToken: TestContext.Current.CancellationToken);
+            Assert.Equal(7, _clientProvider.Main.CallCount);
+            parentGate.TrySetResult();
+            await subscriber.FishForMessageAsync<object>(message =>
+            {
+                outputs.Add(message);
+                return message is TurnCompleted;
+            }, TimeSpan.FromSeconds(20), cancellationToken: TestContext.Current.CancellationToken);
+
+            Assert.DoesNotContain(outputs, static output => output is ErrorOutput);
+            var requests = _clientProvider.Main.ReceivedMessages;
+            // The notice is in the history from request N on, and the evidence is clear: request N runs.
+            var noticeAt = requests.ToList().FindIndex(static request => request.Any(static message =>
+                message.Role == Microsoft.Extensions.AI.ChatRole.User
+                && message.Text.StartsWith("Child run ended.", StringComparison.Ordinal)));
+            Assert.Equal(7, noticeAt);
+            static bool IsRepeatNudge(Microsoft.Extensions.AI.ChatMessage message)
+                => message.Role == Microsoft.Extensions.AI.ChatRole.User
+                    && message.Text.StartsWith("[system: Netclaw refused your repeated call to `search_tools` again.",
+                        StringComparison.Ordinal);
+            // The count does not reset at the notice. Repeat 5 gets the final nudge, and the model answers it. The
+            // notice in request 8 comes before repeat 4, so repeats 4 and 5 follow it. A reset count would give five
+            // nudges after the notice.
+            // Review Should-fix 4: count every nudge of the turn, before and after the notice. The history keeps only
+            // the latest nudge, so a request sends a nudge when the nudge comes after its last assistant message. The
+            // notice can follow the nudge in that tail, so the check does not read only the last message.
+            static string? FreshNudge(IReadOnlyList<Microsoft.Extensions.AI.ChatMessage> request)
+            {
+                var lastAssistant = -1;
+                for (var index = 0; index < request.Count; index++)
+                {
+                    if (request[index].Role == Microsoft.Extensions.AI.ChatRole.Assistant)
+                        lastAssistant = index;
+                }
+
+                return request.Skip(lastAssistant + 1).FirstOrDefault(IsRepeatNudge)?.Text;
+            }
+
+            var nudges = Enumerable.Range(0, requests.Count)
+                .Where(index => FreshNudge(requests[index]) is not null)
+                .ToArray();
+            // A reset at the notice gives more than five nudges. A first repeat after the notice that is final gives
+            // fewer than five nudges.
+            Assert.True(nudges.Length == 5,
+                $"Expected exactly 5 repeat nudges in the turn, got {nudges.Length} "
+                + $"(requests {string.Join(", ", nudges.Select(static index => index + 1))}; notice in request {noticeAt + 1}).");
+            Assert.True(nudges[0] < noticeAt && noticeAt < nudges[4],
+                $"The count must span the notice (nudges in requests {string.Join(", ", nudges.Select(static index => index + 1))}, "
+                + $"notice in request {noticeAt + 1}).");
+            Assert.All(nudges[..4], index =>
+                Assert.DoesNotContain("Stop trying this action.", FreshNudge(requests[index]), StringComparison.Ordinal));
+            Assert.Contains("Stop trying this action.", FreshNudge(requests[nudges[4]]), StringComparison.Ordinal);
+            Assert.Equal(nudges[4] + 1, _clientProvider.Main.CallCount);
+        }
+        finally
+        {
+            childGate.TrySetResult();
+            parentGate.TrySetResult();
+        }
+    }
+
+    // True when the in-memory journal holds the admission of a child notice for the session.
+    private static async Task<bool> HasChildNoticeAdmissionAsync(Akka.TestKit.TestProbe probe, SessionId sessionId)
+    {
+        AkkaPersistence.Instance.Apply(probe.Sys).JournalFor(null).Tell(
+            new MemoryJournal.ReplayAllEvents(0, int.MaxValue, int.MaxValue, probe.Ref));
+        var found = false;
+        while (true)
+        {
+            switch (await probe.ExpectMsgAsync<object>(TimeSpan.FromSeconds(5),
+                        cancellationToken: TestContext.Current.CancellationToken))
+            {
+                case MemoryJournal.ReplayedEvent { Persistent.Payload: InputAdmitted { ChildNotice: not null } admitted }
+                    when admitted.SessionId == sessionId:
+                    found = true;
+                    break;
+                case MemoryJournal.EventReplaySuccess:
+                    return found;
+                case MemoryJournal.EventReplayFailure failure:
+                    throw new InvalidOperationException("The journal replay failed.", failure.Cause);
+            }
+        }
     }
 
     [Fact]
@@ -357,16 +564,20 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         }, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         await subscriber.ExpectMsgAsync<SessionJoined>(cancellationToken: TestContext.Current.CancellationToken);
 
+        var parentCallCountBeforeSend = _clientProvider.Main.CallCount;
+        var parentResumeMarker = PrepareParentResumeMarker();
         await sessionManager.Ask<CommandAck>(new SendUserMessage
         {
             SessionId = sessionId,
             Content = "Use the summarizer.",
             Source = BuildPersonalSource()
         }, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
-        await ExpectTurnCompletedAsync(
+        await ExpectChildTerminalAndParentResumeAsync(
             subscriber,
-            TimeSpan.FromSeconds(5),
-            TestContext.Current.CancellationToken);
+            "summarizer",
+            TestContext.Current.CancellationToken,
+            parentCallCountBeforeSend,
+            parentResumeMarker);
 
         var subagentOptions = Assert.IsType<SessionScopedChatOptions>(_clientProvider.Compaction.ReceivedOptions[0]);
         var subagentTools = Assert.IsAssignableFrom<IEnumerable<AITool>>(subagentOptions.Tools);
@@ -432,16 +643,20 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         await subscriber.ExpectMsgAsync<SessionJoined>(
             cancellationToken: TestContext.Current.CancellationToken);
 
+        var parentCallCountBeforeSend = _clientProvider.Main.CallCount;
+        var parentResumeMarker = PrepareParentResumeMarker();
         await sessionManager.Ask<CommandAck>(new SendUserMessage
         {
             SessionId = sessionId,
             Content = "Use one deferred child tool.",
             Source = BuildPersonalSource()
         }, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
-        await ExpectTurnCompletedAsync(
+        await ExpectChildTerminalAndParentResumeAsync(
             subscriber,
-            TimeSpan.FromSeconds(5),
-            TestContext.Current.CancellationToken);
+            "summarizer",
+            TestContext.Current.CancellationToken,
+            parentCallCountBeforeSend,
+            parentResumeMarker);
 
         var calls = _clientProvider.Compaction.ReceivedOptions;
         Assert.True(calls.Count >= 3);
@@ -551,16 +766,20 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         await subscriber.ExpectMsgAsync<SessionJoined>(
             cancellationToken: TestContext.Current.CancellationToken);
 
+        var parentCallCountBeforeSend = _clientProvider.Main.CallCount;
+        var parentResumeMarker = PrepareParentResumeMarker();
         await sessionManager.Ask<CommandAck>(new SendUserMessage
         {
             SessionId = sessionId,
             Content = "Use a child to check unavailable tools.",
             Source = BuildPersonalSource()
         }, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
-        await ExpectTurnCompletedAsync(
+        await ExpectChildTerminalAndParentResumeAsync(
             subscriber,
-            TimeSpan.FromSeconds(5),
-            TestContext.Current.CancellationToken);
+            "summarizer",
+            TestContext.Current.CancellationToken,
+            parentCallCountBeforeSend,
+            parentResumeMarker);
 
         var resultMessages = _clientProvider.Compaction.ReceivedMessages[1];
         Assert.StartsWith(
@@ -655,6 +874,8 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
             cancellationToken: TestContext.Current.CancellationToken);
 
         var source = BuildPersonalSource();
+        var parentCallCountBeforeSend = _clientProvider.Main.CallCount;
+        var parentResumeMarker = PrepareParentResumeMarker();
         await sessionManager.Ask<CommandAck>(new SendUserMessage
         {
             SessionId = sessionId,
@@ -669,8 +890,9 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
             cancellationToken: TestContext.Current.CancellationToken);
         for (var i = 0; i < 2; i++)
         {
-            var approval = await subscriber.ExpectMsgAsync<ToolInteractionRequest>(
-                TimeSpan.FromSeconds(3),
+            var approval = await subscriber.FishForMessageAsync<ToolInteractionRequest>(
+                request => request.ToolName.Value == ShellTool.ToolName,
+                TimeSpan.FromSeconds(15),
                 cancellationToken: TestContext.Current.CancellationToken);
             Assert.Equal(ShellTool.ToolName, approval.ToolName.Value);
             var denied = await sessionManager.Ask<ISessionResponse>(new ToolInteractionResponse
@@ -682,10 +904,12 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
             }, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
             Assert.IsType<CommandAck>(denied);
         }
-        await ExpectTurnCompletedAsync(
+        await ExpectChildTerminalAndParentResumeAsync(
             subscriber,
-            TimeSpan.FromSeconds(5),
-            TestContext.Current.CancellationToken);
+            "summarizer",
+            TestContext.Current.CancellationToken,
+            parentCallCountBeforeSend,
+            parentResumeMarker);
 
         var resultMessages = _clientProvider.Compaction.ReceivedMessages[1];
         Assert.DoesNotContain(
@@ -710,30 +934,25 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
     public async Task Loaded_child_tool_does_not_transfer_to_the_next_child()
     {
         RegisterSyntheticMcpCatalog();
-        _clientProvider.Main.PlannedResponses.Enqueue(
+        (string Prompt, FunctionCallContent Spawn)[] parentSpawns =
         [
-            CreateToolCall(
+            ("Run the first child.", CreateToolCall(
                 "call-isolation-spawn-1",
                 "spawn_agent",
                 new Dictionary<string, object?>
                 {
                     ["agent"] = "summarizer",
                     ["task"] = "Use one synthetic tool."
-                })
-        ]);
-        _clientProvider.Main.PlannedResponses.Enqueue([new TextContent("First child completed.")]);
-        _clientProvider.Main.PlannedResponses.Enqueue(
-        [
-            CreateToolCall(
+                })),
+            ("Run the second child.", CreateToolCall(
                 "call-isolation-spawn-2",
                 "spawn_agent",
                 new Dictionary<string, object?>
                 {
                     ["agent"] = "summarizer",
                     ["task"] = "Start without inherited tools."
-                })
-        ]);
-        _clientProvider.Main.PlannedResponses.Enqueue([new TextContent("Second child completed.")]);
+                }))
+        ];
         _clientProvider.Compaction.PlannedResponses.Enqueue(
         [
             CreateToolCall(
@@ -759,18 +978,24 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         await subscriber.ExpectMsgAsync<SessionJoined>(
             cancellationToken: TestContext.Current.CancellationToken);
 
-        foreach (var content in new[] { "Run the first child.", "Run the second child." })
+        var completedChildren = 0;
+        foreach (var (content, _) in parentSpawns)
         {
+            var parentCallCountBeforeSend = _clientProvider.Main.CallCount;
+            var parentResumeMarker = PrepareParentSpawnReplies(parentSpawns);
             await sessionManager.Ask<CommandAck>(new SendUserMessage
             {
                 SessionId = sessionId,
                 Content = content,
                 Source = BuildPersonalSource()
             }, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
-            await ExpectTurnCompletedAsync(
+            await ExpectChildTerminalAndParentResumeAsync(
                 subscriber,
-                TimeSpan.FromSeconds(5),
-                TestContext.Current.CancellationToken);
+                "summarizer",
+                TestContext.Current.CancellationToken,
+                parentCallCountBeforeSend,
+                parentResumeMarker,
+                ++completedChildren);
         }
 
         Assert.True(_clientProvider.Compaction.ReceivedToolNames.Count >= 3);
@@ -795,30 +1020,25 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         var shellProbe = new RecordingContextTool("shell_execute", "shell must not run", "shell");
         _toolRegistry.Register(shellProbe);
 
-        _clientProvider.Main.PlannedResponses.Enqueue(
+        (string Prompt, FunctionCallContent Spawn)[] parentSpawns =
         [
-            CreateToolCall(
+            ("Run the correcting child.", CreateToolCall(
                 "call-native-child-spawn-1",
                 "spawn_agent",
                 new Dictionary<string, object?>
                 {
                     ["agent"] = "summarizer",
                     ["task"] = "Inspect with the native probe."
-                })
-        ]);
-        _clientProvider.Main.PlannedResponses.Enqueue([new TextContent("First child returned.")]);
-        _clientProvider.Main.PlannedResponses.Enqueue(
-        [
-            CreateToolCall(
+                })),
+            ("Run a fresh child.", CreateToolCall(
                 "call-native-child-spawn-2",
                 "spawn_agent",
                 new Dictionary<string, object?>
                 {
                     ["agent"] = "summarizer",
                     ["task"] = "Start without inherited tools."
-                })
-        ]);
-        _clientProvider.Main.PlannedResponses.Enqueue([new TextContent("Second child returned.")]);
+                }))
+        ];
         _clientProvider.Compaction.PlannedResponses.Enqueue(
         [
             CreateToolCall(
@@ -851,10 +1071,12 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
             cancellationToken: TestContext.Current.CancellationToken);
 
         var source = BuildPersonalSource();
+        var parentCallCountBeforeSend = _clientProvider.Main.CallCount;
+        var parentResumeMarker = PrepareParentSpawnReplies(parentSpawns);
         await sessionManager.Ask<CommandAck>(new SendUserMessage
         {
             SessionId = sessionId,
-            Content = "Run the correcting child.",
+            Content = parentSpawns[0].Prompt,
             Source = source
         }, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
         await subscriber.ExpectMsgAsync<ToolCallOutput>(
@@ -863,8 +1085,9 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         await subscriber.ExpectMsgAsync<SubAgentOutput>(
             TimeSpan.FromSeconds(3),
             cancellationToken: TestContext.Current.CancellationToken);
-        var approval = await subscriber.ExpectMsgAsync<ToolInteractionRequest>(
-            TimeSpan.FromSeconds(3),
+        var approval = await subscriber.FishForMessageAsync<ToolInteractionRequest>(
+            request => request.ToolName.Value == deferredToolName,
+            TimeSpan.FromSeconds(15),
             cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(deferredToolName, approval.ToolName.Value);
         var denied = await sessionManager.Ask<ISessionResponse>(new ToolInteractionResponse
@@ -875,26 +1098,36 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
             SenderId = source.SenderId!
         }, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
         Assert.IsType<CommandAck>(denied);
-        await ExpectTurnCompletedAsync(
+        await ExpectChildTerminalAndParentResumeAsync(
             subscriber,
-            TimeSpan.FromSeconds(5),
-            TestContext.Current.CancellationToken);
+            "summarizer",
+            TestContext.Current.CancellationToken,
+            parentCallCountBeforeSend,
+            parentResumeMarker,
+            1);
 
+        parentCallCountBeforeSend = _clientProvider.Main.CallCount;
+        parentResumeMarker = PrepareParentSpawnReplies(parentSpawns);
         await sessionManager.Ask<CommandAck>(new SendUserMessage
         {
             SessionId = sessionId,
-            Content = "Run a fresh child.",
+            Content = parentSpawns[1].Prompt,
             Source = source
         }, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
-        await ExpectTurnCompletedAsync(
+        await ExpectChildTerminalAndParentResumeAsync(
             subscriber,
-            TimeSpan.FromSeconds(5),
-            TestContext.Current.CancellationToken);
+            "summarizer",
+            TestContext.Current.CancellationToken,
+            parentCallCountBeforeSend,
+            parentResumeMarker,
+            2);
 
         Assert.True(_clientProvider.Compaction.ReceivedToolNames.Count >= 4);
         Assert.DoesNotContain(deferredToolName, _clientProvider.Compaction.ReceivedToolNames[0]);
         Assert.Contains(deferredToolName, _clientProvider.Compaction.ReceivedToolNames[1]);
-        Assert.Contains(deferredToolName, _clientProvider.Compaction.ReceivedToolNames[2]);
+        // The call to the deferred tool parks, and a new incarnation resumes after the answer. A park does not keep
+        // the loaded deferred tools (durable-child-consent-wait, PR 1 cut plan), so the resumed call does not show it.
+        Assert.DoesNotContain(deferredToolName, _clientProvider.Compaction.ReceivedToolNames[2]);
         Assert.DoesNotContain(deferredToolName, _clientProvider.Compaction.ReceivedToolNames[^1]);
         Assert.False(shellProbe.WasCalled);
         Assert.NotNull(_recordingApprovalTool);
@@ -919,30 +1152,25 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
                 new InvalidOperationException("synthetic child model failure")));
         _toolRegistry.Register(failureProbe);
 
-        _clientProvider.Main.PlannedResponses.Enqueue(
+        (string Prompt, FunctionCallContent Spawn)[] parentSpawns =
         [
-            CreateToolCall(
+            ("Run the failing child.", CreateToolCall(
                 "call-failure-spawn-1",
                 "spawn_agent",
                 new Dictionary<string, object?>
                 {
                     ["agent"] = "summarizer",
                     ["task"] = "Load the failure probe."
-                })
-        ]);
-        _clientProvider.Main.PlannedResponses.Enqueue([new TextContent("Failure was recorded.")]);
-        _clientProvider.Main.PlannedResponses.Enqueue(
-        [
-            CreateToolCall(
+                })),
+            ("Run the fresh child.", CreateToolCall(
                 "call-failure-spawn-2",
                 "spawn_agent",
                 new Dictionary<string, object?>
                 {
                     ["agent"] = "summarizer",
                     ["task"] = "Start with a clean tool set."
-                })
-        ]);
-        _clientProvider.Main.PlannedResponses.Enqueue([new TextContent("Fresh child completed.")]);
+                }))
+        ];
         _clientProvider.Compaction.PlannedResponses.Enqueue(
         [
             CreateToolCall(
@@ -971,26 +1199,46 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         await subscriber.ExpectMsgAsync<SessionJoined>(
             cancellationToken: TestContext.Current.CancellationToken);
 
-        foreach (var content in new[] { "Run the failing child.", "Run the fresh child." })
+        var completedChildren = 0;
+        foreach (var (content, _) in parentSpawns)
         {
+            var parentCallCountBeforeSend = _clientProvider.Main.CallCount;
+            var parentResumeMarker = PrepareParentSpawnReplies(parentSpawns);
             await sessionManager.Ask<CommandAck>(new SendUserMessage
             {
                 SessionId = sessionId,
                 Content = content,
                 Source = BuildPersonalSource()
             }, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
-            await ExpectTurnCompletedAsync(
+
+            var (terminal, _) = await ExpectChildTerminalAndParentResumeWithOutputsAsync(
                 subscriber,
-                TimeSpan.FromSeconds(5),
-                TestContext.Current.CancellationToken);
+                "summarizer",
+                TestContext.Current.CancellationToken,
+                parentCallCountBeforeSend,
+                parentResumeMarker,
+                ++completedChildren);
+            Assert.Equal(completedChildren == 2, terminal.Success);
+            Assert.Equal(
+                completedChildren == 2 ? SubAgentRunOutcome.Completed : SubAgentRunOutcome.Failed,
+                terminal.Outcome);
+            if (completedChildren == 1)
+                Assert.Equal(SubAgentOutcomeReason.LlmCallFailed, terminal.OutcomeReason);
         }
 
         Assert.True(failureProbe.WasCalled);
+        var spawnReceiptRequest = _clientProvider.Main.ReceivedMessages
+            .LastOrDefault(request => request.SelectMany(static message => message.Contents.OfType<FunctionResultContent>())
+                .Any(result => result.CallId == "call-failure-spawn-1"));
+        Assert.NotNull(spawnReceiptRequest);
+        var firstRunId = ParseAcceptedRunId(GetToolResult(spawnReceiptRequest!, "call-failure-spawn-1"));
+        Assert.False(string.IsNullOrWhiteSpace(firstRunId));
+        var failedChildResultRequest = _clientProvider.Main.ReceivedMessages
+            .LastOrDefault(request => FindDeliveredRunIds(request).Contains(firstRunId!));
+        Assert.NotNull(failedChildResultRequest);
         Assert.Contains(
             "synthetic child model failure",
-            GetToolResult(
-                _clientProvider.Main.ReceivedMessages[1],
-                "call-failure-spawn-1"),
+            GetChildRunResult(failedChildResultRequest!, firstRunId!),
             StringComparison.Ordinal);
         Assert.Equal(
             ["file_read", "load_tool", "search_tools"],
@@ -1057,6 +1305,8 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         }, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         await subscriber.ExpectMsgAsync<SessionJoined>(cancellationToken: TestContext.Current.CancellationToken);
 
+        var parentCallCountBeforeSend = _clientProvider.Main.CallCount;
+        var parentResumeMarker = PrepareParentResumeMarker();
         await sessionManager.Ask<CommandAck>(new SendUserMessage
         {
             SessionId = sessionId,
@@ -1070,9 +1320,31 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         var started = await subscriber.ExpectMsgAsync<SubAgentOutput>(TimeSpan.FromSeconds(3), cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(SubAgentPhase.Started, started.Phase);
 
-        var request = await subscriber.ExpectMsgAsync<ToolInteractionRequest>(TimeSpan.FromSeconds(3), cancellationToken: TestContext.Current.CancellationToken);
-        Assert.NotEqual(childCallId, request.CallId.Value);
-        Assert.StartsWith($"{parentCallId}/subagent-approval/", request.CallId.Value, StringComparison.Ordinal);
+        ToolResultOutput? accepted = null;
+        ToolInteractionRequest? request = null;
+        // The child approval and parent acceptance receipt can arrive in either order.
+        await subscriber.FishForMessageAsync<SessionOutput>(
+            output =>
+            {
+                if (output is ToolResultOutput result && result.CallId.Value == parentCallId)
+                    accepted = result;
+                if (output is ToolInteractionRequest interaction && interaction.ToolName.Value == ApprovalProbeToolName)
+                    request = interaction;
+                return accepted is not null && request is not null;
+            },
+            TimeSpan.FromSeconds(15),
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        Assert.Equal("spawn_agent", accepted!.ToolName.Value);
+        string runId;
+        using (var acceptedJson = JsonDocument.Parse(accepted.Result))
+        {
+            Assert.Equal("accepted", acceptedJson.RootElement.GetProperty("state").GetString());
+            runId = acceptedJson.RootElement.GetProperty("run_id").GetString()!;
+        }
+
+        Assert.NotEqual(childCallId, request!.CallId.Value);
+        Assert.StartsWith($"{runId}/subagent-approval/", request.CallId.Value, StringComparison.Ordinal);
         Assert.Contains("subagent-approval", request.CallId.Value, StringComparison.Ordinal);
         Assert.DoesNotContain(childCallId, request.CallId.Value, StringComparison.Ordinal);
         AssertApprovalButtonValuesRoundTrip(request);
@@ -1090,15 +1362,14 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         }, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
         Assert.IsType<CommandAck>(approvalReply);
 
-        var completed = await subscriber.ExpectMsgAsync<SubAgentOutput>(TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        var completed = await ExpectChildTerminalAndParentResumeAsync(
+            subscriber,
+            "approval-tester",
+            TestContext.Current.CancellationToken,
+            parentCallCountBeforeSend,
+            parentResumeMarker);
         Assert.Equal(SubAgentPhase.Completed, completed.Phase);
         Assert.True(completed.Success);
-
-        var result = await subscriber.ExpectMsgAsync<ToolResultOutput>(TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
-        Assert.Equal("spawn_agent", result.ToolName.Value);
-
-        await subscriber.ExpectMsgAsync<TextOutput>(TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
-        await subscriber.ExpectMsgAsync<TurnCompleted>(TimeSpan.FromSeconds(3), cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.NotNull(_recordingApprovalTool);
         Assert.True(_recordingApprovalTool!.WasCalled);
@@ -1110,97 +1381,6 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         // The sub-agent extracted the meta timeout hint and applied it to the
         // tool context (regression guard for the previously-dropped hint).
         Assert.Equal(TimeSpan.FromSeconds(1800), _recordingApprovalTool.LastContext?.ExecutionTimeout.Value);
-    }
-
-    [Fact]
-    public async Task Spawn_agent_subagent_approval_expires_after_parent_session_recovery()
-    {
-        _clientProvider.Main.ToolCallsOnFirstCall =
-        [
-            CreateToolCall(
-                "call-spawn-approval-expire",
-                "spawn_agent",
-                new Dictionary<string, object?>
-                {
-                    ["agent"] = "approval-tester",
-                    ["task"] = "Run the approval probe"
-                })
-        ];
-        _clientProvider.Compaction.ToolCallsOnFirstCall =
-        [
-            CreateToolCall(
-                "call-subagent-approval-expire",
-                ApprovalProbeToolName,
-                new Dictionary<string, object?>())
-        ];
-
-        var sessionId = new SessionId("console/subagent-approval-expired");
-        var sessionManager = ActorRegistry.Get<SessionManagerActorKey>();
-        var subscriber = CreateTestProbe("subagent-approval-expired-events");
-        var source = BuildPersonalSource();
-
-        await sessionManager.Ask<SessionJoined>(new JoinSession(subscriber)
-        {
-            SessionId = sessionId,
-            Filter = OutputFilter.Full
-        }, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
-        await subscriber.ExpectMsgAsync<SessionJoined>(cancellationToken: TestContext.Current.CancellationToken);
-
-        await sessionManager.Ask<CommandAck>(new SendUserMessage
-        {
-            SessionId = sessionId,
-            Content = "Use a subagent to run the approval probe",
-            Source = source
-        }, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
-
-        await subscriber.ExpectMsgAsync<ToolCallOutput>(TimeSpan.FromSeconds(3), cancellationToken: TestContext.Current.CancellationToken);
-        await subscriber.ExpectMsgAsync<SubAgentOutput>(TimeSpan.FromSeconds(3), cancellationToken: TestContext.Current.CancellationToken);
-        var request = await subscriber.ExpectMsgAsync<ToolInteractionRequest>(TimeSpan.FromSeconds(3), cancellationToken: TestContext.Current.CancellationToken);
-        Assert.Contains("subagent-approval", request.CallId.Value, StringComparison.Ordinal);
-        Assert.DoesNotContain("call-subagent-approval-expire", request.CallId.Value, StringComparison.Ordinal);
-        AssertApprovalButtonValuesRoundTrip(request);
-        Assert.False(_recordingApprovalTool!.WasCalled);
-
-        await ColdRespawnAsync(sessionId);
-
-        var subscriberB = CreateTestProbe("subagent-approval-expired-events-b");
-        await sessionManager.Ask<SessionJoined>(new JoinSession(subscriberB)
-        {
-            SessionId = sessionId,
-            Filter = OutputFilter.Full
-        }, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
-        await subscriberB.ExpectMsgAsync<SessionJoined>(cancellationToken: TestContext.Current.CancellationToken);
-
-        var reply = await sessionManager.Ask<ISessionResponse>(new ToolInteractionResponse
-        {
-            SessionId = sessionId,
-            CallId = request.CallId,
-            SelectedKey = new ApprovalOptionKey(ApprovalOptionKeys.ApproveOnce),
-            SenderId = source.SenderId!
-        }, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-
-        var nack = Assert.IsType<CommandNack>(reply);
-        Assert.Equal(ApprovalNackReasons.PromptExpired, nack.Reason);
-        var notice = await subscriberB.ExpectMsgAsync<TextOutput>(TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
-        Assert.Contains("expired", notice.Text, StringComparison.OrdinalIgnoreCase);
-        Assert.False(_recordingApprovalTool.WasCalled);
-
-        await sessionManager.Ask<CommandAck>(new SendUserMessage
-        {
-            SessionId = sessionId,
-            Content = "Never mind, just say hello",
-            Source = source
-        }, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-
-        await subscriberB.ExpectMsgAsync<TextOutput>(TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
-        await subscriberB.ExpectMsgAsync<TurnCompleted>(TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
-
-        var resumedCall = _clientProvider.Main.ReceivedMessages[^1];
-        Assert.Contains(resumedCall, message =>
-            message.Role == Microsoft.Extensions.AI.ChatRole.Tool
-            && message.Contents.OfType<FunctionResultContent>().Any(result =>
-                result.CallId == "call-spawn-approval-expire"
-                && result.Result?.ToString()?.Contains("session restarted", StringComparison.OrdinalIgnoreCase) == true));
     }
 
     [Fact]
@@ -1235,6 +1415,7 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
     [Fact]
     public async Task Routed_slash_command_executes_with_overlay_and_isolated_prompt_stack()
     {
+        // Arrange
         var sessionId = new SessionId("test-channel/routed-slash-success");
         var sessionManager = ActorRegistry.Get<SessionManagerActorKey>();
         var subscriber = CreateTestProbe("routed-slash-success-events");
@@ -1246,6 +1427,10 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         }, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         await subscriber.ExpectMsgAsync<SessionJoined>(cancellationToken: TestContext.Current.CancellationToken);
 
+        var parentCallCountBeforeSend = _clientProvider.Main.CallCount;
+        var parentResumeMarker = PrepareParentResumeMarker();
+
+        // Act
         await sessionManager.Ask<CommandAck>(new SendUserMessage
         {
             SessionId = sessionId,
@@ -1253,12 +1438,25 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
             Source = BuildPersonalSource()
         }, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
 
-        var text = await ExpectTextOutputAsync(subscriber, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-        Assert.Contains("fake", text.Text, StringComparison.OrdinalIgnoreCase);
-        await ExpectTurnCompletedAsync(subscriber, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
+        var completed = await ExpectChildTerminalAndParentResumeAsync(
+            subscriber,
+            "summarizer",
+            TestContext.Current.CancellationToken,
+            parentCallCountBeforeSend,
+            parentResumeMarker);
 
-        Assert.Equal(0, _clientProvider.Main.CallCount);
+        // Assert
+        Assert.Equal(SubAgentPhase.Completed, completed.Phase);
+        Assert.Equal("summarizer", completed.AgentName.Value);
+        Assert.True(completed.Success);
+
+        Assert.Equal(parentCallCountBeforeSend + 1, _clientProvider.Main.CallCount);
         Assert.Equal(1, _clientProvider.Compaction.CallCount);
+        var resumedRequest = _clientProvider.Main.ReceivedMessages
+            .Skip(parentCallCountBeforeSend)
+            .Last(request => CountDeliveredChildRuns(request) == 1);
+        var acceptedRunId = Assert.Single(FindAcceptedRunIds(resumedRequest));
+        Assert.NotEmpty(GetChildRunResult(resumedRequest, acceptedRunId));
 
         var subagentCall = Assert.Single(_clientProvider.Compaction.ReceivedMessages);
         Assert.Contains(subagentCall, m =>
@@ -1285,6 +1483,51 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
             && (m.Text?.Contains(AgentsLayerMarker, StringComparison.Ordinal) ?? false));
     }
 
+    [Fact]
+    public async Task Routed_slash_command_reports_child_model_failure_and_completes_the_turn()
+    {
+        // Arrange
+        const string failure = "synthetic routed model failure";
+        _clientProvider.Compaction.PlannedExceptions.Enqueue(new InvalidOperationException(failure));
+        var sessionId = new SessionId("test-channel/routed-slash-child-failure");
+        var sessionManager = ActorRegistry.Get<SessionManagerActorKey>();
+        var subscriber = CreateTestProbe("routed-slash-child-failure-events");
+        var parentCallCountBeforeSend = _clientProvider.Main.CallCount;
+        var parentResumeMarker = PrepareParentResumeMarker();
+        await sessionManager.Ask<SessionJoined>(new JoinSession(subscriber)
+        {
+            SessionId = sessionId,
+            Filter = OutputFilter.Full
+        }, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        await subscriber.ExpectMsgAsync<SessionJoined>(cancellationToken: TestContext.Current.CancellationToken);
+
+        // Act
+        await sessionManager.Ask<CommandAck>(new SendUserMessage
+        {
+            SessionId = sessionId,
+            Content = "/ops-route check daemon health",
+            Source = BuildPersonalSource()
+        }, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
+        var completed = await ExpectChildTerminalAndParentResumeAsync(
+            subscriber,
+            "summarizer",
+            TestContext.Current.CancellationToken,
+            parentCallCountBeforeSend,
+            parentResumeMarker);
+
+        // Assert
+        Assert.Equal(parentCallCountBeforeSend + 1, _clientProvider.Main.CallCount);
+        Assert.Equal(SubAgentPhase.Completed, completed.Phase);
+        Assert.False(completed.Success);
+        Assert.Equal(SubAgentRunOutcome.Failed, completed.Outcome);
+        Assert.Equal(SubAgentOutcomeReason.LlmCallFailed, completed.OutcomeReason);
+        var resumedRequest = _clientProvider.Main.ReceivedMessages
+            .Skip(parentCallCountBeforeSend)
+            .Last(request => CountDeliveredChildRuns(request) == 1);
+        var acceptedRunId = Assert.Single(FindAcceptedRunIds(resumedRequest));
+        Assert.Contains(failure, GetChildRunResult(resumedRequest, acceptedRunId), StringComparison.Ordinal);
+    }
+
     // NOTE: routing the spawn lifecycle to session.log is no longer per-path-wired — the
     // breadcrumbs log under a SessionId scope and the file-logger partitions them regardless of
     // which path (tool-execution or routed-skill) drove the spawn. The producer side is covered
@@ -1304,6 +1547,8 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         }, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         await subscriber.ExpectMsgAsync<SessionJoined>(cancellationToken: TestContext.Current.CancellationToken);
 
+        var parentCallCountBeforeSend = _clientProvider.Main.CallCount;
+        var parentResumeMarker = PrepareParentResumeMarker();
         await sessionManager.Ask<CommandAck>(new SendUserMessage
         {
             SessionId = sessionId,
@@ -1311,11 +1556,17 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
             Source = BuildReminderSource()
         }, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
 
-        await ExpectTextOutputAsync(subscriber, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-        await ExpectTurnCompletedAsync(subscriber, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
+        var (completed, outputs) = await ExpectChildTerminalAndParentResumeWithOutputsAsync(
+            subscriber,
+            "summarizer",
+            TestContext.Current.CancellationToken,
+            parentCallCountBeforeSend,
+            parentResumeMarker);
 
-        Assert.Equal(0, _clientProvider.Main.CallCount);
+        Assert.Equal(parentCallCountBeforeSend + 1, _clientProvider.Main.CallCount);
+        Assert.Equal(SubAgentPhase.Completed, completed.Phase);
         Assert.Equal(1, _clientProvider.Compaction.CallCount);
+        AssertAcceptedSpawnReceipt(outputs.OfType<TextOutput>().First().Text);
 
         var subagentCall = Assert.Single(_clientProvider.Compaction.ReceivedMessages);
         Assert.Contains(subagentCall, m =>
@@ -1339,6 +1590,8 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         await subscriber.ExpectMsgAsync<SessionJoined>(cancellationToken: TestContext.Current.CancellationToken);
 
         var reminderSource = BuildReminderSource("ops-route:1712000000000");
+        var parentCallCountBeforeSend = _clientProvider.Main.CallCount;
+        var parentResumeMarker = PrepareParentResumeMarker();
 
         var firstAck = await sessionManager.Ask<CommandAck>(new SendUserMessage
         {
@@ -1348,10 +1601,18 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         }, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
         Assert.Equal(sessionId, firstAck.SessionId);
 
-        await ExpectTextOutputAsync(subscriber, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-        await ExpectTurnCompletedAsync(subscriber, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
+        var (completed, outputs) = await ExpectChildTerminalAndParentResumeWithOutputsAsync(
+            subscriber,
+            "summarizer",
+            TestContext.Current.CancellationToken,
+            parentCallCountBeforeSend,
+            parentResumeMarker);
+        Assert.Equal(parentCallCountBeforeSend + 1, _clientProvider.Main.CallCount);
+        Assert.Equal(SubAgentPhase.Completed, completed.Phase);
+        AssertAcceptedSpawnReceipt(outputs.OfType<TextOutput>().First().Text);
 
         var callsAfterFirst = _clientProvider.Compaction.CallCount;
+        var parentCallsAfterFirst = _clientProvider.Main.CallCount;
 
         var duplicateAck = await sessionManager.Ask<CommandAck>(new SendUserMessage
         {
@@ -1364,6 +1625,7 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         await AwaitAssertAsync(() =>
         {
             Assert.Equal(callsAfterFirst, _clientProvider.Compaction.CallCount);
+            Assert.Equal(parentCallsAfterFirst, _clientProvider.Main.CallCount);
             return Task.CompletedTask;
         }, TimeSpan.FromSeconds(1), TimeSpan.FromMilliseconds(100), cancellationToken: TestContext.Current.CancellationToken);
     }
@@ -1385,6 +1647,8 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         var reminderSource = BuildReminderSource("ops-route:1712000000001");
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         _clientProvider.Compaction.NextResponseGate = gate;
+        var parentCallCountBeforeSend = _clientProvider.Main.CallCount;
+        var parentResumeMarker = PrepareParentResumeMarker();
 
         var firstAck = await sessionManager.Ask<CommandAck>(new SendUserMessage
         {
@@ -1418,8 +1682,14 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
 
         gate.TrySetResult();
 
-        await ExpectTextOutputAsync(subscriber, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-        await ExpectTurnCompletedAsync(subscriber, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
+        var completed = await ExpectChildTerminalAndParentResumeAsync(
+            subscriber,
+            "summarizer",
+            TestContext.Current.CancellationToken,
+            parentCallCountBeforeSend,
+            parentResumeMarker);
+        Assert.Equal(SubAgentPhase.Completed, completed.Phase);
+        Assert.Equal(parentCallCountBeforeSend + 1, _clientProvider.Main.CallCount);
 
         await AwaitAssertAsync(() =>
         {
@@ -1454,6 +1724,8 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         await subscriber.ExpectMsgAsync<SessionJoined>(cancellationToken: TestContext.Current.CancellationToken);
 
         var source = BuildReminderSource();
+        var parentCallCountBeforeSend = _clientProvider.Main.CallCount;
+        var parentResumeMarker = PrepareParentResumeMarker();
 
         await sessionManager.Ask<CommandAck>(new SendUserMessage
         {
@@ -1462,11 +1734,16 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
             Source = source
         }, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
 
-        var text = await ExpectTextOutputAsync(subscriber, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-        await ExpectTurnCompletedAsync(subscriber, TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
+        var (completed, outputs) = await ExpectChildTerminalAndParentResumeWithOutputsAsync(
+            subscriber,
+            "summarizer",
+            TestContext.Current.CancellationToken,
+            parentCallCountBeforeSend,
+            parentResumeMarker);
+        Assert.Equal(parentCallCountBeforeSend + 1, _clientProvider.Main.CallCount);
+        Assert.Equal(SubAgentPhase.Completed, completed.Phase);
 
-        Assert.Contains("fake", text.Text, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal(0, _clientProvider.Main.CallCount);
+        AssertAcceptedSpawnReceipt(outputs.OfType<TextOutput>().First().Text);
         Assert.Equal(2, _clientProvider.Compaction.CallCount);
         Assert.NotNull(_recordingFileReadTool);
         Assert.True(_recordingFileReadTool!.WasCalled);
@@ -1488,6 +1765,13 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         };
     }
 
+    private static void AssertAcceptedSpawnReceipt(string text)
+    {
+        using var receipt = JsonDocument.Parse(text);
+        Assert.Equal("accepted", receipt.RootElement.GetProperty("state").GetString());
+        Assert.False(string.IsNullOrWhiteSpace(receipt.RootElement.GetProperty("run_id").GetString()));
+    }
+
     private static MessageSource BuildReminderSource(string? reminderId = null)
     {
         return new MessageSource
@@ -1501,6 +1785,21 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
             ReceivedAt = DateTimeOffset.UtcNow,
             ReminderId = reminderId is null ? null : new ReminderId(reminderId)
         };
+    }
+
+    private static async Task<IReadOnlyList<SessionOutput>> CollectTurnOutputsAsync(
+        Akka.TestKit.TestProbe probe, CancellationToken ct)
+    {
+        var outputs = new List<SessionOutput>();
+        for (var i = 0; i < 12; i++)
+        {
+            var output = await probe.ExpectMsgAsync<SessionOutput>(TimeSpan.FromSeconds(5), cancellationToken: ct);
+            outputs.Add(output);
+            if (output is TurnCompleted)
+                return outputs;
+        }
+
+        throw new Xunit.Sdk.XunitException("Expected TurnCompleted within 12 session outputs.");
     }
 
     private static async Task<TextOutput> ExpectTextOutputAsync(Akka.TestKit.TestProbe probe, TimeSpan timeout, CancellationToken ct)
@@ -1527,14 +1826,221 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         throw new Xunit.Sdk.XunitException("Expected TurnCompleted but only received other session outputs.");
     }
 
-    private async Task ColdRespawnAsync(SessionId sessionId)
+    private static async Task<SubAgentOutput> ExpectChildTerminalAsync(
+        Akka.TestKit.TestProbe probe,
+        string agentName,
+        CancellationToken ct)
     {
-        var escapedId = Uri.EscapeDataString(sessionId.Value);
-        var child = await Sys.ActorSelection($"/user/session-manager/{escapedId}")
-            .ResolveOne(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-        Watch(child);
-        Sys.Stop(child);
-        await ExpectTerminatedAsync(child, cancellationToken: TestContext.Current.CancellationToken);
+        var terminal = await probe.FishForMessageAsync<SubAgentOutput>(
+            output => output.Phase == SubAgentPhase.Completed && output.AgentName.Value == agentName,
+            TimeSpan.FromSeconds(15),
+            cancellationToken: ct);
+        Assert.Equal(SubAgentPhase.Completed, terminal.Phase);
+        Assert.Equal(agentName, terminal.AgentName.Value);
+        return terminal;
+    }
+
+    private async Task<SubAgentOutput> ExpectChildTerminalAndParentResumeAsync(
+        Akka.TestKit.TestProbe probe,
+        string agentName,
+        CancellationToken ct,
+        int parentCallCountBeforeSend,
+        string parentResumeMarker,
+        int expectedChildResults = 1)
+    {
+        var result = await ExpectChildTerminalAndParentResumeWithOutputsAsync(
+            probe,
+            agentName,
+            ct,
+            parentCallCountBeforeSend,
+            parentResumeMarker,
+            expectedChildResults);
+        return result.Terminal;
+    }
+
+    private async Task<(SubAgentOutput Terminal, IReadOnlyList<SessionOutput> Outputs)> ExpectChildTerminalAndParentResumeWithOutputsAsync(
+        Akka.TestKit.TestProbe probe,
+        string agentName,
+        CancellationToken ct,
+        int parentCallCountBeforeSend,
+        string parentResumeMarker,
+        int expectedChildResults = 1)
+    {
+        var outputs = new List<SessionOutput>();
+        SubAgentOutput? terminal = null;
+        var markerSeen = false;
+        var resumedTurnCompleted = false;
+        while (terminal is null || !resumedTurnCompleted)
+        {
+            var output = await probe.ExpectMsgAsync<SessionOutput>(
+                TimeSpan.FromSeconds(15),
+                cancellationToken: ct);
+            outputs.Add(output);
+            if (output is SubAgentOutput child
+                && child.Phase == SubAgentPhase.Completed
+                && child.AgentName.Value == agentName)
+            {
+                terminal = child;
+            }
+
+            if (output is TextOutput text && text.Text == parentResumeMarker)
+                markerSeen = true;
+            else if (markerSeen && output is TurnCompleted)
+                resumedTurnCompleted = true;
+        }
+
+        Assert.NotNull(terminal);
+        await AwaitAssertAsync(() =>
+        {
+            var latestParentRequest = _clientProvider.Main.ReceivedMessages
+                .Skip(parentCallCountBeforeSend)
+                .LastOrDefault(request => CountDeliveredChildRuns(request) >= expectedChildResults);
+            Assert.True(
+                latestParentRequest is not null,
+                $"Expected a new parent request with {expectedChildResults} distinct child result deliveries after call {parentCallCountBeforeSend}.");
+            Assert.Equal(expectedChildResults, CountDeliveredChildRuns(latestParentRequest!));
+            return Task.CompletedTask;
+        }, TimeSpan.FromSeconds(15), TimeSpan.FromMilliseconds(100), cancellationToken: ct);
+
+        return (terminal!, outputs);
+    }
+
+    private string PrepareParentResumeMarker()
+    {
+        var marker = $"parent-resumed-{Guid.NewGuid():N}";
+        var priorRunIds = _clientProvider.Main.ReceivedMessages
+            .SelectMany(FindAcceptedRunIds)
+            .ToHashSet(StringComparer.Ordinal);
+        _clientProvider.Main.ResponseContentsSelector = request =>
+        {
+            var newRunIds = FindAcceptedRunIds(request)
+                .Except(priorRunIds, StringComparer.Ordinal)
+                .ToHashSet(StringComparer.Ordinal);
+            var deliveredRunIds = FindDeliveredRunIds(request);
+            return newRunIds.Count == 1 && newRunIds.IsSubsetOf(deliveredRunIds)
+                ? [new TextContent(marker)]
+                : null;
+        };
+        return marker;
+    }
+
+    // A multi-turn spawn test must pick each parent reply from the request, not from
+    // its position. The child result can reach the parent before or after the
+    // post-spawn model call, and the session accepts both orders. If the result
+    // arrives first, it folds into the post-spawn call and that call returns the
+    // marker. A positional reply queue then shifts by one, and the next turn gets a
+    // stale text reply in place of its spawn_agent call.
+    private string PrepareParentSpawnReplies(IReadOnlyList<(string Prompt, FunctionCallContent Spawn)> spawns)
+    {
+        var marker = PrepareParentResumeMarker();
+        var resumeSelector = _clientProvider.Main.ResponseContentsSelector!;
+        _clientProvider.Main.ResponseContentsSelector = request =>
+        {
+            var issuedCallIds = request
+                .SelectMany(static message => message.Contents.OfType<FunctionCallContent>())
+                .Select(static call => call.CallId)
+                .ToHashSet(StringComparer.Ordinal);
+            var userTexts = request
+                .Where(static message => message.Role == Microsoft.Extensions.AI.ChatRole.User)
+                .Select(static message => message.Text)
+                .ToArray();
+            foreach (var (prompt, spawn) in spawns)
+            {
+                if (!issuedCallIds.Contains(spawn.CallId)
+                    && userTexts.Any(text => text.Contains(prompt, StringComparison.Ordinal)))
+                    return [spawn];
+            }
+
+            return resumeSelector(request) ?? [new TextContent("Child run accepted.")];
+        };
+        return marker;
+    }
+
+    private static int CountDeliveredChildRuns(IReadOnlyList<ChatMessage> request)
+    {
+        var acceptedRunIds = FindAcceptedRunIds(request);
+        var deliveredRunIds = FindDeliveredRunIds(request);
+        Assert.All(deliveredRunIds, runId => Assert.Contains(runId, acceptedRunIds));
+        return deliveredRunIds.Count;
+    }
+
+    // A child result reaches the parent as a notice: a user message that names the run and its result file.
+    private static IEnumerable<string> NoticeTexts(IEnumerable<ChatMessage> request)
+        => request
+            .Where(static message => message.Role == Microsoft.Extensions.AI.ChatRole.User
+                && message.Text.StartsWith("Child run ended.", StringComparison.Ordinal))
+            .Select(static message => message.Text);
+
+    private static string NoticeRunId(string notice)
+        => System.Text.RegularExpressions.Regex.Match(notice, @"\brun=(\S+)").Groups[1].Value;
+
+    private static string ReadNoticeFile(string notice)
+    {
+        var path = System.Text.RegularExpressions.Regex.Match(notice, @"result_file=(\S+)").Groups[1].Value;
+        Assert.False(string.IsNullOrWhiteSpace(path), "The notice names no result file.");
+        return File.ReadAllText(path);
+    }
+
+    private static HashSet<string> FindAcceptedRunIds(IEnumerable<ChatMessage> request)
+    {
+        var contents = request.SelectMany(static message => message.Contents).ToArray();
+        var resultsByCallId = contents
+            .OfType<FunctionResultContent>()
+            .ToLookup(static result => result.CallId, StringComparer.Ordinal);
+        var toolAcceptedRunIds = contents
+            .OfType<FunctionCallContent>()
+            .Where(static call => call.Name == "spawn_agent")
+            .SelectMany(call => resultsByCallId[call.CallId]
+                .Select(static result => ParseAcceptedRunId(result.Result?.ToString())))
+            .Where(static runId => !string.IsNullOrWhiteSpace(runId))
+            .Select(static runId => runId!)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var routedAcceptedRunIds = request
+            .Where(static message => message.Role == Microsoft.Extensions.AI.ChatRole.Assistant)
+            .SelectMany(static message => message.Contents.OfType<Microsoft.Extensions.AI.TextContent>())
+            .Select(static text => ParseAcceptedRunId(text.Text))
+            .Where(static runId => !string.IsNullOrWhiteSpace(runId))
+            .Select(static runId => runId!);
+
+        toolAcceptedRunIds.UnionWith(routedAcceptedRunIds);
+        return toolAcceptedRunIds;
+    }
+
+    // Review Should-fix 3: a run gets exactly one notice. The set below would hide a second notice for one run, so
+    // the notices are counted before the set removes repeats.
+    private static HashSet<string> FindDeliveredRunIds(IEnumerable<ChatMessage> request)
+    {
+        var noticeRunIds = NoticeTexts(request).Select(NoticeRunId).ToArray();
+        var deliveredRunIds = noticeRunIds.ToHashSet(StringComparer.Ordinal);
+        Assert.True(noticeRunIds.Length == deliveredRunIds.Count,
+            $"A run has more than one notice in one model request: {string.Join(", ", noticeRunIds)}.");
+        return deliveredRunIds;
+    }
+
+    private static string? ParseAcceptedRunId(string? result)
+    {
+        if (string.IsNullOrWhiteSpace(result))
+            return null;
+
+        try
+        {
+            using var json = JsonDocument.Parse(result);
+            var root = json.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !root.TryGetProperty("state", out var state) ||
+                state.ValueKind != JsonValueKind.String || state.GetString() != "accepted" ||
+                !root.TryGetProperty("run_id", out var runId) ||
+                runId.ValueKind != JsonValueKind.String)
+                return null;
+
+            var value = runId.GetString();
+            return string.IsNullOrWhiteSpace(value) ? null : value;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     private static void AssertApprovalButtonValuesRoundTrip(ToolInteractionRequest request)
@@ -1591,6 +2097,9 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
             .Result;
         return Assert.IsType<string>(result);
     }
+
+    private static string GetChildRunResult(IReadOnlyList<ChatMessage> messages, string runId)
+        => ReadNoticeFile(Assert.Single(NoticeTexts(messages), text => NoticeRunId(text) == runId));
 
     private sealed record ToolFootprintBaseline(
         int SchemaVersion,

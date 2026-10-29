@@ -1,5 +1,486 @@
 # NetClaw Release Notes
 
+## 0.28.2 (2026-10-28)
+
+This is a stable patch release for 0.28.0. A model definition now carries a provider-neutral output limit and thinking level, so an Anthropic reply is no longer cut at 1024 tokens. The daemon rotates its log into bounded numbered segments. The CLI refuses to send local control traffic to a guessed address when the configuration cannot be read.
+
+**Upgrade impact:** none. 0.28.2 uses the same database format as 0.28.0 and 0.28.1, and it changes no configuration format. Three behaviors change: a turn that keeps failing through different tools now stops, `netclaw doctor --json` writes only JSON to stdout, and `Logs:Days` now also prunes numbered daemon log segments.
+
+### Models
+
+- **A model definition has a provider-neutral output limit and thinking level.** `netclaw model set` gets `--max-output-tokens`, `--clear-max-output-tokens`, `--thinking <off|low|medium|high|max>`, and `--clear-thinking`. `netclaw model list` and the TUI role table show "Max out" and "Thinking". `P` in `netclaw model` edits both values. Netclaw maps them to the switch of each provider.
+  - Netclaw rejects a level that the provider dialect or the model does not offer, and lists the offered levels. It never sends a nearby level.
+  - An `openai-compatible` provider needs `Providers:<name>:VendorOptions:ThinkingDialect` (`ChatTemplateKwargs`, `ReasoningEffort`, `DeepSeek`, or `None`) before it can send a level. `model set` saves `ReasoningEffort` when it detects llama.cpp.
+  - **Behavior change:** without a configured value, a hosted API now receives an output limit of 32000 tokens, capped to its known model maximum and clamped to its known context window. Anthropic replies are no longer cut at 1024 tokens. The cost per call can increase. A self-hosted server receives 32000 clamped to its context window only when that window is known from `ContextWindow` or from the server's own probe; otherwise the request has no limit field, as before.
+  - A hand-edited level that the provider dialect cannot send now fails startup and `netclaw doctor`, and so does a level other than `off` on an Ollama provider with `DisableThinking`.
+- **Each model definition resolves its capabilities against its own provider.** Before, the capability chain used the Main provider's endpoint for every role.
+- **A fallback model no longer receives the request fields of a failed candidate.** Each failover candidate gets its own copy of the request options ([#2681](https://github.com/netclaw-dev/netclaw/issues/2681)).
+
+### Security
+
+- **An unreadable local configuration no longer leaves the CLI to guess a daemon address.** Before, a config that failed to load fell back to the default local daemon address, so a lifecycle command could send local control traffic to a destination that no configuration named. Now the CLI reports an unknown address before it creates the local control transport, and it skips the shutdown notice and the readiness probe. An explicit remote endpoint still takes precedence for a remote operation, and the existing process identity proof still governs a stop signal ([#2726](https://github.com/netclaw-dev/netclaw/pull/2726), fixes [#2476](https://github.com/netclaw-dev/netclaw/issues/2476)).
+- **A bounded glob that crosses a contained directory alias can use an existing grant.** Before, a directory alias anywhere in a bounded glob asked for exact consent, so an ordinary repository-listing command could not use a folder or repository grant that already covered it. Now the glob resolves each known alias target with the same filesystem authority rules, and the grant applies only when it covers the authored scope and every target scope. A walk that is incomplete, external, cyclic, broken, or uninspectable stays unresolved, so it still asks. The target check also compares the authored pattern and each target's remaining pattern against protected paths, so a protected path that a lexical check hid is now refused ([#2716](https://github.com/netclaw-dev/netclaw/pull/2716), [#2718](https://github.com/netclaw-dev/netclaw/pull/2718)).
+
+### Sessions
+
+- **The loop guard counts failed calls, not only repeated actions.** The guard keyed on the tool name and the arguments hash, so a model that rotated tools never repeated a key and a model that hit one error through several tools stayed invisible to it. Now a second axis counts failed calls and resets the count when a batch holds one success. The model receives a nudge that names the repeated cause and its fix, in the parent session and in a child run ([#2710](https://github.com/netclaw-dev/netclaw/pull/2710), fixes [#2706](https://github.com/netclaw-dev/netclaw/issues/2706)).
+
+### Configuration
+
+- **The daemon log rotates into bounded numbered segments.** `~/.netclaw/logs/daemon-{yyyy-MM-dd}.log` stops at 10 MiB, and the writer continues in `daemon-{yyyy-MM-dd}.1.log`, then `.2.log`, and further numbered files. A restart appends to the first segment below the threshold, and a new UTC date starts a new series. `netclaw doctor` and the eval tools read every segment. **Upgrade impact:** `Logs:Days` now prunes those numbered segments as well as the daily file and `crash-*.log`, judged by the date in the file name. The newest 3 daemon logs and the newest 3 crash logs are still always kept ([#2712](https://github.com/netclaw-dev/netclaw/pull/2712)).
+
+### CLI/TUI
+
+- **`netclaw daemon help` exits successfully.** `netclaw daemon help`, `--help`, and `-h` print the usage text and exit with code `0`, so a script that asks for help no longer reads it as a failure. An unknown subcommand still exits non-zero. Help does not control the daemon or change a service file ([#2709](https://github.com/netclaw-dev/netclaw/pull/2709)).
+- **`netclaw doctor --json` writes only JSON to stdout.** Before, a repair notice could join the JSON document and break a caller that parses stdout. The notice now goes to stderr ([#2711](https://github.com/netclaw-dev/netclaw/pull/2711)).
+
+### Bug Fixes
+
+- **A tool call that misspells a required key in another form resolves again.** A model that writes `rationale` or another variation instead of `_rationale` no longer fails the call. The argument resolver gains the entries that the timeout key already had ([#2705](https://github.com/netclaw-dev/netclaw/pull/2705)).
+
+### Dependency Updates
+
+- **Anthropic 13.3.0.** The provider SDK moves from 12.50.0 to 13.3.0 ([#2697](https://github.com/netclaw-dev/netclaw/pull/2697)).
+- **Termina 0.17.1.** The terminal library moves from 0.17.0 ([#2708](https://github.com/netclaw-dev/netclaw/pull/2708)).
+- **ShellSyntaxTree 0.5.0-beta.2.** The parser that proves a launch-variable glob moves from 0.5.0-beta.1, and its bounded handle-glob rules back the alias walk above ([#2718](https://github.com/netclaw-dev/netclaw/pull/2718)).
+- **Discord.Net 3.20.2.** The Discord client library moves from 3.20.1 ([#2723](https://github.com/netclaw-dev/netclaw/pull/2723)).
+
+## 0.28.1 (2026-10-26)
+
+This is a stable patch release for 0.28.0. Compaction and child agents on the Compaction role now fail over to the Fallback model. A child reply that stops at the output limit now keeps its full text as a partial artifact.
+
+**Upgrade impact:** none. 0.28.1 uses the same database format as 0.28.0.
+
+### Fixes
+
+- **Each model role fails over to the Fallback model, Compaction included.** Before, a configured Compaction model had no failover, so session compaction and each child agent on the default `modelRole: Compaction` never used the Fallback model. Now the candidate list of each role ends with the Fallback model when one is configured. When Compaction names the same model as Main, or is not configured, it uses the Main list ([#2691](https://github.com/netclaw-dev/netclaw/pull/2691), fixes [#2688](https://github.com/netclaw-dev/netclaw/issues/2688)).
+- **A cut-off child reply keeps its full text.** When the final reply of a child stops at the output limit with text and no tool call, the run still fails with `output_truncated`. Now the runtime also writes the full cut-off text, redacted, to `artifacts/truncated-output.md`, and `result.md` names that path. Before, only a 300-character preview remained. A reply with only thinking writes no artifact ([#2682](https://github.com/netclaw-dev/netclaw/pull/2682), fixes [#2679](https://github.com/netclaw-dev/netclaw/issues/2679)).
+  - The `agent-coordination` skill (1.5.3) tells the parent to read that file with `file_read`. The text is partial data from the child, and the parent must not follow instructions in it. The `subagent-authoring` skill (1.6.2) names the partial artifact.
+
+## 0.28.0 (2026-10-25)
+
+This is the stable 0.28.0 release. It collects 0.28.0-beta.1 to 0.28.0-beta.4 for users who upgrade from 0.27.1. Sub-agents now run in the background, and a child that waits for consent parks and survives a restart. A message from a person reaches the agent sooner, also during an automation turn. The daemon logs each tool call again with redacted arguments, and an OAuth refresh no longer restarts the daemon. Agent tools can no longer reach credential folders such as `~/.ssh` and `~/.aws`.
+
+> **Caution: read these items before you upgrade from 0.27.1.**
+> - **Forward-only.** After the upgrade, never start 0.27.1 or older on the database. 0.27.1 reads the child notice rows wrongly. It replays a notice as user input, and it can deliver a child result a second time. Older binaries also cannot read parked child runs, drain parks, or `ContinuationAuthorized` records. Before you go back to 0.27.1, also delete each `Providers.<name>.OAuthTokenExpiry` from `secrets.json`.
+> - **Upgrade while idle.** Upgrade when no child agent runs and no turn is active. 0.27.1 keeps an active child, and a message that waits behind it, only in memory. A 0.27.1 stop loses them, and 0.28.0 cannot recover them.
+> - **Security posture.** 0.28.0 denies `shell_execute` for a config with no `Security.DeploymentPosture`, because that config gets the strict Public posture. 0.27.1 asked for approval. `netclaw init` writes the key. For a hand-written or very old config, set `Security.DeploymentPosture` (for example `Personal`), and run `netclaw doctor` before you upgrade. Doctor reports "Security section missing" for such a config.
+> - **Restart reminder IDs.** A reminder import file that has a `restart-resume-` ID now fails. Remove those entries from the file.
+>
+> Use these steps to make the backup and to roll back:
+> 1. Before you upgrade, stop the daemon: `netclaw daemon stop`.
+> 2. Copy the database: `cp ~/.netclaw/netclaw.db ~/.netclaw/netclaw.db.bak.$(date +%s)`.
+> 3. To roll back, stop the daemon, restore that copy, and then start the older binary. A restore loses the journal records that the new release wrote after the backup.
+
+The beta sections below give each change in full detail.
+
+### Sub-agents
+
+- **A child runs in the background.** `spawn_agent` returns a run ID at once. When the child ends, the parent gets one notice in a later turn and reads `result.md` with `file_read` ([#2464](https://github.com/netclaw-dev/netclaw/pull/2464), [#2467](https://github.com/netclaw-dev/netclaw/pull/2467), [#2515](https://github.com/netclaw-dev/netclaw/pull/2515)).
+  - **Upgrade impact:** `netclaw chat -p` exits at the end of the first turn, so a headless caller does not see a child result that arrives later.
+- **A child that waits for consent parks.** The parent gets a notice and pauses. After the last answer, the child runs only the parked calls, each one time, and the gate checks each call again. The park is in the run record, so it survives a restart, a config reload, a compaction, and passivation ([#2583](https://github.com/netclaw-dev/netclaw/pull/2583), [#2618](https://github.com/netclaw-dev/netclaw/pull/2618), [#2670](https://github.com/netclaw-dev/netclaw/pull/2670)).
+- **A child that runs during a graceful restart parks and resumes after the restart.** A child that does not park in time ends as `owner_restarted`, and its tools do not run again ([#2604](https://github.com/netclaw-dev/netclaw/pull/2604), [#2672](https://github.com/netclaw-dev/netclaw/pull/2672)).
+  - **Upgrade impact:** a graceful restart with an active child can take up to about 18 seconds longer.
+- **Child prompts close cleanly.** Each channel redraws a prompt that nothing can answer, with no buttons and with the reason. A text answer does not resolve a child prompt ([#2584](https://github.com/netclaw-dev/netclaw/pull/2584), [#2676](https://github.com/netclaw-dev/netclaw/pull/2676)).
+  - **Upgrade impact:** a Mattermost binding with no `CallbackUrl` refuses child consent requests.
+- **Child control is clearer.** Status and cancel check only the requester. A reminder turn and an approval notice turn can manage the child runs of their own session. A notice turn handles only its notice ([#2504](https://github.com/netclaw-dev/netclaw/pull/2504), [#2550](https://github.com/netclaw-dev/netclaw/pull/2550), [#2617](https://github.com/netclaw-dev/netclaw/pull/2617), [#2657](https://github.com/netclaw-dev/netclaw/pull/2657)).
+- **Child failures are honest.** A cut-off child reply fails with `output_truncated`, and a call that streams only thinking past its cap fails with `thinking_only_timeout` ([#2502](https://github.com/netclaw-dev/netclaw/pull/2502)). The parent keeps a productive child ([#2666](https://github.com/netclaw-dev/netclaw/pull/2666)). The `spawn_agent` template includes `_rationale` ([#2606](https://github.com/netclaw-dev/netclaw/pull/2606)).
+- **Sub-agent profiles no longer set `timeoutSeconds`.** A profile that sets it still loads, with one warning. Each child now waits 600 seconds for a silent stream ([#2503](https://github.com/netclaw-dev/netclaw/pull/2503)).
+
+### Sessions
+
+- **A message from a person reaches the agent sooner.** A message joins the active turn of the same person. During a reminder, job, webhook, or approval-notice turn, a message from the operator or a trusted person ends that turn after its current tool batch. The model then gets a short stop note ([#2505](https://github.com/netclaw-dev/netclaw/pull/2505), [#2607](https://github.com/netclaw-dev/netclaw/pull/2607), [#2630](https://github.com/netclaw-dev/netclaw/pull/2630), [#2677](https://github.com/netclaw-dev/netclaw/pull/2677)).
+  - **Upgrade impact:** when a person interrupts a reminder turn, the reminder records success and does not run the rest of its steps.
+- **Restarts lose less work.** A restart drain stops a tool loop at a safe point and tells the user. A restart resumes a turn that stopped after its first tool batch. An expired restart reminder closes the stopped work with one notice ([#2608](https://github.com/netclaw-dev/netclaw/pull/2608), [#2651](https://github.com/netclaw-dev/netclaw/pull/2651), [#2676](https://github.com/netclaw-dev/netclaw/pull/2676)).
+- **Queued input runs correctly.** A slash command from the input queue runs as a command and gets one acknowledgement. A restart or a rejected slash command starts the inputs behind it. A damaged input no longer stops a restart resume ([#2592](https://github.com/netclaw-dev/netclaw/pull/2592), [#2613](https://github.com/netclaw-dev/netclaw/pull/2613), [#2615](https://github.com/netclaw-dev/netclaw/pull/2615), [#2663](https://github.com/netclaw-dev/netclaw/pull/2663)).
+- **A SQLite lock wait no longer stops a session.** The journal write timeout is now the SQLite `Default Timeout` plus 10 seconds. A failed save during a turn posts an error ([#2569](https://github.com/netclaw-dev/netclaw/pull/2569)).
+- **Repeated or cut-off model output is handled.** A repeated refused call gets a nudge, not a turn failure. A cut-off reply fails the turn ([#2466](https://github.com/netclaw-dev/netclaw/pull/2466), [#2502](https://github.com/netclaw-dev/netclaw/pull/2502), [#2553](https://github.com/netclaw-dev/netclaw/pull/2553)).
+  - **Upgrade impact:** `Session.MaxToolIterationsPerTurn` no longer limits a turn.
+- **After a person denies a call, the agent stops and asks** ([#2616](https://github.com/netclaw-dev/netclaw/pull/2616)).
+
+### Reminders
+
+- **Interval reminders shorter than 61 minutes run again.** A run with a denied tool is recorded as `denied` ([#2402](https://github.com/netclaw-dev/netclaw/pull/2402)).
+  - **Upgrade impact:** `netclaw reminder list` prints a table. Use `--json` for the old output.
+- **A one-shot reminder deletes itself after it ends.** Its history stays for 12 days ([#2533](https://github.com/netclaw-dev/netclaw/pull/2533)).
+- **A `current_session` reminder ends when the session admits the fire.** A failed reply post sends a `reminder.delivery.failed` alert ([#2511](https://github.com/netclaw-dev/netclaw/pull/2511), [#2537](https://github.com/netclaw-dev/netclaw/pull/2537)).
+- **Reminder sessions resume after a restart**, and a one-shot occurrence has a delivery window of 7 days ([#2491](https://github.com/netclaw-dev/netclaw/pull/2491), [#2438](https://github.com/netclaw-dev/netclaw/pull/2438)).
+- **Restart reminder IDs are reserved for the system** ([#2676](https://github.com/netclaw-dev/netclaw/pull/2676)).
+
+### Security
+
+- **Agent tools cannot reach credential locations,** such as `~/.ssh`, `~/.aws`, `~/.kube`, `~/.netrc`, and `~/.docker/config.json` ([#2405](https://github.com/netclaw-dev/netclaw/pull/2405)).
+- **The daemon checks `Host` and `Origin` on loopback requests** ([#2530](https://github.com/netclaw-dev/netclaw/pull/2530)).
+  - **Upgrade impact:** call the daemon as `http://127.0.0.1:<port>` or `http://localhost:<port>`. A browser app on another local port gets 401.
+- **Tool access follows the effective posture audience** for a turn and its sub-agents ([#2619](https://github.com/netclaw-dev/netclaw/pull/2619)).
+  - **Upgrade impact:** under a posture that is narrower than the source audience, a reminder from before the upgrade can have the Personal audience. `run_reminder` then refuses it. Create the reminder again from a chat.
+- **Provider OAuth token reads require a local-control proof** ([#2621](https://github.com/netclaw-dev/netclaw/pull/2621)).
+- **Approval override keys with no value are ignored** ([#2622](https://github.com/netclaw-dev/netclaw/pull/2622)).
+  - **Upgrade impact:** `netclaw doctor` reports a `ToolOverrides` or `McpServerDefaults` key with a colon as an error. Remove it by hand. The tool returns to the audience default, so it can ask for approval again.
+- **TUI commands no longer write a trace file** ([#2620](https://github.com/netclaw-dev/netclaw/pull/2620)).
+  - **Upgrade impact:** delete each old `netclaw-*-trace.log` file from the system temp folder.
+- **Personal file reads reach as far as Personal writes,** and the private temp folder is short ([#2559](https://github.com/netclaw-dev/netclaw/pull/2559)).
+- **Shell approval judges more commands correctly** ([#2372](https://github.com/netclaw-dev/netclaw/pull/2372), [#2373](https://github.com/netclaw-dev/netclaw/pull/2373), [#2374](https://github.com/netclaw-dev/netclaw/pull/2374), [#2377](https://github.com/netclaw-dev/netclaw/pull/2377), [#2378](https://github.com/netclaw-dev/netclaw/pull/2378), [#2379](https://github.com/netclaw-dev/netclaw/pull/2379), [#2380](https://github.com/netclaw-dev/netclaw/pull/2380), [#2381](https://github.com/netclaw-dev/netclaw/pull/2381), [#2382](https://github.com/netclaw-dev/netclaw/pull/2382), [#2563](https://github.com/netclaw-dev/netclaw/pull/2563), [#2665](https://github.com/netclaw-dev/netclaw/pull/2665)).
+- **The output redactor finds more secrets and runs in linear time** ([#2401](https://github.com/netclaw-dev/netclaw/pull/2401), [#2463](https://github.com/netclaw-dev/netclaw/pull/2463), [#2605](https://github.com/netclaw-dev/netclaw/pull/2605)).
+
+### Configuration
+
+- **The OAuth token expiry moves to `secrets.json`,** so a refresh no longer restarts the daemon ([#2529](https://github.com/netclaw-dev/netclaw/pull/2529)).
+  - **Upgrade impact:** run `netclaw doctor --fix` to move an old `OAuthTokenExpiry` key from `netclaw.json`.
+- **The daemon deletes old logs.** It deletes daemon and crash logs older than `Retention.Logs.Days` (default 14). Set the value in `netclaw config` or with `netclaw config retention` ([#2401](https://github.com/netclaw-dev/netclaw/pull/2401), [#2412](https://github.com/netclaw-dev/netclaw/pull/2412), [#2417](https://github.com/netclaw-dev/netclaw/pull/2417)).
+  - **Upgrade impact:** to keep all logs, set `Retention.Logs.Days` to `0` before you upgrade.
+- **Invalid model or provider configuration stops startup with one clear message,** and `netclaw doctor --fix` deletes less ([#2399](https://github.com/netclaw-dev/netclaw/pull/2399), [#2404](https://github.com/netclaw-dev/netclaw/pull/2404), [#2531](https://github.com/netclaw-dev/netclaw/pull/2531)).
+
+### Channels, tools, memory, and providers
+
+- **A channel keeps its output route until its session stops** ([#2429](https://github.com/netclaw-dev/netclaw/pull/2429)).
+- **A large tool result keeps its tail,** and the full text stays readable with `tool_output_read` ([#2414](https://github.com/netclaw-dev/netclaw/pull/2414), [#2425](https://github.com/netclaw-dev/netclaw/pull/2425), [#2430](https://github.com/netclaw-dev/netclaw/pull/2430)).
+- **`search_tools` ranks its results,** and the agent prefers a built-in tool to a `netclaw` CLI command ([#2385](https://github.com/netclaw-dev/netclaw/pull/2385)).
+- **Memory fixes.** `update_memory` writes a new embedding. A same-name rewrite no longer adds a duplicate. Recall reports a coverage gap only for documents. Curation uses the Main model ([#2395](https://github.com/netclaw-dev/netclaw/pull/2395), [#2431](https://github.com/netclaw-dev/netclaw/pull/2431), [#2664](https://github.com/netclaw-dev/netclaw/pull/2664), [#2669](https://github.com/netclaw-dev/netclaw/pull/2669)).
+- **Provider fixes.** Codex refreshes its token after an HTTP 401. A rejected OpenAI refresh sends the re-auth alert. Stream retry and failover work on Responses-based providers ([#2298](https://github.com/netclaw-dev/netclaw/pull/2298), [#2432](https://github.com/netclaw-dev/netclaw/pull/2432), [#2568](https://github.com/netclaw-dev/netclaw/pull/2568)).
+
+### Telemetry
+
+- **The tool call log line is back, with redaction,** and `session.log` redacts tool arguments too ([#2600](https://github.com/netclaw-dev/netclaw/pull/2600), [#2605](https://github.com/netclaw-dev/netclaw/pull/2605), [#2609](https://github.com/netclaw-dev/netclaw/pull/2609)).
+- **Expected outcomes no longer write an Error log.** A call that needs approval, a policy denial, and a correction request stay on the authorization log. A real tool failure still writes an Error entry ([#2649](https://github.com/netclaw-dev/netclaw/pull/2649), [#2683](https://github.com/netclaw-dev/netclaw/pull/2683)).
+
+### CLI/TUI
+
+- **`netclaw chat -p` exits 1 when the turn fails,** and `netclaw daemon status` exits 1 when the daemon does not run ([#2400](https://github.com/netclaw-dev/netclaw/pull/2400), [#2409](https://github.com/netclaw-dev/netclaw/pull/2409), [#2517](https://github.com/netclaw-dev/netclaw/pull/2517)).
+  - **Upgrade impact:** update scripts that read these exit codes.
+- **Chat input is confirmed after the daemon saves it,** and a message can be up to 512 KB ([#2426](https://github.com/netclaw-dev/netclaw/pull/2426), [#2487](https://github.com/netclaw-dev/netclaw/pull/2487), [#2668](https://github.com/netclaw-dev/netclaw/pull/2668)).
+  - **Upgrade impact:** update the CLI and the daemon together.
+- **MCP, provider, and model commands are safer.** They keep and clean up server state, check names and endpoints, and show the OAuth redirect URI. C clears the highlighted role in the model manager ([#2390](https://github.com/netclaw-dev/netclaw/pull/2390), [#2394](https://github.com/netclaw-dev/netclaw/pull/2394), [#2403](https://github.com/netclaw-dev/netclaw/pull/2403), [#2462](https://github.com/netclaw-dev/netclaw/pull/2462), [#2610](https://github.com/netclaw-dev/netclaw/pull/2610), [#2667](https://github.com/netclaw-dev/netclaw/pull/2667)).
+- **A bad `netclaw.json` gives one error line,** and messages name real commands ([#2391](https://github.com/netclaw-dev/netclaw/pull/2391), [#2459](https://github.com/netclaw-dev/netclaw/pull/2459)).
+
+### Daemon and install
+
+- **`netclaw daemon stop` stops only the daemon of its own home** ([#2544](https://github.com/netclaw-dev/netclaw/pull/2544)).
+- **Install scripts use `NETCLAW_HOME`,** and `daemon.env` keeps operator lines ([#2528](https://github.com/netclaw-dev/netclaw/pull/2528)).
+- **An update check timeout no longer stops the daemon** ([#2538](https://github.com/netclaw-dev/netclaw/pull/2538)).
+
+### Dependency Updates
+
+- **Bump ShellSyntaxTree** — 0.4.0-beta.22 → 0.5.0-beta.1 ([#2372](https://github.com/netclaw-dev/netclaw/pull/2372), [#2660](https://github.com/netclaw-dev/netclaw/pull/2660), [#2665](https://github.com/netclaw-dev/netclaw/pull/2665))
+- **Bump OpenTelemetry** — 1.19.1 → 1.20.1 ([#2518](https://github.com/netclaw-dev/netclaw/pull/2518), [#2577](https://github.com/netclaw-dev/netclaw/pull/2577))
+- **Bump ASP.NET Core packages** — 10.0.12 → 10.0.13 ([#2490](https://github.com/netclaw-dev/netclaw/pull/2490))
+- **Bump Termina** — 0.16.2 → 0.17.0 ([#2410](https://github.com/netclaw-dev/netclaw/pull/2410), [#2465](https://github.com/netclaw-dev/netclaw/pull/2465), [#2520](https://github.com/netclaw-dev/netclaw/pull/2520))
+- **Bump Aaron.Akka.Reminders** — 0.7.0 → 1.5.73.3 ([#2402](https://github.com/netclaw-dev/netclaw/pull/2402), [#2438](https://github.com/netclaw-dev/netclaw/pull/2438))
+- **Bump Aspire.Hosting.AppHost** — 13.5.4 → 13.6.3 ([#2579](https://github.com/netclaw-dev/netclaw/pull/2579))
+
+## 0.28.0-beta.4 (2026-10-25)
+
+Follow-up beta to 0.28.0-beta.3. A child that runs during a graceful restart now parks, and it resumes after the restart. An expired restart reminder closes the stopped work with one notice. When a person ends an automation turn, the model gets a short stop note.
+
+> **Caution: this release is forward-only.**
+> - 0.28.0-beta.3 cannot recover a session in which a child parked at a graceful restart (a park with no consent requests). The beta.3 replay rejects the park, or the resumed child fails.
+> - 0.28.0-beta.3 cannot recover a session that holds the new `ContinuationAuthorized` record until a snapshot replaces that record.
+> - If 0.28.0-beta.3 starts while a restart expiry signal waits, beta.3 treats the signal as a normal reminder fire and runs one automation turn.
+> - Never start 0.27.1 or older on a database that 0.28.0-beta.1 or newer wrote. 0.27.1 reads the child notice rows wrongly. It replays a notice as user input, and it can deliver a child result a second time.
+> - To roll back, you must have the backup from before this upgrade. To roll back to 0.27.1, you must have the backup from before the first 0.28 beta upgrade.
+>
+> Use these steps to make the backup and to roll back:
+> 1. Before you upgrade, stop the daemon: `netclaw daemon stop`.
+> 2. Copy the database: `cp ~/.netclaw/netclaw.db ~/.netclaw/netclaw.db.bak.$(date +%s)`.
+> 3. To roll back, stop the daemon, restore that copy, and then start the older binary. A restore loses the journal records that the new release wrote after the backup.
+
+### Sub-agents
+
+- **A child that runs during a graceful restart parks and resumes after the restart.** Before, a graceful restart ended each active child run as `owner_restarted`. Now the restart drain tells each live child to park. A child in a tool batch parks when the batch ends. A child that waits for a model reply cancels that call and parks at once. After the restart, the child resumes under the authority of the person who started it ([#2672](https://github.com/netclaw-dev/netclaw/pull/2672)).
+  - The session writes the park to the run record before the drain ends. The park uses the same record as a consent park, with no consent requests.
+  - A child that does not park in time ends as `owner_restarted`, and a tool that was still active never runs again. The session logs `Restart drain child_wait_ended live_children={N}`.
+  - When Netclaw refuses a drain park, the run ends as a restart loss: `owner_restarted`, with the changed files of the park, and "effects uncertain" ([#2672](https://github.com/netclaw-dev/netclaw/pull/2672), [#2676](https://github.com/netclaw-dev/netclaw/pull/2676)).
+  - A park that does not agree with its answers ends with `park_damaged` and an Error log.
+  - **Upgrade impact:** a graceful restart with an active child can take up to about 18 seconds longer. This change is forward-only. Read the caution at the top of this section.
+- **A late click after a failed resume gets the withdrawal reason.** Before, the click got "already answered" ([#2676](https://github.com/netclaw-dev/netclaw/pull/2676)).
+
+### Sessions
+
+- **An expired restart reminder closes the stopped work with one notice.** When a restart reminder expires before it runs, the daemon sends an expiry signal at startup. The session closes the held continuation, and a person input that the drain stopped at its first model call. It resumes nothing, and the person gets one short notice ([#2676](https://github.com/netclaw-dev/netclaw/pull/2676)).
+  - An expired continuation never cancels a durable child park.
+  - While a parent approval is open, the signal closes nothing and the session logs `restart_expired_skipped`. A second delivery of the signal closes nothing.
+  - A restart reminder must stay valid for 1 minute after its fire time. Otherwise startup sends the expiry signal.
+- **A held continuation runs only with a fresh restart reminder.** After the last consent answer, a held automation continuation runs only when a fresh restart reminder authorized it. Otherwise the continuation closes, and the person gets the restart notice one time. A new `ContinuationAuthorized` journal record keeps that authorization across passivation ([#2676](https://github.com/netclaw-dev/netclaw/pull/2676)).
+- **A continuation input has an explicit marker.** Thus Netclaw never reads an empty input from a person as a continuation ([#2676](https://github.com/netclaw-dev/netclaw/pull/2676)).
+- **The model gets a stop note when a person ends an automation turn.** The first turn of the person holds one fixed note: "The automated turn above stopped unfinished because a person sent a message. Answer the person's message first, and do not resume the stopped work in this reply unless the person asks for it." Later turns do not get the note ([#2677](https://github.com/netclaw-dev/netclaw/pull/2677)).
+- **A due compaction runs where a person ends an automation turn.** The compaction runs before the first model call of the person. After a compaction, the session also ends an automation turn when a person waits. A stop never closes an input that no model request carried ([#2677](https://github.com/netclaw-dev/netclaw/pull/2677)).
+
+### Reminders
+
+- **Restart reminder IDs are reserved for the system.** The reminder manager refuses a `restart-resume-` ID from any creator other than the system. `/api/reminders/import` refuses that prefix with HTTP 400 ([#2676](https://github.com/netclaw-dev/netclaw/pull/2676)).
+  - **Upgrade impact:** an import file that has a `restart-resume-` ID now fails. Remove those entries from the file.
+
+### Internal
+
+- Test reliability for the chat close expiry scenario, the notice order test, and the redactor time guard ([#2673](https://github.com/netclaw-dev/netclaw/pull/2673), [#2674](https://github.com/netclaw-dev/netclaw/pull/2674), [#2675](https://github.com/netclaw-dev/netclaw/pull/2675)).
+
+## 0.28.0-beta.3 (2026-10-24)
+
+Follow-up beta to 0.28.0-beta.2. A child that waits for operator consent now parks, and the park survives a daemon restart. A restart also resumes a turn that the restart drain stopped in a tool loop. Memory recall and memory curation get two fixes.
+
+> **Caution: this release is forward-only.**
+> - When this release writes a parked child run to a session journal, 0.28.0-beta.2 and older cannot recover that session. To roll back, you must have a backup from before this upgrade.
+> - Never start 0.27.1 or older on a database that 0.28.0-beta.1 or newer wrote. 0.27.1 reads the child notice rows wrongly. It replays a notice as user input, and it can deliver a child result a second time. To roll back to 0.27.1, you must have the backup from before the first 0.28 beta upgrade.
+>
+> Use these steps to make the backup and to roll back:
+> 1. Before you upgrade, stop the daemon: `netclaw daemon stop`.
+> 2. Copy the database: `cp ~/.netclaw/netclaw.db ~/.netclaw/netclaw.db.bak.$(date +%s)`.
+> 3. To roll back, stop the daemon, restore that copy, and then start the older binary. A restore loses the journal records that the new release wrote after the backup.
+
+### Sub-agents
+
+- **A child that waits for consent parks, and the park survives a restart.** When a child call needs operator consent, the child parks. The other calls of its batch end first. The session writes the park and its consent requests to the run record in one journal write. After the last answer, the child resumes and runs only the parked calls, each one time. The approval gate checks each parked call again under the current policy ([#2618](https://github.com/netclaw-dev/netclaw/pull/2618), [#2670](https://github.com/netclaw-dev/netclaw/pull/2670)).
+  - A parked run survives a daemon restart, a config reload, a compaction snapshot, and passivation. After a restart, one click resumes the parked calls one time.
+  - After a restart, the requester of a parked prompt comes from the run record. Netclaw refuses a click from another person.
+  - When the daemon stops after a resume starts, recovery records the run as lost. The parked calls do not run again.
+  - A park larger than 4 MiB ends the run with `park_too_large`, and no prompt appears. A damaged park ends the run with `park_damaged`.
+  - A cancel of a parked run ends the run at once.
+  - A resumed child does not keep the deferred tools that it loaded. The child can load them again.
+  - Before, a child waited live for consent, and a restart recorded the run as lost.
+  - **Upgrade impact:** this change is forward-only. Read the caution at the top of this section before you upgrade.
+- **A notice turn handles only its notice.** An approval notice turn cannot ask for approval. Each approval notice now ends with one rule: handle only this notice, tell the operator the next step, and end the turn. Before, the model could continue other work in the notice turn and get an `approval_required_unattended` denial ([#2657](https://github.com/netclaw-dev/netclaw/pull/2657)).
+- **The parent keeps a productive child.** The `agent-coordination` guidance now says that long child runs are normal, and that a status check sets no limit on rounds. The parent cancels a child only for an operator request, for wrong work, or for no progress ([#2666](https://github.com/netclaw-dev/netclaw/pull/2666)).
+
+### Sessions
+
+- **A restart resumes a turn that stopped after its first tool batch.** Before, the restart drain could stop a turn in a tool loop, and no restart reminder resumed that turn. Now the session records a continuation input for the stopped turn before the restart. After the restart, the turn continues from its stored history, with the authority of that turn ([#2651](https://github.com/netclaw-dev/netclaw/pull/2651)).
+  - A later input that arrives before the turn continues closes the continuation. That input runs in its own turn, and the session posts the restart notice one time.
+- **A slash command from the input queue gets one acknowledgement.** Before, the sender got a second acknowledgement when the queue drained ([#2663](https://github.com/netclaw-dev/netclaw/pull/2663)).
+
+### Security
+
+- **Shell approval reuses a proved grant and checks compound redirects.** A Bash assignment from the launch environment now uses its proved value in the grant check, so an equal grant no longer prompts again. A changed value, or a grant with no assignment qualification, gives no authority. PowerShell still needs the authored value. A supported compound redirect now gets its own file check. A one-time shell answer applies only to the exact command text, also for a call that recovery restarts ([#2665](https://github.com/netclaw-dev/netclaw/pull/2665)).
+
+### Memory
+
+- **A same-name memory rewrite no longer adds a duplicate.** Before, a rewrite of a memory with the same name could skip the model decision. Curation then added a duplicate document after the overwrite guard refused the rewrite. Now the decision waits until the model resolves it ([#2669](https://github.com/netclaw-dev/netclaw/pull/2669)).
+- **Recall reports a coverage gap only for documents.** Memory records have no embeddings by design. Recall no longer reports a vector coverage gap for them. The `netclaw-memory` skill explains the diagnostic correctly ([#2664](https://github.com/netclaw-dev/netclaw/pull/2664)).
+
+### CLI/TUI
+
+- **A cold chat start no longer blocks a second request.** The chat client now starts its runtime outside its lifetime lock. The two-second limit for quit also applies while the runtime starts ([#2668](https://github.com/netclaw-dev/netclaw/pull/2668)).
+- **C clears the highlighted role in the model manager.** Before, C did nothing until you selected a row with Enter or Space. Now C clears the role of the highlighted row, and the table shows the change. A role that is not set gets a message ([#2667](https://github.com/netclaw-dev/netclaw/pull/2667)).
+
+### Telemetry
+
+- **A tool call that needs approval no longer writes an Error log.** Before, the daemon wrote an Error entry with a stack trace in addition to the Information audit entry. Now only the Information entry remains. A real tool failure still writes an Error entry ([#2649](https://github.com/netclaw-dev/netclaw/pull/2649)).
+
+### Internal
+
+- `build.ps1` now writes `VersionPrefix` and `VersionSuffix` for a prerelease ([#2645](https://github.com/netclaw-dev/netclaw/pull/2645)).
+- Session outputs, tests, mutation gates, evals, and design text ([#2646](https://github.com/netclaw-dev/netclaw/pull/2646), [#2647](https://github.com/netclaw-dev/netclaw/pull/2647), [#2648](https://github.com/netclaw-dev/netclaw/pull/2648), [#2650](https://github.com/netclaw-dev/netclaw/pull/2650), [#2652](https://github.com/netclaw-dev/netclaw/pull/2652), [#2654](https://github.com/netclaw-dev/netclaw/pull/2654), [#2658](https://github.com/netclaw-dev/netclaw/pull/2658)).
+
+### Dependency Updates
+
+- **Bump ShellSyntaxTree** — 0.4.0-beta.24 → 0.4.0 ([#2660](https://github.com/netclaw-dev/netclaw/pull/2660)), then 0.5.0-beta.1 for the compound redirect facts ([#2665](https://github.com/netclaw-dev/netclaw/pull/2665))
+
+## 0.28.0-beta.2 (2026-10-23)
+
+Follow-up beta to 0.28.0-beta.1. A message from a person now ends an active automation turn, so the person no longer waits for a long reminder or job turn.
+
+### Sessions
+
+- **A message from a person ends an active automation turn.** A reminder, background-job result, webhook, or approval-notice turn is an automation turn. When the operator or a trusted person sends a message during such a turn, the turn ends after its current tool batch. The turn of the person then starts next, with the authority of that person. A message from an admitted `UntrustedExternal` person still waits until the automation turn ends ([#2630](https://github.com/netclaw-dev/netclaw/pull/2630)).
+  - The ended turn closes quietly and posts no fallback message. The daemon logs a Warning `turn_person_input_end_at_tool_batch`.
+  - Child runs that the ended turn started continue, and they report later.
+  - Before, the person waited until the whole automation turn ended.
+  - **Upgrade impact:** when a person interrupts a reminder turn, the reminder records success and does not run its remaining steps. If you need those steps, ask the agent to continue the work.
+
+### Internal
+
+- Tests for the automation turn rule, and a fix for legacy replay: a background-job close with no input IDs no longer takes a legacy child continuation ([#2631](https://github.com/netclaw-dev/netclaw/pull/2631)).
+
+### Dependency Updates
+
+- **Bump OpenTelemetry** — 1.20.0 → 1.20.1 ([#2577](https://github.com/netclaw-dev/netclaw/pull/2577))
+- **Bump Aspire.Hosting.AppHost** — 13.5.4 → 13.6.3 ([#2579](https://github.com/netclaw-dev/netclaw/pull/2579))
+
+## 0.28.0-beta.1 (2026-10-23)
+
+This is the first beta of 0.28.0. A sub-agent now runs in the background: `spawn_agent` returns a run ID at once, and the result arrives in a later turn. When a child asks for operator consent, the parent gets a notice and pauses until the prompt closes. The daemon logs each tool call again with redacted arguments, and `session.log` now redacts tool arguments too. An OAuth token refresh no longer writes `netclaw.json`, so it no longer restarts the daemon. Agent tools can no longer read or write credential folders such as `~/.ssh` and `~/.aws`.
+
+> **Downgrade note:** read these items before you go back to 0.27.1 or older.
+> - Delete each `Providers.<name>.OAuthTokenExpiry` from `secrets.json`. This release writes that value as plain text, and an older daemon cannot read it ([#2529](https://github.com/netclaw-dev/netclaw/pull/2529)).
+> - 0.27.1 cannot read a restart manifest that this release writes, because this release writes reminder enum names ([#2400](https://github.com/netclaw-dev/netclaw/pull/2400)).
+> - A 0.27.1 daemon deletes the retained records of completed one-shot reminders, as it did before ([#2402](https://github.com/netclaw-dev/netclaw/pull/2402)).
+
+### Configuration
+
+- **The OAuth token expiry moves to `secrets.json`.** Before, each OAuth access-token refresh wrote the new expiry to `netclaw.json`. The config watcher then restarted the daemon, which could stop work in progress. Now Netclaw writes `Providers.<name>.OAuthTokenExpiry` to `secrets.json`, next to the tokens. That one value is not encrypted, because the config binder cannot read an encrypted date. The refresh service also never sends a spent refresh token again ([#2529](https://github.com/netclaw-dev/netclaw/pull/2529)).
+  - **Upgrade impact:** an `OAuthTokenExpiry` key in `netclaw.json` is retired. It still applies until the first refresh, and the daemon logs a startup warning for it. Run `netclaw doctor --fix` to move the value to the provider entry in `secrets.json`. Doctor makes a backup before it removes the key. Doctor does not change a `netclaw.json` that has comments, so remove the key by hand in that case.
+  - If the daemon stops at startup with an error that names `Providers:<name>`, run `netclaw provider` and sign in again.
+  - `netclaw secrets set` now rejects an expiry that is not an ISO 8601 date.
+- **Invalid model or provider configuration stops startup with one clear message.** Before, a bad `Models` section or a provider with no credential or endpoint crashed the daemon with a stack trace (exit 134). Now the daemon exits 1 with one message. A daemon that runs refuses to reload an invalid file and keeps its current configuration ([#2404](https://github.com/netclaw-dev/netclaw/pull/2404)).
+  - **Upgrade impact:** a supervisor that restarts the daemon on failure shows the same message again. Fix the file, and the daemon starts.
+- **`netclaw doctor --fix` deletes less.** It never removes a key under `Models` or a credential. It backs up `netclaw.json` before it removes any other key ([#2404](https://github.com/netclaw-dev/netclaw/pull/2404)). Doctor also accepts the valid `Session` keys `MaxToolDescriptionChars`, `MaxToolSchemaWarnChars`, `MemoryDistillationTurnInterval`, and `Tuning.StreamingRetryPolicy`. Before, `--fix` deleted them with no backup ([#2399](https://github.com/netclaw-dev/netclaw/pull/2399)). Doctor now reads the `Tools` and `Security` sections without regard to letter case ([#2531](https://github.com/netclaw-dev/netclaw/pull/2531)).
+- **The daemon deletes old logs.** A new retention job deletes `daemon-*.log` and `crash-*.log` files older than `Retention.Logs.Days` (default 14). It runs shortly after start and then every 12 hours. It always keeps the newest three daemon logs and the newest three crash logs. The value `0` keeps all logs. Set the value on the new Data Retention page of `netclaw config`, or with `netclaw config retention --logs-days <days>` ([#2401](https://github.com/netclaw-dev/netclaw/pull/2401), [#2412](https://github.com/netclaw-dev/netclaw/pull/2412), [#2417](https://github.com/netclaw-dev/netclaw/pull/2417)).
+  - **Upgrade impact:** about 30 seconds after the first start, the daemon deletes daemon and crash logs older than 14 days. To keep them, set `Retention.Logs.Days` to `0` before you upgrade.
+- **`netclaw doctor` warns when a profile can write wider than it can read.** The warning names the audience profile and its two modes. It has no auto-fix ([#2559](https://github.com/netclaw-dev/netclaw/pull/2559)).
+
+### Sessions
+
+- **A message from a person reaches the active turn.** A child consent notice waits at the front of the input queue for its own turn. A new message from the same person now passes that notice and joins the active turn, as in 0.27.1. An earlier development build held such messages until the turn ended ([#2607](https://github.com/netclaw-dev/netclaw/pull/2607)).
+- **Each input runs under the authority of its own requester.** Inputs from different people no longer share one model call. Only the same requester can join an active turn, and the turn keeps its authority. An automated input, such as a reminder or a child result, no longer closes an open approval prompt. It waits and runs as its own turn ([#2505](https://github.com/netclaw-dev/netclaw/pull/2505)).
+- **A restart drain stops a tool loop and tells the user.** Before, a config restart did not stop a session in a tool loop. The drain timed out after 20 seconds, the turn stopped, and nothing told the user. Now the session stops the turn at the next safe point ([#2608](https://github.com/netclaw-dev/netclaw/pull/2608)):
+  - a tool batch boundary, a prepared model request, an empty-reply retry, or the end of a compaction;
+  - when the turn cannot resume, the session posts one notice in its channel. The notice says "stopping" for `netclaw daemon stop` and "restarting" for other reasons;
+  - the shutdown alert names each session that timed out in `timedOutSessionIds`.
+  - A tool that runs longer than the drain timeout still holds the drain.
+- **A restart or a rejected slash command starts the inputs behind it.** Before, a restart that resumed a slash command, or a slash command that the session rejected, could leave other inputs with no turn. For example, a reminder fire that waited behind an approval never ran after a mistyped slash command. Now those inputs run ([#2592](https://github.com/netclaw-dev/netclaw/pull/2592)).
+- **A SQLite lock wait no longer stops a session.** The journal and snapshot write timeout is now the SQLite `Default Timeout` plus 10 seconds (40 seconds by default). Before, it was 10 seconds. A slow disk write now only delays the turn. When a save fails during a turn, the session posts an error that says some actions may already have run. Before, the session stopped with no message ([#2569](https://github.com/netclaw-dev/netclaw/pull/2569)).
+  - **Upgrade impact:** a SQLite connection string with `Default Timeout` of 0 or less now stops the daemon at startup, because SQLite would wait forever.
+- **A repeated tool call gets a correction, not a turn failure.** After two equal rounds, Netclaw refuses the next identical call. Calls that do new work stay allowed. The model gets a nudge for refused repeats 1 to 4 and a stronger nudge for repeat 5. At repeat 6 the turn ends quietly with the text of the model. The person sees no Netclaw error ([#2466](https://github.com/netclaw-dev/netclaw/pull/2466), [#2553](https://github.com/netclaw-dev/netclaw/pull/2553)).
+  - **Upgrade impact:** `Session.MaxToolIterationsPerTurn` stays valid, but it no longer limits a turn. A turn that does new work in each round can now run past 60 rounds.
+- **A cut-off reply fails the turn.** When a reply stops at the output limit with no tool call, the session does not post the cut-off text. The turn ends with an error that says the reply was truncated. A model call that streams only thinking now stops after three times the no-progress timeout (60 minutes by default) ([#2502](https://github.com/netclaw-dev/netclaw/pull/2502)).
+- **Provider streams retry and fail over more often.** A stream attempt now starts at its first real output, not at its first metadata update. Thus retry and failover to the fallback model work again on Responses-based providers, Codex included ([#2298](https://github.com/netclaw-dev/netclaw/pull/2298)).
+
+- **A slash command in the input queue runs as a command.** Before, a slash command that waited behind a turn or an approval reached the model as plain text. Now the session runs it on the live command path, with the same checks ([#2613](https://github.com/netclaw-dev/netclaw/pull/2613), fixes [#2591](https://github.com/netclaw-dev/netclaw/issues/2591)).
+- **A damaged input no longer stops a restart resume.** When a stored input has damaged authority, the session logs it, keeps it, and queues the valid inputs. Before, a damaged input could stop the resume halfway with an error ([#2615](https://github.com/netclaw-dev/netclaw/pull/2615), fixes [#2576](https://github.com/netclaw-dev/netclaw/issues/2576)).
+
+### Sub-agents
+
+- **A child runs in the background.** `spawn_agent` records the run and returns its run ID at once, so the parent stays available. When the child ends, the runtime writes `result.md` in the run folder. The parent then gets one notice in a later turn and reads the result with `file_read`. A notice runs under the authority of the person who started the child ([#2464](https://github.com/netclaw-dev/netclaw/pull/2464), [#2467](https://github.com/netclaw-dev/netclaw/pull/2467), [#2515](https://github.com/netclaw-dev/netclaw/pull/2515)).
+  - **Upgrade impact:** `netclaw chat -p` exits at the end of the first turn. A headless caller does not see a child result that arrives in a later turn. The follow-up turn still runs in the daemon.
+- **The parent gets a notice and pauses while a child waits for consent.** When a child asks for operator consent, the parent gets one notice turn. The notice lists the open child requests and the answers since the last notice. While a child request is open, the session holds reminder fires and refuses `spawn_agent`. The parent can finish its turn, and prompts from other children still post ([#2583](https://github.com/netclaw-dev/netclaw/pull/2583)).
+  - **Upgrade impact:** an open child approval now holds reminder fires for that session until the prompt closes.
+- **Netclaw withdraws a child prompt that nothing can answer.** Slack, Discord, Mattermost, the TUI, and headless redraw the prompt with no buttons and show the reason. A prompt closes when the parent cancels the child, the child ends or is lost, the prompt post fails, or the daemon restarts. An answered prompt shows "This approval request has an answer." While a child prompt is open, a text answer resolves nothing, and the channel asks for a button ([#2584](https://github.com/netclaw-dev/netclaw/pull/2584)).
+  - **Upgrade impact:** a Mattermost binding with no `CallbackUrl` (text only) now refuses child consent requests. Set the callback URL to approve child requests in Mattermost.
+- **`owner_restarted` names a child that a restart lost.** Before, recovery recorded such a run as `actor_stopped`, and the log said `success=True`. Now the reason is `owner_restarted`. The notice says that the parent session restarted and that the runtime does not start the child again. When the run had a checkpoint, the notice also says that effects after the checkpoint are uncertain. A lost run is never a success ([#2604](https://github.com/netclaw-dev/netclaw/pull/2604)).
+- **The `spawn_agent` call template includes `_rationale`.** The template in the system prompt had no `_rationale`, so the model copied it, and the first `spawn_agent` call of a session often failed. Now the template ends with `_rationale` ([#2606](https://github.com/netclaw-dev/netclaw/pull/2606)).
+- **Child status and cancel check only the requester.** The owner of a child no longer loses access to it in a later turn. A reminder turn can check and cancel the child runs of its own session. Any other turn of the same session can manage a child that a reminder started ([#2504](https://github.com/netclaw-dev/netclaw/pull/2504), [#2550](https://github.com/netclaw-dev/netclaw/pull/2550)).
+- **A second approval answer is not called "expired".** An answer to a prompt that already has an answer grants nothing. The session posts "Approval response ignored: that approval prompt already has an answer." ([#2504](https://github.com/netclaw-dev/netclaw/pull/2504)).
+- **An approval notice turn can cancel a child run of its session.** Before, a notice turn that called `check_agent_run` with `Cancel: true` for its own child got "This child run is not available to the requester." Now a notice turn can read the status of a child run of its session and cancel it. The notice turn gets no other authority, and a tool that needs consent is still denied with no prompt ([#2617](https://github.com/netclaw-dev/netclaw/pull/2617)).
+- **A cut-off child reply fails the run.** A child reply that stops at the output limit with no tool call now fails with reason `output_truncated`. A child call that streams only thinking past the cap fails with `thinking_only_timeout` ([#2502](https://github.com/netclaw-dev/netclaw/pull/2502)).
+- **Sub-agent profiles no longer set `timeoutSeconds`.** Each child now detects a silent stream after the session `FirstTokenTimeout` (default 600 seconds). When the loader rejects a profile file, `spawn_agent` names the file and the reason ([#2503](https://github.com/netclaw-dev/netclaw/pull/2503)).
+  - **Upgrade impact:** a profile that sets `timeoutSeconds` still loads, and the daemon logs one warning for each reload. A profile that used 60 to 180 seconds now waits 600 seconds for a silent stream.
+- **Recovery logs a closed child approval once.** Replay no longer writes `Tool approval requested` again for a child approval that a later record closed ([#2552](https://github.com/netclaw-dev/netclaw/pull/2552)).
+
+- **Replay clears a noticed child run at a turn of another requester.** A notice turn that fails or crashes leaves no end record in the journal. Before, replay kept the noticed run, and a later turn of another person recorded the reminder link of that run. This affected delivery records only, not authority ([#2614](https://github.com/netclaw-dev/netclaw/pull/2614), fixes [#2574](https://github.com/netclaw-dev/netclaw/issues/2574)).
+
+### Reminders
+
+- **Interval reminders shorter than 61 minutes run again.** Since 0.26.0, the scheduler skipped them on each fire. After downtime, a reminder gets at most one catch-up fire. An expired retry of a recurring reminder counts as one failure, and only five failures in a row disable the reminder ([#2402](https://github.com/netclaw-dev/netclaw/pull/2402)).
+- **A one-shot reminder deletes itself after it ends.** Netclaw keeps a small end record and the history for 12 days. Thus `netclaw reminder status`, `netclaw reminder history`, and `get_reminder_history` still work in that period. `cancel_reminder` and `netclaw reminder cancel` delete a one-shot. A recurring reminder is still disabled and kept. Startup cleans up leftover one-shots, so the upgrade needs no operator step ([#2533](https://github.com/netclaw-dev/netclaw/pull/2533)).
+- **A run with a denied tool is recorded as `denied`.** An unattended run in which authorization denied a tool call is no longer recorded as `ok`. Netclaw does not retry it and does not count it toward auto-disable. Netclaw sends at most one `reminder.tool_denied` alert for each distinct denial ([#2402](https://github.com/netclaw-dev/netclaw/pull/2402)).
+- **A `current_session` reminder ends when the session admits the fire.** The reminder system no longer waits for the post. While an earlier fire of the same reminder waits in the queue, the session drops the newer fire ([#2511](https://github.com/netclaw-dev/netclaw/pull/2511)).
+  - **Upgrade impact:** the reminder system no longer retries a failed post of a `current_session` reminder. When the reply post fails for good, the session writes an Error log and sends a `reminder.delivery.failed` alert ([#2537](https://github.com/netclaw-dev/netclaw/pull/2537)).
+- **A reminder session resumes after a restart.** A reminder can enter its own session again after a daemon restart, and the session resumes the interrupted input ([#2491](https://github.com/netclaw-dev/netclaw/pull/2491)).
+- **A one-shot occurrence has a delivery window of 7 days.** Before, an occurrence that nothing acknowledged replayed with no end. A daemon that is offline still delivers a reminder up to a week late ([#2438](https://github.com/netclaw-dev/netclaw/pull/2438)).
+- **`set_reminder` accepts more model output.** `DeliveryKind` is now a required parameter. The tool ignores blank optional fields, so a `current_session` call with empty channel fields succeeds ([#2458](https://github.com/netclaw-dev/netclaw/pull/2458)).
+- **Reminder import and time zones.** `netclaw reminder import` reads what `export` writes. Netclaw validates time zones as IANA IDs. `/run-reminder` and skill bodies reach the model ([#2400](https://github.com/netclaw-dev/netclaw/pull/2400)).
+
+### Security
+
+- **Agent tools cannot reach credential locations.** File tools and shell commands are now denied on `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.azure`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker/config.json`, `~/.netrc`, and `~/.git-credentials`. On Windows, the deny also covers the `gcloud`, `GitHub CLI`, and `gnupg` folders under `%APPDATA%`, and `%PROGRAMDATA%\ssh`. No approval, `ToolOverrides` entry, or audience profile can override this deny ([#2405](https://github.com/netclaw-dev/netclaw/pull/2405)).
+  - **Upgrade impact:** commands such as `cat ~/.ssh/id_ed25519`, `ls ~/.aws`, `ssh -i ...`, and `docker run -v $HOME/.aws:...` are now denied. Commands that name no credential path still work, for example `ssh host`, `git push`, `aws s3 ls`, and `kubectl get pods`. To change these files, edit them in your own shell.
+- **The daemon checks `Host` and `Origin` on loopback requests.** In `Local` exposure mode, the `Host` must be `localhost` or a loopback IP address, such as `127.0.0.1` or `[::1]`. An `Origin` header, when present, must be `http://` plus the same `Host` ([#2530](https://github.com/netclaw-dev/netclaw/pull/2530)).
+  - **Upgrade impact:** a client that calls the daemon through another host name now gets 401. A browser app on another local port, for example `http://localhost:3000`, also gets 401. Call the daemon as `http://127.0.0.1:<port>` or `http://localhost:<port>`. For a web app, make the call from its server process, or pair the app with `netclaw daemon pair` and send the device token.
+- **Personal file reads reach as far as Personal writes.** For the Personal audience, `file_read`, `file_list`, `file_search`, and `attach_file` now reach at least as far as the write profile. Thus the agent can read the files that its shell writes, for example in `/tmp`. Protected paths stay denied. Team and Public do not change ([#2559](https://github.com/netclaw-dev/netclaw/pull/2559)).
+  - **Upgrade impact:** a host with Personal `ReadFiles.Mode = Roots` and a wider `WriteFiles` gets wider Personal reads. Unattended Personal runs, such as reminders and webhooks, get the same reach with no prompt. Run `netclaw doctor` to see the profiles.
+- **The private temp folder is short.** On Linux and macOS, the temp folder of a run is now `/tmp/netclaw-<uid>/<key>/p` (or `c<id>` for a child). Netclaw creates it with mode 0700 and refuses a shell launch when the owner, mode, or a link is wrong. A short path keeps Unix socket paths, such as the Chrome socket, under their length limit. Windows does not change ([#2559](https://github.com/netclaw-dev/netclaw/pull/2559)).
+- **A repository grant composes with the session scratch folder.** A command that a repository grant covers no longer prompts again when it redirects output to the session scratch folder. Netclaw checks the command and the file write separately. A `Once` answer covers the command and each file operation ([#2563](https://github.com/netclaw-dev/netclaw/pull/2563)).
+- **Shell approval judges more commands correctly.**
+  - A loop or brace list with a finite set of values is judged as each literal command it runs ([#2372](https://github.com/netclaw-dev/netclaw/pull/2372), [#2373](https://github.com/netclaw-dev/netclaw/pull/2373)).
+  - A Bash assignment that no program reads no longer forces an exact prompt for each later command ([#2374](https://github.com/netclaw-dev/netclaw/pull/2374)).
+  - A command that runs no program, such as `> result.log` or `echo hi > file`, gets the file-tool decision for its redirect, not a shell prompt ([#2377](https://github.com/netclaw-dev/netclaw/pull/2377)).
+  - A heredoc with a quoted delimiter, such as `python3 - <<'EOF'`, is data on stdin. A grant can now cover the command ([#2381](https://github.com/netclaw-dev/netclaw/pull/2381)).
+  - An option value outside the folder, such as `--output=../x`, and a link to a target outside the folder now need a grant that covers that location ([#2378](https://github.com/netclaw-dev/netclaw/pull/2378), [#2380](https://github.com/netclaw-dev/netclaw/pull/2380)).
+  - The agent gets a correction only when it can follow it. A word with a run-time value gets a one-time prompt instead ([#2379](https://github.com/netclaw-dev/netclaw/pull/2379)).
+  - The prompt and the "Saved" line show the same grant words that Netclaw saves ([#2382](https://github.com/netclaw-dev/netclaw/pull/2382)).
+- **The output redactor finds more secrets and runs in linear time.** It now masks known token formats, prefixed secret variable names, URL credentials, option values such as `--password hunter2`, API-key, Basic, Cookie, and Proxy-Authorization headers, and HAR or Postman name and value pairs. A long or repetitive tool output no longer slows the redactor ([#2401](https://github.com/netclaw-dev/netclaw/pull/2401), [#2463](https://github.com/netclaw-dev/netclaw/pull/2463), [#2605](https://github.com/netclaw-dev/netclaw/pull/2605)).
+- **Tool access follows the effective posture audience.** Tool access for a turn and its sub-agents now follows the effective audience of the deployment posture ([#2619](https://github.com/netclaw-dev/netclaw/pull/2619)).
+  - **Upgrade impact:** a posture can be narrower than the source audience, for example a Team posture with Slack direct messages. In that case, a reminder that someone created before the upgrade has the Personal audience. After the upgrade, `run_reminder` refuses that reminder, and a chat with the narrower audience does not show it. Create the reminder again from a chat after the upgrade.
+- **Approval override keys with no value are ignored.** Netclaw now ignores a `ToolOverrides` or `McpServerDefaults` key that has a colon, such as `file_write:control-plane`, and keeps the audience default. The daemon logs a startup warning for each ignored key. Override keys now match tool names without regard to letter case. When two keys differ only in case, the more restrictive mode applies ([#2622](https://github.com/netclaw-dev/netclaw/pull/2622)).
+  - **Upgrade impact:** `netclaw doctor` reports a key with a colon as an error and names the valid forms: `tool_name`, `server/tool`, and `server__tool`. `netclaw doctor --fix` does not change these keys, so remove them by hand. A tool that such a key changed returns to the audience default, so it can ask for approval again.
+- **TUI commands no longer write a trace file.** Before, the TUI commands wrote `netclaw-<mode>-trace.log` to the system temp folder. Now no command writes this file ([#2620](https://github.com/netclaw-dev/netclaw/pull/2620)).
+  - **Upgrade impact:** files from older releases stay on disk. Delete each `netclaw-*-trace.log` file from the system temp folder.
+- **Provider OAuth token reads require a local-control proof.** The provider OAuth status endpoint no longer returns tokens. The CLI reads the tokens from a new local-control endpoint, and only with a local-control proof. The provider manager also shows the browser OAuth progress, the authorization URL, and errors ([#2621](https://github.com/netclaw-dev/netclaw/pull/2621)).
+  - **Upgrade impact:** use the same version for the CLI and the daemon. A new CLI with an older daemon shows an upgrade message during a provider OAuth sign-in.
+
+### Channels
+
+- **A channel keeps its output route until its session stops.** Before, a channel binding could stop before its session, and the session lost its output route. Now a binding stays until the session passivates, then sends its last output and stops. Mattermost stops its typing indicator before that drain ([#2429](https://github.com/netclaw-dev/netclaw/pull/2429)).
+- **Closed child prompts redraw in each channel.** See Sub-agents ([#2584](https://github.com/netclaw-dev/netclaw/pull/2584)).
+
+### Tools
+
+- **A large tool result keeps its tail.** When a tool result is longer than the inline limit (`Session.Tuning.MaxInlineToolResultChars`, default 12,000 characters), the model now gets the last part, not the first and last parts. Command output, logs, and stack traces put the useful text at the end. `tool_output_read` still reads the rest ([#2425](https://github.com/netclaw-dev/netclaw/pull/2425)).
+- **A large tool result is always kept.** Before, a session with no workspace folder lost the full text, and the model could not read the middle. Now Netclaw creates the folder, and refuses a link at the folder or its parent ([#2414](https://github.com/netclaw-dev/netclaw/pull/2414), [#2430](https://github.com/netclaw-dev/netclaw/pull/2430)).
+- **`search_tools` ranks its results.** Results with the most query words come first, so a built-in tool such as `list_reminders` is found. The agent guidance now prefers a built-in tool to a `netclaw` CLI command that needs a shell approval ([#2385](https://github.com/netclaw-dev/netclaw/pull/2385)).
+- **`update_memory` keeps a memory in semantic recall.** An edit now writes a new embedding. `netclaw memory backfill-embeddings` does nothing when `Memory.Embeddings.Enabled` is false ([#2395](https://github.com/netclaw-dev/netclaw/pull/2395)). The `netclaw-memory` skill states the correct default and log event names ([#2419](https://github.com/netclaw-dev/netclaw/pull/2419)).
+- **Memory curation uses the Main model.** Before, curation used the Compaction model ([#2431](https://github.com/netclaw-dev/netclaw/pull/2431)).
+  - **Upgrade impact:** a deployment with a separate Compaction model now sends curation requests to the Main model. A deployment with no Compaction model does not change.
+- **The content scanner accepts `.potx` PowerPoint templates** ([#2196](https://github.com/netclaw-dev/netclaw/pull/2196)).
+
+- **After a person denies a call, the agent stops and asks.** Before, a denial forbade only a retry, so the agent could reach the same goal with another tool. Now the denial text and the agent guidance tell the agent not to reach that goal another way. The agent says what it wanted to do and asks how to continue. Timeout, policy, and unattended denials keep their text ([#2616](https://github.com/netclaw-dev/netclaw/pull/2616)).
+
+### Providers
+
+- **Codex refreshes its token after an HTTP 401.** When ChatGPT rotates an access token early, Netclaw refreshes the token and sends the request one more time ([#2432](https://github.com/netclaw-dev/netclaw/pull/2432)).
+- **A rejected OpenAI refresh sends the re-auth alert.** Netclaw now reads the error object that auth.openai.com sends, so a dead login raises the `ProviderAuthExpired` alert. A transient failure gets one retry ([#2568](https://github.com/netclaw-dev/netclaw/pull/2568)).
+- **OpenAI-compatible endpoints work with or without `/v1`** ([#2400](https://github.com/netclaw-dev/netclaw/pull/2400)).
+
+### Telemetry
+
+- **The tool call log line is back, with redaction.** 0.27.0 removed the Info line for each tool call, and the 0.27.0 notes did not say so. The line returns in the parent session and in sub-agents, with the 0.26.0 template and field names ([#2600](https://github.com/netclaw-dev/netclaw/pull/2600)):
+
+  ```
+  Invoking tool [{ToolName}] (call={CallId}) args={Args} rationale={Rationale} authorizationAttemptId={AuthorizationAttemptId} sessionId={SessionId}
+  ```
+
+  - The redactor masks secrets in the arguments at each depth, and in key names ([#2605](https://github.com/netclaw-dev/netclaw/pull/2605)).
+  - A string longer than 256 characters becomes a length and a hash. A string that contained a secret becomes `<N chars, redacted>`.
+  - The line is capped at 4,096 characters, and the rationale at 500 characters. The line never makes a tool call fail.
+  - **Upgrade impact:** the exported logs now hold one more Info line for each tool call.
+- **`session.log` redacts tool arguments.** Before, `session.log` wrote tool call arguments in clear text, cut at 1,000 characters. Now it uses the same redaction, hash, and cap as the log line above. Text that is not a JSON object becomes `<arguments unavailable>` ([#2609](https://github.com/netclaw-dev/netclaw/pull/2609)).
+  - **Upgrade impact:** `session.log` no longer holds full long argument values. A long file body appears as its length and hash.
+- **OTLP over HTTP/protobuf posts to the signal paths** ([#2400](https://github.com/netclaw-dev/netclaw/pull/2400)).
+- **Skill load log lines include the session ID:** `turn_skill_loaded skill=X method=Y session=Z` ([#2512](https://github.com/netclaw-dev/netclaw/pull/2512)).
+
+### CLI/TUI
+
+- **`netclaw chat -p` exits 1 when the turn fails.** A provider error, a timeout, or another failed turn now gives exit code 1. A failed turn also writes one `[turn:failed] category=<model|infra> kind=<Kind>` line on stderr. With `--json`, the envelope adds `errorCategory` and `errorKind` ([#2409](https://github.com/netclaw-dev/netclaw/pull/2409), [#2517](https://github.com/netclaw-dev/netclaw/pull/2517)).
+  - **Upgrade impact:** a script that ran `netclaw chat -p` and ignored the exit code can now stop on a failed turn. A tool call that headless mode denies still ends with exit code 0 when the model finishes.
+- **`netclaw daemon status` exits 1 when the daemon does not run or is not ready.** Before, it exited 0 ([#2400](https://github.com/netclaw-dev/netclaw/pull/2400)).
+  - **Upgrade impact:** update scripts that read this exit code.
+- **Chat input is confirmed after the daemon saves it.** Before, Enter and then Ctrl+Q could exit before the daemon kept the text. Now the daemon confirms the text after it records it, and that work continues after the client disconnects. On quit, the CLI reports input that it could not send or confirm ([#2426](https://github.com/netclaw-dev/netclaw/pull/2426)).
+  - **Upgrade impact:** update the CLI and the daemon together. The chat client needs the text-admission protocol of this release.
+- **Chat messages can be up to 512 KB.** Before, a message over 32 KB closed the connection and showed "Message unconfirmed". Now the limit is 512 KB, and the CLI refuses a larger message with its size ([#2487](https://github.com/netclaw-dev/netclaw/pull/2487)).
+- **The chat view shows each parallel tool call.** Each call has its own line, and a tool line stays on one row. A preview no longer breaks a character or an escape code ([#2461](https://github.com/netclaw-dev/netclaw/pull/2461), [#2411](https://github.com/netclaw-dev/netclaw/pull/2411)). A very long paste no longer stops input, and Ctrl+Q exits fast with a large transcript ([#2465](https://github.com/netclaw-dev/netclaw/pull/2465), [#2520](https://github.com/netclaw-dev/netclaw/pull/2520)).
+- **A bad `netclaw.json` gives one error line.** When `netclaw.json` or `secrets.json` cannot be read, a CLI command prints `Couldn't read <file>: <reason>` and exits 1. Before, it crashed with exit 134 and a crash log ([#2459](https://github.com/netclaw-dev/netclaw/pull/2459)).
+- **MCP commands keep and clean up server state.** `netclaw mcp add` on a known name keeps the audience grants, defaults, and enabled state. `netclaw mcp remove` also removes the OAuth tokens, grants, and saved approvals of that server ([#2394](https://github.com/netclaw-dev/netclaw/pull/2394)). The permissions screen asks before it grants all tools, and `--grant` adds the server to the audience ([#2403](https://github.com/netclaw-dev/netclaw/pull/2403)). `netclaw mcp auth` prints the OAuth redirect URI to register with the provider ([#2610](https://github.com/netclaw-dev/netclaw/pull/2610)).
+- **Names and endpoints are checked.** MCP and provider names now resolve without regard to letter case, so a second key that differs only in case is not written. `provider add` rejects an endpoint with no scheme. `model list` shows what the daemon uses ([#2462](https://github.com/netclaw-dev/netclaw/pull/2462)). `provider remove`, the `netclaw config` dashboard, and the init wizard read model roles in the current `Models.Definitions` and `Models.Roles` shape ([#2390](https://github.com/netclaw-dev/netclaw/pull/2390)).
+- **`netclaw approvals trust-verb` refuses a grant that can never match.** For a non-shell tool, the command prints the form that works and writes nothing ([#2392](https://github.com/netclaw-dev/netclaw/pull/2392)).
+- **Messages name real commands.** CLI, TUI, doctor, and alert text no longer name commands that do not exist, and no longer tell you to restart the daemon after a config change ([#2391](https://github.com/netclaw-dev/netclaw/pull/2391)).
+- **Identity setup.** `netclaw chat --onboarding` starts the identity interview ([#2401](https://github.com/netclaw-dev/netclaw/pull/2401)). After Redo identity setup, Enter starts the guided identity chat ([#2384](https://github.com/netclaw-dev/netclaw/pull/2384)). A new beta install with only a channel seed opens the first-run wizard ([#2192](https://github.com/netclaw-dev/netclaw/pull/2192)).
+- **TUI fixes.** The Exposure Mode page keeps unrelated config when it saves ([#2531](https://github.com/netclaw-dev/netclaw/pull/2531)). A pre-filled input puts the cursor at the end, and Provider Manager and Model Manager fit their columns to the terminal ([#2400](https://github.com/netclaw-dev/netclaw/pull/2400), [#2410](https://github.com/netclaw-dev/netclaw/pull/2410)). On Windows, tables and stats use the locale of the user ([#2400](https://github.com/netclaw-dev/netclaw/pull/2400)).
+
+### Daemon and install
+
+- **`netclaw daemon stop` stops only the daemon of its own home.** The CLI sends no signal until it proves that the PID serves this home. The daemon answers 409 to a stop notice for another home ([#2544](https://github.com/netclaw-dev/netclaw/pull/2544)).
+  - **Upgrade impact:** on macOS and Windows, the CLI cannot prove the home of a daemon that does not answer, or of a 0.27.1 daemon during `netclaw update`. `netclaw daemon stop` then refuses and prints the `kill <pid>` command to use. Linux reads the proof from `/proc`.
+- **Install scripts use `NETCLAW_HOME`.** `install.sh` and `install.ps1` put the config in `<NETCLAW_HOME>/config`. `netclaw daemon install` and `netclaw doctor --fix` now keep the operator lines in `daemon.env` and change only `PATH` ([#2528](https://github.com/netclaw-dev/netclaw/pull/2528)).
+- **systemd and Docker.** `daemon stop` and `daemon start` go through the systemd unit that owns the daemon. The Docker health check follows `Daemon.Port`. `daemon pair` prints a command that you can use ([#2400](https://github.com/netclaw-dev/netclaw/pull/2400)).
+- **An update check timeout no longer stops the daemon.** Before, a network timeout in the update check stopped the daemon 10 seconds after start. `netclaw update --check` no longer crashes on a timeout ([#2538](https://github.com/netclaw-dev/netclaw/pull/2538)).
+- **Session folders follow a moved home.** When the data directory moves, Netclaw finds session folders under the new path and logs one warning ([#2401](https://github.com/netclaw-dev/netclaw/pull/2401)).
+
+### Fixes
+
+- The headless channel closes its session log before it stops ([#2611](https://github.com/netclaw-dev/netclaw/pull/2611)).
+
+### Internal
+
+- The session actor moves its tool, model context, task lifetime, restart, and input rules into separate owners, with no behavior change ([#2439](https://github.com/netclaw-dev/netclaw/pull/2439), [#2441](https://github.com/netclaw-dev/netclaw/pull/2441), [#2442](https://github.com/netclaw-dev/netclaw/pull/2442), [#2443](https://github.com/netclaw-dev/netclaw/pull/2443), [#2445](https://github.com/netclaw-dev/netclaw/pull/2445), [#2446](https://github.com/netclaw-dev/netclaw/pull/2446), [#2449](https://github.com/netclaw-dev/netclaw/pull/2449), [#2451](https://github.com/netclaw-dev/netclaw/pull/2451), [#2454](https://github.com/netclaw-dev/netclaw/pull/2454), [#2455](https://github.com/netclaw-dev/netclaw/pull/2455), [#2598](https://github.com/netclaw-dev/netclaw/pull/2598)).
+- Specs, evals, mutation gates, CI, and test reliability work ([#2371](https://github.com/netclaw-dev/netclaw/pull/2371), [#2376](https://github.com/netclaw-dev/netclaw/pull/2376), [#2398](https://github.com/netclaw-dev/netclaw/pull/2398), [#2408](https://github.com/netclaw-dev/netclaw/pull/2408), [#2415](https://github.com/netclaw-dev/netclaw/pull/2415), [#2427](https://github.com/netclaw-dev/netclaw/pull/2427), [#2433](https://github.com/netclaw-dev/netclaw/pull/2433), [#2434](https://github.com/netclaw-dev/netclaw/pull/2434), [#2435](https://github.com/netclaw-dev/netclaw/pull/2435), [#2436](https://github.com/netclaw-dev/netclaw/pull/2436), [#2437](https://github.com/netclaw-dev/netclaw/pull/2437), [#2447](https://github.com/netclaw-dev/netclaw/pull/2447), [#2448](https://github.com/netclaw-dev/netclaw/pull/2448), [#2450](https://github.com/netclaw-dev/netclaw/pull/2450), [#2456](https://github.com/netclaw-dev/netclaw/pull/2456), [#2457](https://github.com/netclaw-dev/netclaw/pull/2457), [#2460](https://github.com/netclaw-dev/netclaw/pull/2460), [#2501](https://github.com/netclaw-dev/netclaw/pull/2501), [#2506](https://github.com/netclaw-dev/netclaw/pull/2506), [#2508](https://github.com/netclaw-dev/netclaw/pull/2508), [#2509](https://github.com/netclaw-dev/netclaw/pull/2509), [#2513](https://github.com/netclaw-dev/netclaw/pull/2513), [#2514](https://github.com/netclaw-dev/netclaw/pull/2514), [#2521](https://github.com/netclaw-dev/netclaw/pull/2521), [#2522](https://github.com/netclaw-dev/netclaw/pull/2522), [#2532](https://github.com/netclaw-dev/netclaw/pull/2532), [#2534](https://github.com/netclaw-dev/netclaw/pull/2534), [#2536](https://github.com/netclaw-dev/netclaw/pull/2536), [#2543](https://github.com/netclaw-dev/netclaw/pull/2543), [#2545](https://github.com/netclaw-dev/netclaw/pull/2545), [#2549](https://github.com/netclaw-dev/netclaw/pull/2549), [#2555](https://github.com/netclaw-dev/netclaw/pull/2555), [#2556](https://github.com/netclaw-dev/netclaw/pull/2556), [#2562](https://github.com/netclaw-dev/netclaw/pull/2562), [#2564](https://github.com/netclaw-dev/netclaw/pull/2564), [#2565](https://github.com/netclaw-dev/netclaw/pull/2565), [#2580](https://github.com/netclaw-dev/netclaw/pull/2580), [#2582](https://github.com/netclaw-dev/netclaw/pull/2582), [#2585](https://github.com/netclaw-dev/netclaw/pull/2585), [#2586](https://github.com/netclaw-dev/netclaw/pull/2586), [#2588](https://github.com/netclaw-dev/netclaw/pull/2588), [#2594](https://github.com/netclaw-dev/netclaw/pull/2594), [#2612](https://github.com/netclaw-dev/netclaw/pull/2612), [#2623](https://github.com/netclaw-dev/netclaw/pull/2623), [#2624](https://github.com/netclaw-dev/netclaw/pull/2624), [#2626](https://github.com/netclaw-dev/netclaw/pull/2626), [#2627](https://github.com/netclaw-dev/netclaw/pull/2627), [#2628](https://github.com/netclaw-dev/netclaw/pull/2628)).
+
+### Dependency Updates
+
+- **Bump ASP.NET Core packages** — 10.0.12 → 10.0.13, for the `System.Security.Cryptography.Pkcs` and `System.Security.Cryptography.Xml` advisories ([#2490](https://github.com/netclaw-dev/netclaw/pull/2490))
+- **Bump OpenTelemetry** — 1.19.1 → 1.20.0 ([#2518](https://github.com/netclaw-dev/netclaw/pull/2518))
+- **Bump Termina** — 0.16.2 → 0.17.0 ([#2410](https://github.com/netclaw-dev/netclaw/pull/2410), [#2465](https://github.com/netclaw-dev/netclaw/pull/2465), [#2520](https://github.com/netclaw-dev/netclaw/pull/2520))
+- **Bump Aaron.Akka.Reminders** — 0.7.0 → 1.5.73.3, and **Akka.Hosting** 1.5.71 → 1.5.73 ([#2402](https://github.com/netclaw-dev/netclaw/pull/2402), [#2438](https://github.com/netclaw-dev/netclaw/pull/2438))
+- **Bump ShellSyntaxTree** — 0.4.0-beta.22 → 0.4.0-beta.24 ([#2372](https://github.com/netclaw-dev/netclaw/pull/2372))
+
 ## 0.27.1 (2026-10-06)
 
 This is the stable 0.27.1 release. Configured tool lists now replace the defaults, so a narrowed allowlist narrows. Shell and tool approval now uses one authorizer and real parser facts, which gives fewer prompts and closes several ways around approval. Mattermost gets native typing indicators. MCP connections keep rotated tokens and deliver real file artifacts. The daemon stops more gracefully.

@@ -11,15 +11,38 @@ fi
 # Resolve exact boundaries. An absent or duplicate marker must fail before Stryker starts.
 spans="$(
   perl -Mopen=:std,:encoding\(UTF-8\) -0777 -ne '
-    @targets = /class ActiveExecutionTracker/
-      ? (
+    if (/class ActiveExecutionTracker/) {
+      @targets = (
           ["execution.ExecutionId == executionId", 1],
           ["_executing.Remove(reminderId);", 1]
-        )
-      : (
+        );
+    } elsif (/class ReminderExecutionActor/) {
+      @targets = (
+          ["unrelatedTurn.SourceReminderId != expectedKey", 1]
+        );
+    } elsif (/class SessionInputFlow/) {
+      @targets = (
+          ["if (TryFindWaitingFire(evt, state, out var fire, out var waiting))\n            return new AdmissionDecision.Dropped(fire, waiting);", 1],
+          ["if (IsBuffered(pending.InputId)\n                && TryReadFireKey(pending, out waiting)\n                && waiting.DefinitionId == fire.DefinitionId)\n                return true;", 5],
+          ["if (!TryReadFireKey(incoming, out fire))\n            return false;", 2],
+          ["return input.TurnContext.SourceKind == ReminderExecutionActor.ReminderSourceKind\n               && ReminderFireKey.TryParse(input.SourceMessageId, out key);", 2]
+        );
+    } elsif (/record struct ReminderFireKey/) {
+      @targets = (
+          ["if (text is null)\n            return false;", 2],
+          ["if (separator <= 0 || text.IndexOf(\x27:\x27, StringComparison.Ordinal) != separator)\n            return false;", 6],
+          ["if (!long.TryParse(text.AsSpan(separator + 1), NumberStyles.None, CultureInfo.InvariantCulture, out var fireTimeMs))\n            return false;", 3]
+        );
+    } else {
+      @targets = (
           ["execution.ExecutionId != outcome.ExecutionId", 1],
+          ["definition.Schedule.Type == ReminderScheduleType.OneShot\n        && tombstone.FireAtMs == definition.Schedule.FireAtMs;", 3],
+          ["definition.Schedule.FireAtMs == envelope.DueTimeUtc.ToUnixTimeMilliseconds();", 1],
+          ["if (SettledOccurrenceIsCurrent(definition, envelope))\n            return false;", 2],
+          ["if (await TryRefuseStaleOccurrenceAsync(definition, envelope))\n                return;", 2],
           ["finally\n        {\n            _activeExecutions.TryRemove(outcome.Id, outcome.ExecutionId, out _);\n            replyTo.Tell(new ReminderExecutionAccepted(outcome.ExecutionId));\n        }", 1]
         );
+    }
     for $target (@targets) {
       ($marker, $count) = @$target;
       $start = index($_, $marker);
@@ -35,7 +58,10 @@ spans="$(
       print "$file $start ", $start + length($marker), " $first $last $count\n";
     }
   ' "$repo_root/src/Netclaw.Actors/Reminders/ReminderManagerActor.cs" \
-    "$repo_root/src/Netclaw.Actors/Reminders/ActiveExecutionTracker.cs"
+    "$repo_root/src/Netclaw.Actors/Reminders/ActiveExecutionTracker.cs" \
+    "$repo_root/src/Netclaw.Actors/Reminders/ReminderExecutionActor.cs" \
+    "$repo_root/src/Netclaw.Actors/Sessions/Handlers/SessionInputFlow.cs" \
+    "$repo_root/src/Netclaw.Actors/Reminders/ReminderFireKey.cs"
 )"
 
 mutate_args=()
@@ -58,7 +84,7 @@ report="$output_path/reports/mutation-report.json"
 while read -r file span_start span_end first last count; do
   jq -e --arg source "$repo_root/src/Netclaw.Actors/$file" \
     --argjson first "$first" --argjson last "$last" --argjson count "$count" '
-    [.files[$source].mutants[] | select(.status != "Ignored")
+    [(.files[$source].mutants // [])[] | select(.status != "Ignored" and .status != "CompileError")
       | select(.location.start.line >= $first and .location.start.line <= $last)] as $mutants
     | ($mutants | length) == $count and all($mutants[]; .status == "Killed")
   ' "$report" > /dev/null || {

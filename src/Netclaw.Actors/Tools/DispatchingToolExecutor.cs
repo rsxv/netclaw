@@ -66,6 +66,17 @@ public sealed class DispatchingToolExecutor : IToolExecutor, IApprovalShellProvi
             logger);
     }
 
+    private bool CanSuggestChildInspection(ToolInvocationContext context)
+    {
+        if (context.SpawnChildActor is null)
+            return false;
+        var tools = _registry.GetAllRegistrations().Select(registration => registration.Tool)
+            .Where(tool => tool.Name is "spawn_agent" or ToolOutputReadTool.ToolName);
+        var visible = _policy.FilterDiscoverableTools(tools, context);
+        return visible.Any(tool => tool.Name == "spawn_agent") &&
+               visible.Any(tool => tool.Name == ToolOutputReadTool.ToolName);
+    }
+
     /// <inheritdoc />
     public ToolArgumentRejection? ValidateToolCall(FunctionCallContent toolCall)
         => _registry.GetByName(toolCall.Name) is { } registered
@@ -233,7 +244,7 @@ public sealed class DispatchingToolExecutor : IToolExecutor, IApprovalShellProvi
             // to a session file and steer the model to read a slice. Tools only
             // bound their own capture for memory safety; they do not window or spill.
             result = await ToolOutputSpill.BoundAndSpillAsync(
-                modelFacing, redacted, toolCall.CallId, ResolveInlineBudget(tool, context), context.Invocation, _logger, ct);
+                modelFacing, redacted, toolCall.CallId, ResolveInlineBudget(tool, context), context.Invocation, _logger, ct, CanSuggestChildInspection(context.Invocation));
 
             sw.Stop();
             _logger.LogInformation(
@@ -248,18 +259,25 @@ public sealed class DispatchingToolExecutor : IToolExecutor, IApprovalShellProvi
 
             return result;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not ToolApprovalRequiredException)
         {
             CompleteExceptionOutcome(context, ex, ct);
             sw.Stop();
-            _logger.LogError(ex,
-                "Tool execution failed: {ToolName} ({Duration}ms) " +
-                "authorizationAttemptId={AuthorizationAttemptId} sessionId={SessionId} callId={CallId}",
-                toolCall.Name,
-                sw.ElapsedMilliseconds,
-                context.Approval.AuthorizationAttemptId.Value,
-                context.SessionId,
-                toolCall.CallId);
+            // A policy denial and a correction request are expected outcomes. The authorization
+            // decision log already records each one, so they must not add an Error line.
+            // CompleteExceptionOutcome above still records the denial receipt.
+            if (ex is not (ToolAccessDeniedException or ToolCorrectionRequiredException))
+            {
+                _logger.LogError(ex,
+                    "Tool execution failed: {ToolName} ({Duration}ms) " +
+                    "authorizationAttemptId={AuthorizationAttemptId} sessionId={SessionId} callId={CallId}",
+                    toolCall.Name,
+                    sw.ElapsedMilliseconds,
+                    context.Approval.AuthorizationAttemptId.Value,
+                    context.SessionId,
+                    toolCall.CallId);
+            }
+
             throw;
         }
     }
@@ -353,7 +371,7 @@ public sealed class DispatchingToolExecutor : IToolExecutor, IApprovalShellProvi
                     var redacted = SecretOutputRedactor.Redact(completed.Result);
                     var modelResult = tool.SuppressOutputRedaction ? completed.Result : redacted;
                     modelResult = await ToolOutputSpill.BoundAndSpillAsync(
-                        modelResult, redacted, toolCall.CallId, ResolveInlineBudget(tool, context), context.Invocation, _logger, ct);
+                        modelResult, redacted, toolCall.CallId, ResolveInlineBudget(tool, context), context.Invocation, _logger, ct, CanSuggestChildInspection(context.Invocation));
                     _logger.LogInformation(
                         "Tool executed: {ToolName} ({Duration}ms, {ResultLength} chars) " +
                         "authorizationAttemptId={AuthorizationAttemptId} sessionId={SessionId} callId={CallId}",

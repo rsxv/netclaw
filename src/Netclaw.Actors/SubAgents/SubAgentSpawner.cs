@@ -3,7 +3,6 @@
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
 // -----------------------------------------------------------------------
-using System.Diagnostics;
 using System.Threading.Channels;
 using Akka.Actor;
 using Microsoft.Extensions.Logging;
@@ -17,9 +16,9 @@ using static Netclaw.Actors.SubAgents.SubAgentProtocol;
 namespace Netclaw.Actors.SubAgents;
 
 /// <summary>
-/// Shared utility that encapsulates the subagent spawn-ask-report lifecycle.
-/// Resolves audience-scoped runtime tools, spawns a <see cref="SubAgentActor"/> as a child of the
-/// owning session actor, awaits results, and emits observability notifications.
+/// Resolves child tools and authority before the session accepts a durable start.
+/// The session owns the <see cref="SubAgentActor"/> and its terminal result.
+/// The public foreground adapter remains available for explicit foreground callers.
 /// Singleton — registered in DI.
 /// </summary>
 public sealed class SubAgentSpawner
@@ -27,7 +26,6 @@ public sealed class SubAgentSpawner
     private static readonly StringComparer FilePathComparer =
         OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
-    private const int SubAgentMaxToolIterations = 30;
 
     private readonly IChatClientProvider _chatClientProvider;
     private readonly ToolRegistry _toolRegistry;
@@ -35,6 +33,7 @@ public sealed class SubAgentSpawner
     private readonly IToolApprovalService? _approvalService;
     private readonly ISystemPromptProvider _promptProvider;
     private readonly SubAgentConfig _subAgentConfig;
+    private readonly SessionConfig _sessionConfig;
     private readonly ILogger<SubAgentSpawner> _logger;
     private readonly IWorkingContextSnapshotProvider _workingContextSnapshots;
 
@@ -52,6 +51,7 @@ public sealed class SubAgentSpawner
         ISystemPromptProvider promptProvider,
         IWorkingContextSnapshotProvider workingContextSnapshots,
         ILogger<SubAgentSpawner> logger,
+        SessionConfig sessionConfig,
         SubAgentConfig? subAgentConfig = null,
         Telemetry.ISessionMetrics? sessionMetrics = null)
     {
@@ -62,6 +62,7 @@ public sealed class SubAgentSpawner
         _promptProvider = promptProvider;
         _workingContextSnapshots = workingContextSnapshots;
         _subAgentConfig = subAgentConfig ?? new SubAgentConfig();
+        _sessionConfig = sessionConfig;
         _logger = logger;
         _sessionMetrics = sessionMetrics;
     }
@@ -87,63 +88,136 @@ public sealed class SubAgentSpawner
         return result.ToProtocolResult();
     }
 
+    /// <summary>
+    /// Prepares a child and asks the owning session to accept it. The parent reads the result through
+    /// <c>file_read</c>, so the start is refused when the requester cannot use that tool. The spawner removes the run
+    /// folder when the owner rejects the start, so a rejected start leaves no files.
+    /// </summary>
+    internal async Task<ChildRunAcceptance> StartRunAsync(
+        SubAgentProfile profile, string task, string? runtimeContext,
+        ToolInvocationContext context, CancellationToken ct, string? systemPromptOverlay)
+    {
+        var prepared = await PrepareRunAsync(profile, task, runtimeContext, context, ct, systemPromptOverlay,
+            requireResultReader: true);
+        var spawn = context.SpawnChildActor
+            ?? throw new InvalidOperationException("A child start requires an owning session.");
+        ChildRunAcceptance acceptance;
+        try
+        {
+            acceptance = (ChildRunAcceptance)await spawn(prepared, prepared.ActorName, ct);
+        }
+        catch (ChildStartRejectedException)
+        {
+            RemoveRunDirectory(prepared);
+            throw;
+        }
+
+        // The owner knew this start under another run, so this run never started.
+        if (acceptance.RunId != prepared.RunId)
+            RemoveRunDirectory(prepared);
+        return acceptance;
+    }
+
+    private void RemoveRunDirectory(PreparedChildStart prepared)
+    {
+        try
+        {
+            Directory.Delete(prepared.RunDirectory, recursive: true);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(error, "The rejected child start {RunId} left its run folder {RunDirectory}.",
+                prepared.RunId.Value, prepared.RunDirectory);
+        }
+    }
+
     internal async Task<EnrichedChildRunResult> SpawnRunAsync(
-        SubAgentProfile profile,
-        string task,
-        string? runtimeContext,
-        ToolInvocationContext context,
-        CancellationToken ct,
-        string? systemPromptOverlay,
+        SubAgentProfile profile, string task, string? runtimeContext,
+        ToolInvocationContext context, CancellationToken ct, string? systemPromptOverlay,
         ChannelWriter<ToolActivityUpdate>? activitySink)
     {
-        // Parent-side spawn breadcrumbs — each event is fanned out to daemon.log/Seq and
-        // the parent's session.log from one place (see SubAgentSpawnBreadcrumbs), covering
-        // request → outcome plus early rejections that happen before the child even exists.
-        SubAgentSpawnBreadcrumbs.SpawnRequested(_logger, context, profile.Name, task.Length);
+        IActorRef? child = null;
+        PreparedChildStart? prepared = null;
+        try
+        {
+            prepared = await PrepareRunAsync(profile, task, runtimeContext, context, ct, systemPromptOverlay,
+                requireResultReader: false);
+            context.Outputs.ReportSubAgentActivity(new SubAgentNotificationInfo
+            {
+                RunId = prepared.RunId, AgentName = profile.Name, IsStarted = true, ToolCount = prepared.ToolCount
+            });
+            var spawn = context.SpawnChildActor
+                ?? throw new InvalidOperationException("A child start requires an owning session.");
+            child = (IActorRef)await spawn(prepared.Props, prepared.ActorName, ct);
+            var result = await child.Ask<SubAgentResult>(prepared.Execution with
+            {
+                Cancellation = ct,
+                ActivitySink = activitySink
+            }, Timeout.InfiniteTimeSpan, ct);
+            result = await EnrichWorkingContextResultAsync(result,
+                prepared.Execution.Scope.InitialWorkingSnapshot, context.Audience, ct);
+            result = result with { RunId = prepared.RunId, ScopeId = prepared.Execution.Scope.ScopeId };
+            ReportCompletion(result);
+            if (result.Completion is ChildRunCompletion.Completed or ChildRunCompletion.Partial)
+                return new EnrichedChildRunResult.SuccessfulRun(result,
+                    new EnrichedChildRunResult.RunLocations(prepared.Storage.LogPath, prepared.Storage.ArtifactDirectory));
+            return new EnrichedChildRunResult.OtherRun(result);
+        }
+        catch (Exception error) when (!FatalExceptionPolicy.IsFatal(error))
+        {
+            if (prepared is not null)
+            {
+                if (child is null)
+                    SubAgentSpawnBreadcrumbs.ChildSpawnFailed(_logger, context, profile.Name, prepared.RunId, error);
+                else
+                    SubAgentSpawnBreadcrumbs.RunFailed(_logger, context, profile.Name, prepared.RunId, error);
+            }
+            if (child is not null)
+                TryStopSubAgent(child);
+            var result = new SubAgentResult
+            {
+                AgentName = new AgentName(profile.Name), RunId = prepared?.RunId,
+                ScopeId = prepared?.Execution.Scope.ScopeId,
+                Completion = error is OperationCanceledException
+                    ? new ChildRunCompletion.Cancelled(SubAgentOutcomeReason.CancelledByParent)
+                    : new ChildRunCompletion.Failed(error is ChildStartRejectedException rejected
+                        ? rejected.Reason : SubAgentOutcomeReason.SpawnError),
+                Output = error.Message
+            };
+            if (prepared is not null)
+                ReportCompletion(result);
+            return new EnrichedChildRunResult.OtherRun(result);
+        }
+        finally
+        {
+            activitySink?.TryComplete();
+        }
 
+        void ReportCompletion(SubAgentResult result)
+        {
+            context.Outputs.ReportSubAgentActivity(new SubAgentNotificationInfo
+            {
+                RunId = result.RunId ?? throw new InvalidOperationException("A child completion requires its run ID."),
+                AgentName = profile.Name, IsStarted = false,
+                Success = result.Success, Outcome = result.Outcome, OutcomeReason = result.OutcomeReason,
+                Findings = result.Findings, WorkingContext = result.WorkingContext
+            });
+        }
+    }
+
+    private async Task<PreparedChildStart> PrepareRunAsync(
+        SubAgentProfile profile, string task, string? runtimeContext,
+        ToolInvocationContext context, CancellationToken ct, string? systemPromptOverlay,
+        bool requireResultReader)
+    {
+        SubAgentSpawnBreadcrumbs.SpawnRequested(_logger, context, profile.Name, task.Length);
         if (context.SpawnChildActor is null)
         {
             SubAgentSpawnBreadcrumbs.NoSessionContext(_logger, context, profile.Name);
-            activitySink?.TryComplete();
-            return new EnrichedChildRunResult.OtherRun(new SubAgentResult
-            {
-                Completion = new ChildRunCompletion.Failed(SubAgentOutcomeReason.SpawnUnavailable),
-                Output = $"Cannot spawn subagent '{profile.Name}': no session context available.",
-                AgentName = new AgentName(profile.Name)
-            });
+            throw new ChildStartRejectedException(SubAgentOutcomeReason.SpawnUnavailable, "A child start requires an owning session.");
         }
-
-        var exposure = ResolveTools(context);
-        if (exposure.Tools.Count == 0)
-        {
-            SubAgentSpawnBreadcrumbs.NoToolsAvailable(_logger, context, profile.Name);
-            activitySink?.TryComplete();
-            return new EnrichedChildRunResult.OtherRun(new SubAgentResult
-            {
-                Completion = new ChildRunCompletion.Failed(SubAgentOutcomeReason.NoToolsAvailable),
-                Output = $"Cannot spawn subagent '{profile.Name}': no tools are available under the parent audience policy.",
-                AgentName = new AgentName(profile.Name)
-            });
-        }
-
-        var definition = new SubAgentDefinition
-        {
-            Name = new AgentName(profile.Name),
-            SystemPrompt = AppendSystemPromptOverlay(profile.SystemPrompt, systemPromptOverlay),
-            Tools = exposure.Tools,
-            ModelRole = profile.ModelRole,
-            EmitStructuredFindings = profile.EmitStructuredFindings,
-            ProjectInstructions = ResolveProjectInstructions(context),
-            OperatingRules = ResolveOperatingRules(context)
-        };
-
+        var (definition, coreToolNames) = ResolveDefinition(profile, systemPromptOverlay, context, requireResultReader);
         var runId = SubAgentRunId.New();
-
-        var chatClient = _chatClientProvider.GetClient(definition.ModelRole);
-        var subAgentTimeout = TimeSpan.FromSeconds(profile.TimeoutSeconds);
-        var prefillTimeout = TimeSpan.FromSeconds(
-            profile.PrefillTimeoutSeconds ?? _subAgentConfig.PrefillTimeoutSeconds);
-        var noProgressTimeout = TimeSpan.FromSeconds(_subAgentConfig.NoProgressTimeoutSeconds);
         var subAgentScopeId = !string.IsNullOrWhiteSpace(context.SessionId)
             ? $"{context.SessionId}/subagent/{definition.Name}/{runId}"
             : $"subagent/{definition.Name}/{runId}";
@@ -157,37 +231,84 @@ public sealed class SubAgentSpawner
             ProjectDirectory = context.ProjectDirectory,
             RecentFiles = [.. context.RecentFiles.Take(WorkingContext.MaxRecentFiles)]
         };
-        WorkingContextSnapshot initialWorkingSnapshot;
-        try
+        var initialWorkingSnapshot = await _workingContextSnapshots.CreateAsync(
+            parentWorkingContext, context.Audience, ct).ConfigureAwait(false);
+        var digestInput = System.Text.Json.JsonSerializer.Serialize(new
         {
-            initialWorkingSnapshot = await _workingContextSnapshots.CreateAsync(
-                parentWorkingContext,
-                context.Audience,
-                ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            profile.Name, task, runtimeContext, systemPromptOverlay
+        });
+        var digest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(digestInput)));
+        var prepared = BuildStart(definition, coreToolNames, profile, context, runId, scopeId, childStorage,
+            initialWorkingSnapshot, context.ResolveShellCwd(null), digest);
+        return prepared with { Execution = prepared.Execution with { Task = task, RuntimeContext = runtimeContext } };
+    }
+
+    /// <summary>
+    /// Prepares the next incarnation of a parked run (durable-child-consent-wait, design D4). It runs on the owner
+    /// thread with no await. The spawn rules apply again under the run authority in <paramref name="context"/>: child
+    /// runs enabled, a non-Public audience, a current agent profile, child tools, and <c>file_read</c>. A failed rule
+    /// throws <see cref="ChildStartRejectedException"/>, and no parked call runs.
+    /// </summary>
+    internal PreparedChildStart PrepareResume(BackgroundChildRun run, WorkingContextSnapshot snapshot, ChildRunResume resume,
+        SubAgentProfile? profile, ToolInvocationContext context)
+    {
+        if (!_subAgentConfig.Enabled || context.Audience == TrustAudience.Public)
+            throw new ChildStartRejectedException(SubAgentOutcomeReason.SpawnUnavailable,
+                "Child runs are not available to the requester of this run.");
+        if (profile is null)
+            throw new ChildStartRejectedException(SubAgentOutcomeReason.SpawnUnavailable,
+                $"The agent profile '{run.AgentName.Value}' of this run no longer exists.");
+        var (definition, coreToolNames) = ResolveDefinition(profile, resume.Park.SkillOverlay, context, requireResultReader: true);
+        var storage = (context.SessionStorage ?? throw new InvalidOperationException("A resume requires session storage."))
+            .ForChild(run.RunId, run.ScopeId);
+        var prepared = BuildStart(definition, coreToolNames, profile, context, run.RunId, run.ScopeId, storage, snapshot,
+            resume.Park.ScopeDirectories.InheritedWorkingDirectory, run.ArgumentsDigest);
+        return prepared with { Execution = prepared.Execution with { Resume = resume } };
+    }
+
+    // The spawn rules on the tool set, and the definition of the agent.
+    private (SubAgentDefinition Definition, IReadOnlySet<string> CoreToolNames) ResolveDefinition(
+        SubAgentProfile profile, string? skillOverlay, ToolInvocationContext context, bool requireResultReader)
+    {
+        var exposure = ResolveTools(context);
+        if (exposure.Tools.Count == 0)
         {
-            activitySink?.TryComplete();
-            return new EnrichedChildRunResult.OtherRun(CancelledResult(definition.Name, runId, scopeId));
+            SubAgentSpawnBreadcrumbs.NoToolsAvailable(_logger, context, profile.Name);
+            throw new ChildStartRejectedException(SubAgentOutcomeReason.NoToolsAvailable,
+                "No child tools are available under the parent audience policy.");
         }
-        catch (Exception ex) when (!FatalExceptionPolicy.IsFatal(ex))
+        if (requireResultReader && exposure.Tools.All(tool => tool.Name != FileReadTool.ToolName))
         {
-            SubAgentSpawnBreadcrumbs.RunFailed(_logger, context, profile.Name, runId, ex);
-            activitySink?.TryComplete();
-            return new EnrichedChildRunResult.OtherRun(new SubAgentResult
-            {
-                Completion = new ChildRunCompletion.Failed(SubAgentOutcomeReason.SpawnError),
-                Output = $"Subagent error: {ex.Message}",
-                AgentName = definition.Name,
-                RunId = runId,
-                ScopeId = scopeId
-            });
+            SubAgentSpawnBreadcrumbs.NoResultReader(_logger, context, profile.Name);
+            throw new ChildStartRejectedException(SubAgentOutcomeReason.NoResultReader,
+                $"The child was not started. The result of a child run is read with {FileReadTool.ToolName}, "
+                + $"and the policy for this session does not allow {FileReadTool.ToolName}.");
         }
-        catch (Exception ex) when (FatalExceptionPolicy.IsFatal(ex))
+        return (new SubAgentDefinition
         {
-            activitySink?.TryComplete();
-            throw;
-        }
+            Name = new AgentName(profile.Name),
+            SystemPrompt = profile.SystemPrompt,
+            SkillOverlay = string.IsNullOrWhiteSpace(skillOverlay) ? null : skillOverlay,
+            Tools = exposure.Tools,
+            ModelRole = profile.ModelRole,
+            EmitStructuredFindings = profile.EmitStructuredFindings,
+            ProjectInstructions = ResolveProjectInstructions(context),
+            OperatingRules = ResolveOperatingRules(context)
+        }, exposure.CoreToolNames);
+    }
+
+    // The child scope and the props of one incarnation. A first start and a resume share it.
+    private PreparedChildStart BuildStart(SubAgentDefinition definition, IReadOnlySet<string> coreToolNames,
+        SubAgentProfile profile, ToolInvocationContext context, SubAgentRunId runId, SubAgentScopeId scopeId,
+        SessionStoragePaths childStorage, WorkingContextSnapshot initialWorkingSnapshot, string? inheritedCwd, string digest)
+    {
+        var chatClient = _chatClientProvider.GetClient(definition.ModelRole);
+        // Inter-delta budget: session-wide, so every subagent gets the same value.
+        var subAgentTimeout = _sessionConfig.FirstTokenTimeout;
+        var prefillTimeout = TimeSpan.FromSeconds(
+            profile.PrefillTimeoutSeconds ?? _subAgentConfig.PrefillTimeoutSeconds);
+        var noProgressTimeout = TimeSpan.FromSeconds(_subAgentConfig.NoProgressTimeoutSeconds);
         // A transport can own an approval channel without being able to service
         // interactive prompts. Fork only the admitted capability, never bridge
         // presence by itself.
@@ -207,226 +328,42 @@ public sealed class SubAgentSpawner
                 ModelInputModalities = context.ModelInputModalities,
                 InteractiveApproval = interactiveApproval,
                 ProjectDirectory = context.ProjectDirectory,
-                InheritedCwd = context.ResolveShellCwd(null),
+                InheritedCwd = inheritedCwd,
                 RecentFiles = context.RecentFiles,
             },
             InitialWorkingSnapshot = initialWorkingSnapshot
         };
 
-        context.Outputs.ReportSubAgentActivity(new SubAgentNotificationInfo
-        {
-            RunId = runId,
-            AgentName = definition.Name.Value,
-            IsStarted = true,
-            ToolCount = exposure.Tools.Count
-        });
-
-        // Spawn as child of the session actor via the context factory
         var props = SubAgentActor.CreatePropsWithProjectInstructionProvider(
             definition,
             chatClient,
             _toolAccessPolicy,
             _promptProvider,
             _approvalService,
-            SubAgentMaxToolIterations,
             _sessionMetrics,
-            exposure.CoreToolNames,
+            coreToolNames,
             _logger);
         var actorName = $"subagent-{definition.Name}-{runId}";
-        IActorRef subAgent;
-        try
-        {
-            subAgent = (IActorRef)await context.SpawnChildActor(props, actorName, ct);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            context.Outputs.ReportSubAgentActivity(new SubAgentNotificationInfo
+        return new PreparedChildStart(props, actorName, runId, definition.Name, digest, childStorage, definition.Tools.Count,
+            new RunSubAgent
             {
-                RunId = runId,
-                AgentName = definition.Name.Value,
-                IsStarted = false,
-                Success = false,
-                Outcome = SubAgentRunOutcome.Failed,
-                OutcomeReason = SubAgentOutcomeReason.CancelledByParent
+                Scope = childScope,
+                Task = string.Empty,
+                Timeout = subAgentTimeout,
+                PrefillTimeout = prefillTimeout,
+                NoProgressTimeout = noProgressTimeout
             });
-            activitySink?.TryComplete();
-            return new EnrichedChildRunResult.OtherRun(CancelledResult(definition.Name, runId, scopeId));
-        }
-        catch (Exception ex) when (!FatalExceptionPolicy.IsFatal(ex))
-        {
-            // The child actor was never created (session actor ActorOf failed or the
-            // spawn ask timed out). Record it to the session transcript before the
-            // exception propagates to the tool pipeline.
-            SubAgentSpawnBreadcrumbs.ChildSpawnFailed(_logger, context, profile.Name, runId, ex);
-            // Balance the IsStarted=true notification above: the non-streaming path
-            // (activitySink is null) relies solely on the per-call output sink, so without
-            // a terminal event the session UI shows a sub-agent stuck in "Started".
-            context.Outputs.ReportSubAgentActivity(new SubAgentNotificationInfo
-            {
-                RunId = runId,
-                AgentName = definition.Name.Value,
-                IsStarted = false,
-                Success = false,
-                Outcome = SubAgentRunOutcome.Failed,
-                OutcomeReason = SubAgentOutcomeReason.SpawnError
-            });
-            activitySink?.TryComplete();
-            throw;
-        }
-        catch (Exception ex) when (FatalExceptionPolicy.IsFatal(ex))
-        {
-            context.Outputs.ReportSubAgentActivity(new SubAgentNotificationInfo
-            {
-                RunId = runId,
-                AgentName = definition.Name.Value,
-                IsStarted = false,
-                Success = false,
-                Outcome = SubAgentRunOutcome.Failed,
-                OutcomeReason = SubAgentOutcomeReason.SpawnError
-            });
-            activitySink?.TryComplete();
-            throw;
-        }
-
-        SubAgentSpawnBreadcrumbs.ChildSpawned(_logger, context, profile.Name, runId);
-
-        var sw = Stopwatch.StartNew();
-        try
-        {
-            var result = await subAgent.Ask<SubAgentResult>(
-                new RunSubAgent
-                {
-                    Scope = childScope,
-                    Task = task,
-                    RuntimeContext = runtimeContext,
-                    Timeout = subAgentTimeout,
-                    PrefillTimeout = prefillTimeout,
-                    NoProgressTimeout = noProgressTimeout,
-                    Cancellation = ct,
-                    // Null for non-streaming callers such as routed skills and the
-                    // legacy ExecuteAsync path; the sub-agent surfaces its progress
-                    // through its own session-correlated logs regardless. Streaming
-                    // spawn_agent calls pass a real sink so the parent tool's
-                    // liveness watchdog sees progress.
-                    ActivitySink = activitySink
-                },
-                // No Ask timeout: a healthy run is bounded by the sub-agent's own
-                // watchdogs, not by wall-clock, so any finite ceiling here could
-                // pre-empt a legitimately long run. The sub-agent self-completes on
-                // two internal budgets: the liveness watchdog (no bytes at all,
-                // including keepalives) and the no-progress deadline (keepalives but
-                // no real tokens for NoProgressTimeoutSeconds). ct — the spawning
-                // tool call's token — only adds parent-turn / user cancellation on
-                // top; once streaming spawn_agent has emitted its first activity,
-                // the parent no longer applies an inter-item watchdog. Keepalive
-                // wedges are bounded by the sub-agent's own no-progress watchdog.
-                timeout: Timeout.InfiniteTimeSpan,
-                cancellationToken: ct);
-
-            sw.Stop();
-
-            result = await EnrichWorkingContextResultAsync(
-                result,
-                initialWorkingSnapshot,
-                context.Audience,
-                ct).ConfigureAwait(false);
-
-            context.Outputs.ReportSubAgentActivity(new SubAgentNotificationInfo
-            {
-                RunId = runId,
-                AgentName = definition.Name.Value,
-                IsStarted = false,
-                Success = result.Success,
-                Outcome = result.Outcome,
-                OutcomeReason = result.OutcomeReason,
-                Duration = sw.Elapsed,
-                Findings = result.Findings,
-                WorkingContext = result.WorkingContext
-            });
-
-            SubAgentSpawnBreadcrumbs.Completed(_logger, context, profile.Name, runId, result.Success, sw.ElapsedMilliseconds);
-
-            var response = result with { RunId = runId, ScopeId = scopeId };
-            return result.Completion switch
-            {
-                ChildRunCompletion.Completed or ChildRunCompletion.Partial =>
-                    new EnrichedChildRunResult.SuccessfulRun(response,
-                        new EnrichedChildRunResult.RunLocations(childStorage.LogPath, childStorage.ArtifactDirectory)),
-                ChildRunCompletion.Failed or ChildRunCompletion.Cancelled => new EnrichedChildRunResult.OtherRun(response),
-                _ => throw new InvalidOperationException("Unexpected child run completion.")
-            };
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            sw.Stop();
-            TryStopSubAgent(subAgent);
-
-            context.Outputs.ReportSubAgentActivity(new SubAgentNotificationInfo
-            {
-                RunId = runId,
-                AgentName = definition.Name.Value,
-                IsStarted = false,
-                Success = false,
-                Outcome = SubAgentRunOutcome.Failed,
-                OutcomeReason = SubAgentOutcomeReason.CancelledByParent,
-                Duration = sw.Elapsed
-            });
-
-            return new EnrichedChildRunResult.OtherRun(CancelledResult(definition.Name, runId, scopeId));
-        }
-        catch (Exception ex) when (!FatalExceptionPolicy.IsFatal(ex))
-        {
-            sw.Stop();
-
-            TryStopSubAgent(subAgent);
-
-            context.Outputs.ReportSubAgentActivity(new SubAgentNotificationInfo
-            {
-                RunId = runId,
-                AgentName = definition.Name.Value,
-                IsStarted = false,
-                Success = false,
-                Outcome = SubAgentRunOutcome.Failed,
-                OutcomeReason = SubAgentOutcomeReason.SpawnError,
-                Duration = sw.Elapsed
-            });
-
-            SubAgentSpawnBreadcrumbs.RunFailed(_logger, context, profile.Name, runId, ex);
-            return new EnrichedChildRunResult.OtherRun(new SubAgentResult
-            {
-                Completion = new ChildRunCompletion.Failed(SubAgentOutcomeReason.SpawnError),
-                Output = $"Subagent error: {ex.Message}",
-                AgentName = new AgentName(profile.Name),
-                RunId = runId,
-                ScopeId = scopeId
-            });
-        }
-        finally
-        {
-            // Terminate the streaming caller's activity reader even on failure.
-            activitySink?.TryComplete();
-        }
     }
 
-    private static SubAgentResult CancelledResult(
-        AgentName agentName,
-        SubAgentRunId runId,
-        SubAgentScopeId scopeId) => new()
-        {
-            Completion = new ChildRunCompletion.Cancelled(SubAgentOutcomeReason.CancelledByParent),
-            Output = "Subagent cancelled by parent",
-            AgentName = agentName,
-            RunId = runId,
-            ScopeId = scopeId
-        };
-
-    private async Task<SubAgentResult> EnrichWorkingContextResultAsync(
+    internal async Task<SubAgentResult> EnrichWorkingContextResultAsync(
         SubAgentResult result,
         WorkingContextSnapshot initialSnapshot,
         TrustAudience audience,
         CancellationToken cancellationToken)
     {
-        if (!result.Success || result.WorkingContext is not { } childContext)
+        // Only a completed run or a partial run has a delta. A partial run that a restart lost is not a success, but
+        // its result file shows the reviewed delta. The observed changes help the parent judge the uncertain effects.
+        if (result.WorkingContext is not { } childContext)
             return result;
 
         var finalContext = new WorkingContext
@@ -461,7 +398,7 @@ public sealed class SubAgentSpawner
             {
                 ChildRunCompletion.Completed => new ChildRunCompletion.Completed(delta),
                 ChildRunCompletion.Partial partial => new ChildRunCompletion.Partial(partial.PartialReason, delta),
-                _ => throw new InvalidOperationException("Only successful child runs can carry a working-context delta.")
+                _ => throw new InvalidOperationException("Only a completed or a partial child run can carry a working-context delta.")
             }
         };
     }
@@ -515,18 +452,6 @@ public sealed class SubAgentSpawner
             FileMode.OpenOrCreate,
             FileAccess.Write,
             FileShare.ReadWrite | FileShare.Delete);
-    }
-
-    private static string AppendSystemPromptOverlay(string basePrompt, string? overlay)
-    {
-        if (string.IsNullOrWhiteSpace(overlay))
-            return basePrompt;
-
-        return string.Concat(
-            basePrompt.TrimEnd(),
-            "\n\n",
-            "[Skill Overlay]\n",
-            overlay.Trim());
     }
 
     private string? ResolveProjectInstructions(ToolInvocationContext context)

@@ -144,7 +144,7 @@
           "minimum": 1,
           "maximum": 500,
           "default": 60,
-          "description": "Maximum LLM-to-tools-to-LLM iterations allowed per turn. One LLM response with any number of parallel tool calls counts as exactly one iteration."
+          "description": "Legacy field retained for configuration compatibility. Exact recurrence rules replace the fixed iteration ceiling."
         },
         "MemoryObserverIdleSeconds": {
           "type": "integer",
@@ -153,6 +153,7 @@
         },
         "IdleTimeout": {
           "type": "string",
+          "default": "01:00:00",
           "description": "Session idle timeout in HH:mm:ss format. Set to 00:00:00 to disable."
         },
         "TurnLlmTimeoutSeconds": {
@@ -189,7 +190,7 @@
           "minimum": 60,
           "maximum": 7200,
           "default": 1200,
-          "description": "Hard ceiling in seconds on time without substantive output. Reset only by real streaming tokens — content-free keepalives never extend it — so a backend that heartbeats forever without producing a token is killed once this elapses. Catches a wedged stream the prefill/first-token liveness watchdog cannot, because keepalives refresh those."
+          "description": "Hard ceiling in seconds on time without substantive output. Reset only by real streaming tokens — content-free keepalives never extend it — so a backend that heartbeats forever without producing a token is killed once this elapses. Catches a wedged stream the prefill/first-token liveness watchdog cannot, because keepalives refresh those. The value also sets the thinking cap: one model call that streams only thinking, with no answer text and no tool call, stops at three times this value."
         },
         "CompactionThreshold": {
           "type": "number",
@@ -432,7 +433,7 @@
           },
           "OAuthTokenExpiry": {
             "type": ["string", "null"],
-            "description": "Expiry time of the OAuth access token in ISO 8601 format. Netclaw writes it to netclaw.json when you sign in with an OAuth auth method."
+            "description": "Expiry time of the OAuth access token in ISO 8601 format. Netclaw writes it to secrets.json when you sign in with an OAuth auth method. A key in netclaw.json is retired. Run netclaw doctor --fix to move it."
           },
           "VendorOptions": {
             "type": ["object", "null"],
@@ -756,14 +757,14 @@
           "minimum": 5,
           "maximum": 3600,
           "default": 1800,
-          "description": "Generous wait-for-first-delta budget (seconds) covering queue wait and cold prefill for sub-agent LLM calls, mirroring Session.PrefillTimeoutSeconds. Content-free prompt_progress keepalives refresh it; after the first substantive delta the per-agent inter-delta budget applies. A per-agent definition may override via prefillTimeoutSeconds frontmatter."
+          "description": "Generous wait-for-first-delta budget (seconds) covering queue wait and cold prefill for sub-agent LLM calls, mirroring Session.PrefillTimeoutSeconds. Content-free prompt_progress keepalives refresh it; after the first substantive delta the Session.FirstTokenTimeoutSeconds inter-delta budget applies. A per-agent definition may override via prefillTimeoutSeconds frontmatter."
         },
         "NoProgressTimeoutSeconds": {
           "type": "integer",
           "minimum": 60,
           "maximum": 7200,
           "default": 1200,
-          "description": "Hard ceiling (seconds) on time without substantive output for sub-agent LLM calls, mirroring Session.NoProgressTimeoutSeconds. Reset only by real streaming tokens — content-free keepalives never extend it — so a backend that heartbeats forever without producing a token is killed once this elapses."
+          "description": "Hard ceiling (seconds) on time without substantive output for sub-agent LLM calls, mirroring Session.NoProgressTimeoutSeconds. Reset only by real streaming tokens — content-free keepalives never extend it — so a backend that heartbeats forever without producing a token is killed once this elapses. The value also sets the sub-agent thinking cap: one model call that streams only thinking, with no answer text and no tool call, stops at three times this value."
         }
       },
       "additionalProperties": false
@@ -1059,7 +1060,7 @@
         "ToolOverrides": {
           "type": "object",
           "default": {},
-          "description": "Per-tool approval mode overrides. Keys are exact tool names (e.g., shell_execute, file_write) or MCP tool keys of the form {serverName}/{toolName} (e.g., notion/create-pages) or matcher-specific keys such as file_write:control-plane and file_edit:control-plane.",
+          "description": "Per-tool approval mode overrides. Keys are tool names, matched without regard to case (e.g., shell_execute, file_write), or MCP tool keys of the form {serverName}/{toolName} (e.g., notion/create-pages).",
           "additionalProperties": {
             "type": "string",
             "enum": ["Auto", "Approval", "Deny"]
@@ -1115,6 +1116,16 @@
           "type": "string",
           "description": "Manual override for output modalities. Comma-separated ModelModality flags (e.g. \"Text\"). Bypasses automated detection.",
           "pattern": "^(Text|Image|Audio|Video)(\\s*,\\s*(Text|Image|Audio|Video))*$"
+        },
+        "MaxOutputTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Output limit in tokens for every call of this model, unless the call site sets its own. Must be below ContextWindow when ContextWindow is set. When absent, Netclaw sends a default of 32000, clamped per call to the model maximum and to the context window minus the estimated prompt."
+        },
+        "Thinking": {
+          "type": "string",
+          "enum": ["Off", "Low", "Medium", "High", "Max"],
+          "description": "Provider-neutral thinking level for every call of this model, unless the call site sets its own. Max is the highest level that the provider offers. When absent, the model's default applies."
         }
       },
       "additionalProperties": false

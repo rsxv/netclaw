@@ -142,7 +142,7 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
                 ToolName = new Netclaw.Tools.ToolName("send_channel_message"),
                 Result = "Error: 'text' parameter is required."
             },
-            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var definition = CreateDefinition("notify-fail-test");
@@ -159,6 +159,170 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
     }
 
     [Fact]
+    public async Task Reminder_origin_current_session_preserves_session_authority_and_occurrence_key()
+    {
+        // Arrange
+        var sessionId = new SessionId("reminder/restart-session");
+        var dueTime = new DateTimeOffset(2026, 10, 14, 12, 30, 0, TimeSpan.Zero);
+        var definition = CreateDefinition("restart-route") with
+        {
+            Delivery = new ReminderDelivery
+            {
+                Kind = DeliveryKind.CurrentSession,
+                SessionId = sessionId.Value,
+                OriginChannelType = ChannelType.Reminder
+            },
+            DeliveryRequired = true,
+            Audience = TrustAudience.Personal,
+            Boundary = TrustBoundary.Personal,
+            Schedule = new ReminderSchedule { Type = ReminderScheduleType.OneShot, FireAt = dueTime }
+        };
+        var occurrenceKey = new ReminderId($"{definition.Id}:{dueTime.ToUnixTimeMilliseconds()}");
+        var pipeline = new ControlledSessionPipeline();
+        var probe = CreateTestProbe();
+        Sys.ActorOf(
+            Props.Create(() => new ParentProxy(probe.Ref, definition, pipeline, _historyStore)),
+            "restart-route-parent");
+
+        // Act
+        var input = await ExpectCapturedInputAsync(pipeline, probe);
+        input.AckTarget!.Tell(CommandAck.For(sessionId));
+        await probe.ExpectNoMsgAsync(TimeSpan.FromMilliseconds(100), TestContext.Current.CancellationToken);
+        pipeline.ReleaseOutputs(
+            new TurnCompleted
+            {
+                SessionId = sessionId,
+                TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1),
+                SourceReminderId = occurrenceKey,
+                OpenChildRunIds = []
+            });
+        var completed = await probe.ExpectMsgAsync<ReminderExecutionCompleted>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.Equal(sessionId, pipeline.CapturedSessionId);
+        Assert.Equal(ChannelType.Reminder, pipeline.CapturedOptions!.ChannelType);
+        Assert.Equal(TrustAudience.Personal, input.Audience);
+        Assert.Equal(TrustBoundary.Personal, input.Boundary);
+        Assert.Equal(PrincipalClassification.VerifiedAutomation, input.Principal);
+        Assert.Equal(TransportAuthenticity.LocalProcess, input.Provenance.TransportAuthenticity);
+        Assert.Equal(PayloadTaint.Trusted, input.Provenance.PayloadTaint);
+        Assert.Equal(new SourceKind("reminder"), input.Provenance.SourceKind);
+        Assert.Equal(occurrenceKey.Value, input.MessageId);
+        Assert.Equal(occurrenceKey, input.ReminderId);
+        Assert.True(completed.Success, completed.ErrorMessage);
+        Assert.Equal(sessionId.Value, completed.History.SessionId);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Reminder_origin_settlement_uses_the_matching_terminal(bool recoveryNoise)
+    {
+        // Arrange
+        var sessionId = new SessionId("reminder/terminal-settlement");
+        var dueTime = new DateTimeOffset(2026, 10, 14, 12, 30, 0, TimeSpan.Zero);
+        var definition = CreateDefinition($"terminal-{recoveryNoise}") with
+        {
+            Delivery = new ReminderDelivery
+            {
+                Kind = DeliveryKind.CurrentSession,
+                SessionId = sessionId.Value,
+                OriginChannelType = ChannelType.Reminder
+            },
+            DeliveryRequired = true,
+            Schedule = new ReminderSchedule { Type = ReminderScheduleType.OneShot, FireAt = dueTime }
+        };
+        var occurrenceKey = new ReminderId($"{definition.Id}:{dueTime.ToUnixTimeMilliseconds()}");
+        var foreignKey = new ReminderId("other-reminder:1");
+        var pipeline = new ControlledSessionPipeline();
+        var probe = CreateTestProbe();
+        Sys.ActorOf(
+            Props.Create(() => new ParentProxy(probe.Ref, definition, pipeline, _historyStore)),
+            $"terminal-parent-{recoveryNoise}");
+
+        // Act
+        var input = await ExpectCapturedInputAsync(pipeline, probe);
+        input.AckTarget!.Tell(CommandAck.For(sessionId));
+        await probe.ExpectNoMsgAsync(TimeSpan.FromMilliseconds(100), TestContext.Current.CancellationToken);
+        if (recoveryNoise)
+        {
+            pipeline.ReleaseOutputs(
+                new ErrorOutput { SessionId = sessionId, Message = "Context compaction recovered." },
+                new TurnCompleted
+                {
+                    SessionId = sessionId,
+                    TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1),
+                    SourceReminderId = occurrenceKey,
+                    OpenChildRunIds = []
+                });
+        }
+        else
+        {
+            pipeline.ReleaseOutputs(
+                new TurnCompleted
+                {
+                    SessionId = sessionId,
+                    TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1),
+                    SourceReminderId = foreignKey,
+                    OpenChildRunIds = []
+                },
+                new ErrorOutput { SessionId = sessionId, Message = "The resumed turn failed." },
+                new TurnCompleted
+                {
+                    SessionId = sessionId,
+                    TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2),
+                    Outcome = TurnOutcome.Failed,
+                    SourceReminderId = occurrenceKey,
+                    OpenChildRunIds = []
+                });
+        }
+        var completed = await probe.ExpectMsgAsync<ReminderExecutionCompleted>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.Equal(recoveryNoise, completed.Success);
+        if (recoveryNoise)
+            Assert.Null(completed.ErrorMessage);
+        else
+            Assert.Equal("The resumed turn failed.", completed.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task Reminder_origin_rejected_admission_fails_without_waiting_for_terminal_output()
+    {
+        // Arrange
+        var sessionId = new SessionId("reminder/rejected-admission");
+        var dueTime = new DateTimeOffset(2026, 10, 14, 12, 30, 0, TimeSpan.Zero);
+        var definition = CreateDefinition("rejected-admission") with
+        {
+            Delivery = new ReminderDelivery
+            {
+                Kind = DeliveryKind.CurrentSession,
+                SessionId = sessionId.Value,
+                OriginChannelType = ChannelType.Reminder
+            },
+            Schedule = new ReminderSchedule { Type = ReminderScheduleType.OneShot, FireAt = dueTime }
+        };
+        var pipeline = new ControlledSessionPipeline();
+        var probe = CreateTestProbe();
+        Sys.ActorOf(
+            Props.Create(() => new ParentProxy(probe.Ref, definition, pipeline, _historyStore)),
+            "rejected-admission-parent");
+
+        // Act
+        var input = await ExpectCapturedInputAsync(pipeline, probe);
+        input.AckTarget!.Tell(CommandNack.For(sessionId, "recovery rejected"));
+        var completed = await probe.ExpectMsgAsync<ReminderExecutionCompleted>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.False(completed.Success);
+        Assert.Contains("recovery rejected", completed.ErrorMessage);
+        Assert.Equal(sessionId.Value, completed.History.SessionId);
+    }
+
+    [Fact]
     public async Task Execution_with_a_denied_tool_call_is_recorded_as_denied_not_ok()
     {
         var pipeline = new ScriptedSessionPipeline(sessionId =>
@@ -172,7 +336,7 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
                 FailureCode = ToolResultOutput.AccessDeniedFailureCode
             },
             new TextOutput("I could not run the command.") { SessionId = sessionId },
-            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var definition = CreateDefinition("denied-tool-test") with { DeliveryRequired = false };
@@ -212,7 +376,7 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
                 ToolName = new Netclaw.Tools.ToolName("send_channel_message"),
                 Result = "Message sent to channel C1. Thread: C1/1234567890.000001"
             },
-            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var definition = CreateDefinition("denied-then-recovered");
@@ -240,7 +404,7 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
                 Result = "Tool access denied: approval_required_unattended",
                 FailureCode = ToolResultOutput.AccessDeniedFailureCode
             },
-            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var definition = CreateDefinition("denied-and-undelivered");
@@ -268,7 +432,7 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
                 ToolName = new Netclaw.Tools.ToolName("send_channel_message"),
                 Result = "Message sent to channel C1. Thread: C1/1234567890.000001"
             },
-            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var definition = CreateDefinition("notify-success-test");
@@ -290,7 +454,7 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
         var pipeline = new ScriptedSessionPipeline(sessionId =>
         [
             new TextOutput("No new opportunities found.") { SessionId = sessionId },
-            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var definition = CreateDefinition("conditional-no-notify") with
@@ -314,7 +478,7 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
         var pipeline = new ScriptedSessionPipeline(sessionId =>
         [
             new TextOutput("Some output.") { SessionId = sessionId },
-            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         // Default policy is Required — should fail when no notification tool is invoked
@@ -342,7 +506,7 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
                 ToolName = new Netclaw.Tools.ToolName("send_channel_message"),
                 Result = "Error: channel not found"
             },
-            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var definition = CreateDefinition("conditional-notify-error") with
@@ -366,7 +530,7 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
     {
         var pipeline = new ScriptedSessionPipeline(sessionId =>
         [
-            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var definition = CreateDefinition("filter-check") with { DeliveryInstructions = string.Empty };
@@ -647,6 +811,73 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
             Task.FromResult<ISessionResponse>(CommandAck.For(feedback.SessionId));
     }
 
+    private sealed class ControlledSessionPipeline : ISessionPipeline
+    {
+        private readonly TaskCompletionSource<ChannelInput> _inputCaptured =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<IReadOnlyList<SessionOutput>> _outputs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public SessionId? CapturedSessionId { get; private set; }
+        public SessionPipelineOptions? CapturedOptions { get; private set; }
+        public Task<ChannelInput> InputCaptured => _inputCaptured.Task;
+
+        public Task<MaterializedSession> CreateAsync(
+            SessionId sessionId,
+            SessionPipelineOptions options,
+            IMaterializer? materializer = null,
+            CancellationToken cancellationToken = default)
+        {
+            CapturedSessionId = sessionId;
+            CapturedOptions = options;
+            var killSwitch = KillSwitches.Shared($"controlled-{sessionId.Value}");
+            var input = Sink.ForEach<ChannelInput>(channelInput =>
+                {
+                    _inputCaptured.TrySetResult(channelInput);
+                })
+                .MapMaterializedValue<NotUsed>(_ => NotUsed.Instance);
+            var output = Source.UnfoldAsync<int, SessionOutput>(0, async index =>
+            {
+                var outputs = await _outputs.Task.ConfigureAwait(false);
+                return index < outputs.Count ? (index + 1, outputs[index]) : default;
+            })
+                .Concat(Source.Maybe<SessionOutput>().MapMaterializedValue(_ => NotUsed.Instance))
+                .Via(killSwitch.Flow<SessionOutput>());
+
+            return Task.FromResult(new MaterializedSession(input, output, killSwitch));
+        }
+
+        public void ReleaseOutputs(params SessionOutput[] outputs)
+            => _outputs.TrySetResult(outputs);
+
+        public Task SendFeedbackAsync(IWithSessionId feedback, CancellationToken ct = default)
+            => Task.CompletedTask;
+
+        public Task<ISessionResponse> SendFeedbackAndWaitAsync(IWithSessionId feedback, CancellationToken ct = default)
+            => Task.FromResult<ISessionResponse>(CommandAck.For(feedback.SessionId));
+    }
+
+    private async Task<ChannelInput> ExpectCapturedInputAsync(
+        ControlledSessionPipeline pipeline,
+        Akka.TestKit.TestProbe probe)
+    {
+        using var cancellation = new CancellationTokenSource();
+        var earlyCompletion = probe.ExpectMsgAsync<ReminderExecutionCompleted>(
+            TimeSpan.FromSeconds(5),
+            cancellationToken: cancellation.Token).AsTask();
+        var first = await Task.WhenAny(pipeline.InputCaptured, earlyCompletion);
+        if (first == earlyCompletion)
+        {
+            var completed = await earlyCompletion;
+            Assert.True(completed.Success, completed.ErrorMessage);
+            Assert.Fail("The reminder completed before it created the session input.");
+        }
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await earlyCompletion);
+        return await pipeline.InputCaptured;
+    }
+
     // ── Audience resolution tests ─────────────────────────────────────────────
 
     [Fact]
@@ -654,7 +885,7 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
     {
         var pipeline = new ScriptedSessionPipeline(sessionId =>
         [
-            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var definition = CreateDefinition("audience-override") with
@@ -678,7 +909,7 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
     {
         var pipeline = new ScriptedSessionPipeline(sessionId =>
         [
-            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var target = new ChannelDeliveryTargetInfo(
@@ -720,7 +951,7 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
     {
         var pipeline = new ScriptedSessionPipeline(sessionId =>
         [
-            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var definition = CreateDefinition("audience-team-default") with
@@ -744,7 +975,7 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
     {
         var pipeline = new ScriptedSessionPipeline(sessionId =>
         [
-            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var definition = CreateDefinition("boundary-preserved") with
@@ -771,7 +1002,7 @@ public class ReminderExecutionActorTests : TestKit, IAsyncDisposable
     {
         var pipeline = new ScriptedSessionPipeline(sessionId =>
         [
-            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sessionId, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         // Use Kind = None so success is not gated on send_channel_message

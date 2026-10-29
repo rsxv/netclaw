@@ -35,19 +35,22 @@ internal static class SessionLlmInvoker
         SessionAffinityContext.SessionId = sessionId.Value;
         try
         {
+            // This code runs off the actor thread, so it sends with no sender. The implicit sender comes from a
+            // thread-static actor cell, and a test kit can leave a test actor of another system there. The session
+            // can reply to the sender of the message that ends a turn.
             var response = await StreamAsync(client, messages, options, self, callId, cancellationToken);
-            self.Tell(response);
+            self.Tell(response, ActorRefs.NoSender);
         }
         catch (OperationCanceledException ex)
         {
             // The actor's ProcessingWatchdog cancelled the CTS — let the watchdog
             // handler produce the user-facing error. Send a typed failure so the
             // actor can clean up, but the watchdog message is the authoritative timeout.
-            self.Tell(new LlmCallFailed(ex) { CallId = callId });
+            self.Tell(new LlmCallFailed(ex) { CallId = callId }, ActorRefs.NoSender);
         }
         catch (Exception ex)
         {
-            self.Tell(new LlmCallFailed(ex) { CallId = callId });
+            self.Tell(new LlmCallFailed(ex) { CallId = callId }, ActorRefs.NoSender);
         }
         finally
         {
@@ -81,7 +84,7 @@ internal static class SessionLlmInvoker
                 // All deltas emitted for this update share its substantive-ness, so the
                 // watchdog promotes off the prefill budget only on real output, not on a
                 // content-free keepalive.
-                var substantive = cls.HasSubstantiveContent;
+                var activity = cls.Activity;
                 var dispatched = false;
                 foreach (var content in update.Contents)
                 {
@@ -92,7 +95,7 @@ internal static class SessionLlmInvoker
                             if (textDeltaCount == 1)
                             {
                                 pendingTextDelta = text.Text;
-                                self.Tell(new LlmResponseDeltaReceived(EmptyTextContent) { CallId = callId, Substantive = substantive });
+                                self.Tell(new LlmResponseDeltaReceived(EmptyTextContent) { CallId = callId, Activity = activity }, ActorRefs.NoSender);
                             }
                             else
                             {
@@ -101,11 +104,11 @@ internal static class SessionLlmInvoker
                                     self.Tell(new LlmResponseDeltaReceived(new TextContent(pendingTextDelta))
                                     {
                                         CallId = callId,
-                                        Substantive = substantive
-                                    });
+                                        Activity = activity
+                                    }, ActorRefs.NoSender);
                                 }
 
-                                self.Tell(new LlmResponseDeltaReceived(content) { CallId = callId, Substantive = substantive });
+                                self.Tell(new LlmResponseDeltaReceived(content) { CallId = callId, Activity = activity }, ActorRefs.NoSender);
                                 dispatched = true;
                             }
                             break;
@@ -115,7 +118,7 @@ internal static class SessionLlmInvoker
                             if (thinkingDeltaCount == 1)
                             {
                                 pendingThinkingDelta = thinking.Text;
-                                self.Tell(new LlmResponseDeltaReceived(EmptyTextContent) { CallId = callId, Substantive = substantive });
+                                self.Tell(new LlmResponseDeltaReceived(EmptyTextContent) { CallId = callId, Activity = activity }, ActorRefs.NoSender);
                             }
                             else
                             {
@@ -124,11 +127,11 @@ internal static class SessionLlmInvoker
                                     self.Tell(new LlmResponseDeltaReceived(new TextReasoningContent(pendingThinkingDelta))
                                     {
                                         CallId = callId,
-                                        Substantive = substantive
-                                    });
+                                        Activity = activity
+                                    }, ActorRefs.NoSender);
                                 }
 
-                                self.Tell(new LlmResponseDeltaReceived(content) { CallId = callId, Substantive = substantive });
+                                self.Tell(new LlmResponseDeltaReceived(content) { CallId = callId, Activity = activity }, ActorRefs.NoSender);
                                 dispatched = true;
                             }
                             break;
@@ -140,7 +143,7 @@ internal static class SessionLlmInvoker
                 // even though it streams no UI text; a prompt_progress heartbeat is not).
                 if (!dispatched)
                 {
-                    self.Tell(new LlmResponseDeltaReceived(EmptyTextContent) { CallId = callId, Substantive = substantive });
+                    self.Tell(new LlmResponseDeltaReceived(EmptyTextContent) { CallId = callId, Activity = activity }, ActorRefs.NoSender);
                 }
             },
             cancellationToken);
@@ -150,7 +153,6 @@ internal static class SessionLlmInvoker
             Response = result.Response,
             StreamedText = result.Diagnostics.TextDeltaCount > 1,
             StreamedThinking = result.Diagnostics.ThinkingDeltaCount > 1,
-            RecallResult = null,
             CallId = callId
         };
     }

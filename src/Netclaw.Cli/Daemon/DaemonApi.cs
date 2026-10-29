@@ -11,6 +11,7 @@ using System.Text.Json;
 using Netclaw.Cli.Config;
 using Netclaw.Cli.Json;
 using Netclaw.Configuration;
+using Netclaw.Configuration.Secrets;
 
 namespace Netclaw.Cli.Daemon;
 
@@ -30,22 +31,26 @@ public sealed class DaemonApi
     private readonly IHttpClientFactory _factory;
     private readonly string _endpoint;
     private readonly NetclawPaths _paths;
+    private readonly LocalControlPairingProofProtector _proofProtector;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>
     /// Default daemon endpoint when no override is configured.
     /// </summary>
     public const string DefaultEndpoint = "http://127.0.0.1:5199";
 
-    public DaemonApi(IHttpClientFactory factory, IConfiguration configuration, NetclawPaths paths)
+    public DaemonApi(
+        IHttpClientFactory factory,
+        IConfiguration configuration,
+        NetclawPaths paths,
+        LocalControlPairingProofProtector proofProtector,
+        TimeProvider timeProvider)
     {
         _factory = factory;
         _paths = paths;
+        _proofProtector = proofProtector;
+        _timeProvider = timeProvider;
         _endpoint = ResolveEndpoint(paths);
-    }
-
-    internal DaemonApi(IHttpClientFactory factory, IConfiguration configuration)
-        : this(factory, configuration, new NetclawPaths())
-    {
     }
 
     /// <summary>
@@ -58,18 +63,20 @@ public sealed class DaemonApi
 
         return (Environment.GetEnvironmentVariable("NETCLAW_DAEMON_ENDPOINT")
             ?? ClientConfigFile.ReadEndpoint(paths)
-            ?? ResolveDaemonConfigEndpoint(paths)
+            ?? ResolveDaemonConfigEndpoint(paths, lenient: true)
             ?? DefaultEndpoint).TrimEnd('/');
     }
 
-    private static string? ResolveDaemonConfigEndpoint(NetclawPaths paths)
+    private static string ResolveDaemonConfigEndpoint(NetclawPaths paths, bool lenient)
     {
-        var daemonConfig = DaemonClientFactory.LoadDaemonConfig(paths);
+        var daemonConfig = DaemonClientFactory.LoadDaemonConfig(paths, lenient);
         return DaemonControlPlaneEndpointResolver.ResolveFallbackEndpoint(daemonConfig);
     }
 
+    // local-control-strict-config:begin
     internal static string ResolveLocalControlEndpoint(NetclawPaths paths)
-        => ResolveDaemonConfigEndpoint(paths) ?? DefaultEndpoint;
+        => ResolveDaemonConfigEndpoint(paths, lenient: false);
+    // local-control-strict-config:end
 
     internal static SocketsHttpHandler CreateLocalControlHttpHandler()
         => new()
@@ -77,6 +84,9 @@ public sealed class DaemonApi
             AllowAutoRedirect = false,
             UseProxy = false,
         };
+
+    internal static HttpClient CreateLocalControlHttpClient()
+        => new(CreateLocalControlHttpHandler()) { Timeout = DefaultTimeout };
 
     /// <summary>
     /// The resolved daemon base endpoint (e.g. <c>http://127.0.0.1:5199</c>).
@@ -86,37 +96,62 @@ public sealed class DaemonApi
 
     internal string LocalControlEndpoint => ResolveLocalControlEndpoint(_paths);
 
-    internal async Task<PairingCodeRequestResult> RequestPairingCodeAsync(
-        string proof,
+    internal Task<LocalControlResult<PairingCodeResultDto>> RequestPairingCodeAsync(CancellationToken ct = default)
+    {
+        var proof = _proofProtector.CreateProof(LocalControlOperation.GeneratePairingCode, _timeProvider.GetUtcNow());
+        return PostLocalControlAsync<LocalControlPairingCodeRequest, PairingCodeResultDto>(
+            "pairing-code", new LocalControlPairingCodeRequest(proof), ct);
+    }
+
+    /// <summary>
+    /// Reads the tokens of a completed provider OAuth flow. The proof binds to
+    /// <paramref name="state"/>. It goes only to the direct local-control endpoint,
+    /// never through a proxy, a redirect, or the paired-client endpoint.
+    /// </summary>
+    internal Task<LocalControlResult<ProviderOAuthResultDto>> ReadProviderOAuthResultAsync(
+        string state,
         CancellationToken ct = default)
+    {
+        var proof = _proofProtector.CreateProof(
+            LocalControlOperation.ReadProviderOAuthResult(state),
+            _timeProvider.GetUtcNow());
+        return PostLocalControlAsync<LocalControlProviderOAuthResultRequest, ProviderOAuthResultDto>(
+            "provider-oauth-result", new LocalControlProviderOAuthResultRequest(state, proof), ct);
+    }
+
+    private async Task<LocalControlResult<TResult>> PostLocalControlAsync<TRequest, TResult>(
+        string operationPath,
+        TRequest request,
+        CancellationToken ct)
+        where TResult : class
     {
         using var cts = CreateTimeoutCts(DefaultTimeout, ct);
         var client = _factory.CreateClient(LocalControlHttpClientName);
         using var response = await client.PostAsJsonAsync(
-            $"{LocalControlEndpoint}/api/local-control/v1/pairing-code",
-            new LocalControlPairingCodeRequest(proof),
+            $"{LocalControlEndpoint}/api/local-control/v1/{operationPath}",
+            request,
             JsonDefaults.Api,
             cts.Token);
 
         var stream = await response.Content.ReadAsStreamAsync(cts.Token);
         if (response.IsSuccessStatusCode)
         {
-            var result = await JsonSerializer.DeserializeAsync<PairingCodeResultDto>(stream, JsonDefaults.Api, cts.Token);
-            return new PairingCodeRequestResult(response.StatusCode, result, null);
+            var result = await JsonSerializer.DeserializeAsync<TResult>(stream, JsonDefaults.Api, cts.Token);
+            return new LocalControlResult<TResult>(response.StatusCode, result, null);
         }
 
-        PairingCodeErrorResponse? error = null;
+        LocalControlErrorResponse? error = null;
         try
         {
-            error = await JsonSerializer.DeserializeAsync<PairingCodeErrorResponse>(stream, JsonDefaults.Api, cts.Token);
+            error = await JsonSerializer.DeserializeAsync<LocalControlErrorResponse>(stream, JsonDefaults.Api, cts.Token);
         }
         catch (JsonException)
         {
-            error = new PairingCodeErrorResponse(
+            error = new LocalControlErrorResponse(
                 response.ReasonPhrase ?? "The daemon returned an invalid error response.");
         }
 
-        return new PairingCodeRequestResult(response.StatusCode, null, error?.Error);
+        return new LocalControlResult<TResult>(response.StatusCode, null, error?.Error);
     }
 
     // ── Status ────────────────────────────────────────────────────────
@@ -204,6 +239,40 @@ public sealed class DaemonApi
         response.EnsureSuccessStatusCode();
         var stream = await response.Content.ReadAsStreamAsync(cts.Token);
         return await JsonSerializer.DeserializeAsync<SkillInventory.Response>(stream, JsonDefaults.Api, cts.Token);
+    }
+
+    /// <summary>
+    /// Fetches one skill's detail from the daemon's live registry. Returns null when
+    /// the daemon does not know the name. Throws <see cref="HttpRequestException"/>
+    /// (or a timeout) when the daemon is unreachable; callers report that rather than
+    /// degrading to a disk scan.
+    /// </summary>
+    public async Task<SkillInventory.Detail?> GetSkillAsync(string name, CancellationToken ct = default)
+    {
+        using var cts = CreateTimeoutCts(DefaultTimeout, ct);
+        var client = CreateHttpClient();
+        using var response = await client.GetAsync(
+            $"{_endpoint}/api/skills/{Uri.EscapeDataString(name)}", cts.Token);
+
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            // Two different failures share 404. A daemon that predates this route
+            // returns an empty 404; the route itself answers an unknown name with a
+            // problem body. Collapsing both into null would report a missing route as
+            // "skill not found" — the exact false negative this endpoint exists to fix.
+            var body = await response.Content.ReadAsStringAsync(cts.Token);
+            if (string.IsNullOrWhiteSpace(body))
+                throw new HttpRequestException(
+                    "the daemon does not serve /api/skills/{name} yet",
+                    inner: null,
+                    response.StatusCode);
+
+            return null;
+        }
+
+        response.EnsureSuccessStatusCode();
+        var stream = await response.Content.ReadAsStreamAsync(cts.Token);
+        return await JsonSerializer.DeserializeAsync<SkillInventory.Detail>(stream, JsonDefaults.Api, cts.Token);
     }
 
     /// <summary>
@@ -469,25 +538,31 @@ public sealed class DaemonApi
         => ProbeReadinessAsync(ResolveEndpoint(_paths), ct);
 
     /// <summary>
-    /// Probes the daemon this home runs for <c>netclaw daemon status</c>: a plain anonymous GET of
-    /// <c>/api/health/ready</c> at the endpoint <see cref="ResolveLocalControlEndpoint"/> yields
-    /// (ignoring <c>NETCLAW_DAEMON_ENDPOINT</c> and any paired remote endpoint). It builds no host
-    /// and no authenticated client, so it reads no secrets or keys, and it never throws: any failure
-    /// reports not ready.
+    /// Probes this home's daemon with an anonymous GET of <c>/api/health/ready</c>.
+    /// Local configuration supplies the address. Remote client endpoints do not affect the probe.
+    /// A failed address resolution returns no endpoint and creates no transport.
+    /// Other failures report not ready. Caller cancellation propagates.
     /// </summary>
-    internal static async Task<(bool Ready, string Endpoint)> ProbeLocalReadinessAsync(
+    internal static Task<(bool Ready, string? Endpoint)> ProbeLocalReadinessAsync(
         NetclawPaths paths, CancellationToken ct = default)
+        => ProbeLocalReadinessAsync(paths, CreateLocalControlHttpClient, ct);
+
+    internal static async Task<(bool Ready, string? Endpoint)> ProbeLocalReadinessAsync(
+        NetclawPaths paths, Func<HttpClient> createLocalControlHttpClient, CancellationToken ct)
     {
-        var endpoint = DefaultEndpoint;
+        ArgumentNullException.ThrowIfNull(createLocalControlHttpClient);
+        ct.ThrowIfCancellationRequested();
+        string? endpoint = null;
         try
         {
             endpoint = ResolveLocalControlEndpoint(paths);
-            using var http = new HttpClient(CreateLocalControlHttpHandler()) { Timeout = DefaultTimeout };
+            using var http = createLocalControlHttpClient();
             using var response = await http.GetAsync($"{endpoint}/api/health/ready", ct);
             return (response.IsSuccessStatusCode, endpoint);
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         {
+            ct.ThrowIfCancellationRequested();
             return (false, endpoint);
         }
     }
@@ -534,9 +609,18 @@ public sealed class DaemonApi
 
 internal sealed record LocalControlPairingCodeRequest(string Proof);
 
-internal sealed record PairingCodeErrorResponse(string Error);
+internal sealed record LocalControlProviderOAuthResultRequest(string State, string Proof);
 
-internal sealed record PairingCodeRequestResult(
+internal sealed record ProviderOAuthResultDto(
+    string AccessToken,
+    string? RefreshToken,
+    string? AccountId,
+    DateTimeOffset? ExpiresAt);
+
+internal sealed record LocalControlErrorResponse(string Error);
+
+internal sealed record LocalControlResult<T>(
     HttpStatusCode StatusCode,
-    PairingCodeResultDto? Result,
-    string? Error);
+    T? Result,
+    string? Error)
+    where T : class;

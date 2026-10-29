@@ -289,18 +289,44 @@ internal sealed class ToolAuthorizer
     // With no grant store, the rule does not apply, as for the exemption.
     private ToolAuthorizationDecision? NoCommand(ShellCall call)
         => _approvalService is not null && call.Analysis is { ProvesNoCommand: true }
+           && call.Approval?.Candidates.Any(static candidate => candidate.SourceCompoundRedirect is not null) != true
             ? call.Finish(ToolAuthorizationDecision.Allow(ToolAllowReason.ApprovalExemptShellCandidates))
             : null;
 
-    // Consent: a redirect of a command that runs no program gets the decision
-    // of its file tool, with the stored grants of that tool. This rule only
-    // records which file tool calls a grant covers. It never decides.
+    // File authority precedes Auto for composed scratch redirects. The existing file-tool grants supply consent.
     private async Task<ToolAuthorizationDecision?> FileToolGrantsAsync(ShellCall call, CancellationToken ct)
     {
-        if (_approvalService is null || call.CommandApproval is not { } approval)
+        var approval = call.CommandApproval;
+
+        // File-tool restrictions also precede an automatic shell allow for composed scratch redirects.
+        if (approval?.Candidates.Any(static candidate => candidate.UsesFileToolRedirects) == true)
+        {
+            var facts = ShellPolicyPathFacts.Create(approval.Candidates, _policy.ShellEnvironment.PathStyle);
+            var denial = _policy.ScreenNoProgramRedirects(
+                approval.Candidates.Select((candidate, index) => (candidate, facts[index])), call.Context);
+            if (denial is not null)
+                return call.Finish(denial);
+        }
+
+        if (_approvalService is null)
             return null;
 
-        foreach (var fileCall in _policy.GetRedirectsThatNeedConsent(approval, call.Context))
+        var fileCalls = approval is null
+            ? new HashSet<FileToolCall>()
+            : _policy.GetRedirectsThatNeedConsent(approval, call.Context).ToHashSet();
+        if (call.Analysis is { } analysis)
+        {
+            if (!_policy.TryGetCompoundRedirectFileCalls(analysis, call.Context, out var compoundFileCalls))
+            {
+                return call.Finish(ToolAuthorizationDecision.Deny(
+                    "shell_redirect_unproved",
+                    "Tool access denied: Netclaw cannot prove every compound redirect. The call did not run."));
+            }
+
+            fileCalls.UnionWith(compoundFileCalls.Select(static call => call.Call));
+        }
+
+        foreach (var fileCall in fileCalls)
         {
             var check = await StoredGrantCheck.RunAsync(
                 _approvalService,
@@ -548,13 +574,21 @@ internal sealed class ToolAuthorizer
         /// runs no program keeps a prompt when its file tool needs consent.
         /// </summary>
         internal ShellApprovalAnalysis? Approval => CommandApproval is { } approval
-            ? authorizer._policy.WithFileToolConsent(approval, context, GrantedFileToolCalls)
+            ? authorizer._policy.WithFileToolConsent(
+                approval,
+                Analysis ?? throw new InvalidOperationException("Shell approval has no parsed analysis."),
+                context,
+                GrantedFileToolCalls)
             : null;
 
         /// <summary>The file tool calls of redirects that a stored grant of the file tool covers.</summary>
         internal HashSet<FileToolCall> GrantedFileToolCalls { get; } = [];
 
-        internal ShellApprovalAnalysis? CommandApproval => DirectoryProof is { } proof
+        internal ShellApprovalAnalysis? CommandApproval => RawCommandApproval is { } approval
+            ? authorizer._policy.WithManagedTemporaryRedirects(approval, context)
+            : null;
+
+        private ShellApprovalAnalysis? RawCommandApproval => DirectoryProof is { } proof
             ? ToolAccessPolicy.WithDirectoryScopes(ParsedApproval!, proof)
             : ParsedApproval is { } parsed
                 ? WithLiteralTwins(ToolAccessPolicy.WithCommandCandidates(parsed))
@@ -586,7 +620,11 @@ internal sealed class ToolAuthorizer
                     _toolName,
                     context,
                     call.Arguments,
-                    Mode,
+                    Mode == ToolApprovalMode.Auto
+                        && Approval?.Candidates.Any(static candidate => candidate.UsesFileToolRedirects
+                            && candidate.Unresolved != ShellUnresolvedPart.None) == true
+                            ? ToolApprovalMode.Approval
+                            : Mode,
                     Approval,
                     WorkingDirectory),
                 Analysis,
@@ -604,6 +642,7 @@ internal sealed class ToolAuthorizer
                 continuation.ApprovalContext,
                 continuation.DirectoryScopes,
                 context,
+                continuation.Analysis,
                 out var projection)
                 ? projection
                 : null)).Value;

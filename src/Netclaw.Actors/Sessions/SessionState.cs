@@ -7,6 +7,8 @@ using System.Collections.Immutable;
 using Netclaw.Actors.Jobs;
 using Netclaw.Actors.Protocol;
 using Netclaw.Actors.Reminders;
+using Netclaw.Actors.SubAgents;
+using Netclaw.Tools;
 using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Actors.Sessions;
@@ -20,7 +22,7 @@ namespace Netclaw.Actors.Sessions;
 /// event via the <c>Apply</c> methods. Transient concerns (subscribers, message
 /// buffer, behavior) remain on the actor.
 /// </summary>
-public sealed record SessionState
+public sealed partial record SessionState
 {
     public sealed record AdoptedContextAuditRecord(
         string AuthorizedMessageId,
@@ -65,20 +67,6 @@ public sealed record SessionState
     public WorkingContext WorkingContext { get; init; } = WorkingContext.Empty;
 
     /// <summary>
-    /// In-memory best-effort dedup ledger for reminder-originated turns.
-    /// Populated by <see cref="Apply(TurnRecorded)"/> from non-null
-    /// <see cref="TurnRecorded.SourceReminderId"/> values and preserved
-    /// across compaction by <see cref="Apply(SessionCompacted)"/>.
-    /// Deliberately NOT persisted to <see cref="SessionSnapshot"/> — on
-    /// snapshot-based recovery the set starts empty and rebuilds from
-    /// post-snapshot journal replay. Duplicates across snapshot recovery
-    /// boundaries are an explicitly accepted tradeoff; see
-    /// <c>reminder-session-reentry</c> design doc D2.
-    /// </summary>
-    public IImmutableSet<ReminderId> ProcessedReminderIds { get; init; } =
-        ImmutableHashSet<ReminderId>.Empty;
-
-    /// <summary>
     /// Background jobs this session is waiting on. Persisted to snapshot
     /// because jobs are long-lived and must survive recovery.
     /// </summary>
@@ -88,10 +76,11 @@ public sealed record SessionState
     public ImmutableDictionary<string, AdoptedContextAuditRecord> AdoptedContextRecords { get; init; } =
         [];
 
+    /// <summary>Legacy coordination facts that survive journal truncation at a snapshot.</summary>
+    public ImmutableList<LegacyCoordinationEvidence> LegacyCoordinationEvidence { get; init; } = [];
+
     /// <summary>
-    /// In-memory best-effort dedup ledger for background-job-originated turns.
-    /// Same pattern as <see cref="ProcessedReminderIds"/> — not persisted to
-    /// snapshot, rebuilds from event replay.
+    /// Durable deduplication for completed and rejected background-job deliveries.
     /// </summary>
     public IImmutableSet<BackgroundJobId> ProcessedBackgroundJobIds { get; init; } =
         ImmutableHashSet<BackgroundJobId>.Empty;
@@ -107,11 +96,12 @@ public sealed record SessionState
         if (keys.Count > 256)
             keys = keys.RemoveRange(0, keys.Count - 256);
 
-        return this with
+        var admitted = this with
         {
             PendingInputs = PendingInputs.Add(evt),
             RecentSourceMessageKeys = keys
         };
+        return evt.ChildNotice is { } notice ? admitted.ApplyChildNotice(evt, notice) : admitted;
     }
 
     public SessionState CloseInputs(IReadOnlyList<InputId> inputIds)
@@ -120,8 +110,79 @@ public sealed record SessionState
             return this;
 
         var ids = inputIds.ToHashSet();
-        return this with { PendingInputs = PendingInputs.RemoveAll(evt => ids.Contains(evt.InputId)) };
+        var evidence = LegacyCoordinationEvidence.Select(item =>
+        {
+            if (item.Disposition is not (LegacyCoordinationDisposition.AppliedOrdinaryAdoption
+                or LegacyCoordinationDisposition.PreservedLegacyFacts)
+                || !item.ActiveInputIds.Any(ids.Contains))
+                return item;
+
+            var activeIds = item.ActiveInputIds.Where(id => !ids.Contains(id)).ToArray();
+            return item with
+            {
+                ActiveInputIds = activeIds
+            };
+        })
+        .Where(item => item.Disposition is not (LegacyCoordinationDisposition.AppliedOrdinaryAdoption
+                           or LegacyCoordinationDisposition.PreservedLegacyFacts)
+                       || item.ActiveInputIds.Count > 0 || item.HasRetainedFacts)
+        .ToImmutableList();
+
+        return this with
+        {
+            PendingInputs = PendingInputs.RemoveAll(evt => ids.Contains(evt.InputId)),
+            LegacyCoordinationEvidence = evidence
+        };
     }
+
+    public IReadOnlyList<InputAdmitted> GetExecutablePendingInputs()
+        => PendingInputs.Where(input => !IsLegacyInputQuarantined(input.InputId))
+            .Select(input => TryGetLegacyInputContext(input.InputId, out var context)
+                ? input with { TurnContext = context } : input).ToArray();
+
+    public bool IsLegacyInputQuarantined(InputId inputId)
+        => LegacyCoordinationEvidence.Any(evidence =>
+            (evidence.Disposition is LegacyCoordinationDisposition.QuarantinedInvalidAdoption
+                or LegacyCoordinationDisposition.UnresolvedLegacyChild)
+            && evidence.InputIds.Contains(inputId));
+
+    public bool TryGetLegacyChildDisposition(SubAgentRunId runId, out LegacyCoordinationEvidence evidence)
+    {
+        evidence = LegacyCoordinationEvidence.LastOrDefault(item =>
+            item.Disposition == LegacyCoordinationDisposition.UnresolvedLegacyChild
+            && item.ChildRunId == runId)!;
+        return evidence is not null;
+    }
+
+    public bool TryGetLegacyInputContext(InputId inputId, out TurnContextRecord context)
+    {
+        var evidence = LegacyCoordinationEvidence.LastOrDefault(item =>
+            item.Disposition == LegacyCoordinationDisposition.AppliedOrdinaryAdoption
+            && item.ActiveInputIds.Contains(inputId)
+            && item.AdoptedContext is not null);
+        if (evidence?.AdoptedContext is { } adoptedContext)
+        {
+            context = adoptedContext;
+            return true;
+        }
+
+        context = null!;
+        return false;
+    }
+
+    public SessionState RetainLegacyCoordinationEvidence(LegacyCoordinationEvidence evidence)
+        => this with { LegacyCoordinationEvidence = LegacyCoordinationEvidence.Add(evidence) };
+
+    public SessionState ClearLegacyChildApprovalEvents()
+        => this with
+        {
+            LegacyCoordinationEvidence = LegacyCoordinationEvidence
+                .Select(evidence => evidence with { ApprovalEvents = Array.Empty<SessionProtocol.ISessionEvent>() })
+                .Where(evidence => evidence.Disposition is LegacyCoordinationDisposition.QuarantinedInvalidAdoption
+                                   or LegacyCoordinationDisposition.UnresolvedLegacyChild
+                                   || evidence.ActiveInputIds.Count > 0 || evidence.HasRetainedFacts)
+                .ToImmutableList()
+        };
 
     public static string? SourceMessageKey(InputAdmitted evt)
         => string.IsNullOrWhiteSpace(evt.SourceMessageId)
@@ -129,26 +190,26 @@ public sealed record SessionState
             : $"{evt.TurnContext.ChannelType ?? string.Empty}:{evt.TurnContext.RequesterSenderId?.Value ?? string.Empty}:{evt.SourceMessageId}";
 
     public SessionState Apply(TurnRecorded evt)
-    {
-        var processedReminders = ProcessedReminderIds;
-        if (evt.SourceReminderId is { } reminderId && !string.IsNullOrEmpty(reminderId.Value))
-            processedReminders = processedReminders.Add(reminderId);
+        => Apply(evt, userAlreadyInHistory: false);
 
-        // Background-job dedup/remove/prune is delegated to the single shared
-        // helper so the replay path here and the live turn-completion path in
-        // LlmSessionActor cannot drift.
-        return (this with
+    internal SessionState Apply(TurnRecorded evt, bool userAlreadyInHistory)
+    {
+        var closed = CloseLegacyContinuation(evt.ChildContinuation, close: true)
+            .CloseInputs(evt.ConsumedInputIds);
+        // Live history already has the user message. Replay can restore it by input ID.
+        var history = userAlreadyInHistory || evt.ChildContinuation is not null
+            ? closed.History : closed.History.Add(evt.UserMessage);
+        return (closed with
         {
-            History = History.Add(evt.UserMessage).Add(evt.AssistantReply),
-            TurnCount = TurnCount + 1,
-            ProcessedReminderIds = processedReminders
+            History = history.Add(evt.AssistantReply),
+            TurnCount = closed.TurnCount + 1
         }).CompleteTurnBackgroundJobBookkeeping(evt.SourceBackgroundJobId);
     }
 
     /// <summary>
-    /// Single source of truth for per-turn background-job bookkeeping, shared by
-    /// the replay path (<see cref="Apply(TurnRecorded)"/>) and the live
-    /// turn-completion path (LlmSessionActor): dedup-records a delivery turn's
+    /// Single source of truth for per-turn background-job bookkeeping.
+    /// <see cref="Apply(TurnRecorded)"/> uses it for live and replay paths.
+    /// It dedup-records a delivery turn's
     /// job ID, removes the delivered entry, and prunes reaped entries that were
     /// surfaced in this turn's context block (so the agent learns of a reap
     /// exactly once instead of on every turn forever).
@@ -224,7 +285,6 @@ public sealed record SessionState
         {
             History = builder.ToImmutable(),
             WorkingContext = evt.WorkingContext ?? WorkingContext,
-            ProcessedReminderIds = ProcessedReminderIds,
             ProcessedBackgroundJobIds = ProcessedBackgroundJobIds,
             ActiveBackgroundJobs = ActiveBackgroundJobs,
             AdoptedContextRecords = AdoptedContextRecords
@@ -323,6 +383,18 @@ public sealed record SessionState
     }
 
     /// <summary>
+    /// Remove each earlier system nudge whose text starts with <paramref name="nudgeStart"/>, then add
+    /// <paramref name="nudge"/> at the end of history. The history then keeps only the latest nudge of that kind.
+    /// </summary>
+    public SessionState ReplaceSystemNudge(string nudgeStart, string nudge)
+    {
+        var earlier = $"{SystemNudgePrefix} {nudgeStart}";
+        var history = History.RemoveAll(message => IsSystemNudge(message)
+            && message.Content.StartsWith(earlier, StringComparison.Ordinal));
+        return (this with { History = history }).AddSystemNudge(nudge);
+    }
+
+    /// <summary>
     /// Insert the per-turn volatile context block (memory recall, current time,
     /// working context, skill hint, slash-command body, session overlay, turn
     /// restart notice, active background jobs) into history immediately BEFORE
@@ -371,7 +443,7 @@ public sealed record SessionState
                 Role = ChatRole.User,
                 Content = $"{SystemNudgePrefix} {nudge}]",
                 // Snapshot, never alias. The model-input media nudge is built from
-                // the caller's media accumulator (ModelInputMediaBuffer.DrainSnapshot),
+                // the batch tracker's media accumulator,
                 // which reuses/empties its backing list across batches.
                 // SerializableChatMessage is an immutable persistence type that must
                 // own its media list — without this copy the caller's reuse could
@@ -467,11 +539,18 @@ public sealed record SessionState
         {
             History = new List<SerializableChatMessage>(History),
             PendingInputs = PendingInputs.ToArray(),
+            ChildRuns = [.. ChildRuns.Values],
             RecentSourceMessageKeys = RecentSourceMessageKeys.ToArray(),
             TurnCount = TurnCount,
             Title = Title,
             WorkingContext = WorkingContext.IsEmpty ? null : WorkingContext,
             ActiveBackgroundJobs = [.. ActiveBackgroundJobs.Values],
+            ProcessedBackgroundJobIds = [.. ProcessedBackgroundJobIds],
+            LegacyCoordinationEvidence = LegacyCoordinationEvidence
+                .Where(evidence => evidence.Disposition is LegacyCoordinationDisposition.QuarantinedInvalidAdoption
+                                   or LegacyCoordinationDisposition.UnresolvedLegacyChild
+                                   || evidence.ActiveInputIds.Count > 0 || evidence.HasRetainedFacts)
+                .ToArray(),
             AdoptedContextRecords = [.. AdoptedContextRecords.Values
                 .OrderBy(record => record.AuthorizedMessageId, StringComparer.Ordinal)
                 .Select(record => new SessionSnapshot.AdoptedContextSnapshotRecord
@@ -529,12 +608,15 @@ public sealed record SessionState
         {
             History = ImmutableList.CreateRange(snapshot.History),
             PendingInputs = ImmutableList.CreateRange(snapshot.PendingInputs),
+            ChildRuns = snapshot.ChildRuns.ToImmutableDictionary(run => run.RunId),
             RecentSourceMessageKeys = ImmutableList.CreateRange(snapshot.RecentSourceMessageKeys),
             TurnCount = snapshot.TurnCount,
             Title = snapshot.Title,
             WorkingContext = snapshot.WorkingContext ?? WorkingContext.Empty,
             ActiveBackgroundJobs = activeJobs,
-            AdoptedContextRecords = adoptedContextRecords
+            ProcessedBackgroundJobIds = snapshot.ProcessedBackgroundJobIds.ToImmutableHashSet(),
+            AdoptedContextRecords = adoptedContextRecords,
+            LegacyCoordinationEvidence = [.. snapshot.LegacyCoordinationEvidence]
         };
     }
 }

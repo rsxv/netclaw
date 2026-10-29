@@ -101,13 +101,19 @@ public sealed class ApprovalContractGuardTests(ShellApprovalMatrixFixture fixtur
         Assert.Contains("project-tilde-content", run.Output);
     }
 
-    // Guard: the "file_write:control-plane" approval override key has no
-    // effect with the production protected paths. The configuration directory
-    // is write-denied before the approval mode is read.
+    // Guard: the configuration directory is write-denied before an approval mode
+    // is read, so no approval mode opens it. A retired "<tool>:control-plane"
+    // override key in an old configuration changes nothing either.
     [Theory]
-    [InlineData(ToolApprovalMode.Auto)]
-    [InlineData(ToolApprovalMode.Approval)]
-    public async Task Control_plane_approval_override_does_not_open_the_configuration_directory(ToolApprovalMode mode)
+    [InlineData("file_write", ToolApprovalMode.Auto)]
+    [InlineData("file_write", ToolApprovalMode.Approval)]
+    [InlineData("file_write", ToolApprovalMode.Deny)]
+    [InlineData("file_edit", ToolApprovalMode.Auto)]
+    [InlineData("file_edit", ToolApprovalMode.Approval)]
+    [InlineData("file_edit", ToolApprovalMode.Deny)]
+    public async Task No_approval_mode_opens_the_configuration_directory_to_a_file_tool(
+        string tool,
+        ToolApprovalMode mode)
     {
         await using var harness = await ShellApprovalHarness.CreateAsync(
             "control-plane-override",
@@ -119,19 +125,24 @@ public sealed class ApprovalContractGuardTests(ShellApprovalMatrixFixture fixtur
             {
                 PersonalApprovalOverrides = new Dictionary<string, ToolApprovalMode>
                 {
-                    ["file_write:control-plane"] = mode
+                    [tool] = mode,
+                    [tool + ":control-plane"] = mode
                 }
             });
         var target = harness.Paths.NetclawConfigPath;
-        var arguments = ToolInput.Create("Path", target, "Content", "{}");
+        Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+        await File.WriteAllTextAsync(target, "original", Ct);
+        var arguments = tool == "file_write"
+            ? ToolInput.Create("Path", target, "Content", "{}")
+            : ToolInput.Create("Path", target, "OldString", "original", "NewString", "changed");
 
-        var decision = await harness.EvaluateToolAsync("file_write", arguments, Ct);
-        var run = await harness.RunToolAsync("file_write", arguments, Ct);
+        var decision = await harness.EvaluateToolAsync(tool, arguments, Ct);
+        var run = await harness.RunToolAsync(tool, arguments, Ct);
 
         Assert.Equal(ApprovalOutcome.Denied, decision.Outcome);
         Assert.Equal("path_access_denied", decision.DenyReason);
         Assert.Equal(ApprovalOutcome.Denied, run.Outcome);
-        Assert.False(File.Exists(target));
+        Assert.Equal("original", await File.ReadAllTextAsync(target, Ct));
     }
 
     // Guard: allow checks compare paths with case. On a case-insensitive macOS
@@ -165,7 +176,9 @@ public sealed class ApprovalContractGuardTests(ShellApprovalMatrixFixture fixtur
         Assert.Equal("path_access_denied", variantRead.DenyReason);
 
         // An interactive reviewed phrase may read each path that the profile
-        // reads. Confine reads, so the reviewed-safe root check decides.
+        // reads. Issue #2554: a Personal read reaches the write profile, and the
+        // write profile is the shell trust zone. So the write root names the
+        // project only, and the trust zone check compares the paths.
         await using var interactive = await ShellApprovalHarness.CreateAsync(
             "macos-case-interactive",
             new ShellApprovalInvocation("true"),
@@ -174,13 +187,18 @@ public sealed class ApprovalContractGuardTests(ShellApprovalMatrixFixture fixtur
             Ct,
             policy: new ShellApprovalHarnessPolicy
             {
-                ConfigureTools = config =>
+                ConfigureToolsForProject = (config, projectDirectory) =>
                 {
                     config.AudienceProfiles.GlobalReadRoots = [];
                     config.AudienceProfiles.Personal.ReadFiles = new ToolFilesystemAccessProfile
                     {
                         Mode = ToolFilesystemMode.Roots,
                         Roots = []
+                    };
+                    config.AudienceProfiles.Personal.WriteFiles = new ToolFilesystemAccessProfile
+                    {
+                        Mode = ToolFilesystemMode.Roots,
+                        Roots = [projectDirectory]
                     };
                 }
             });
@@ -194,7 +212,12 @@ public sealed class ApprovalContractGuardTests(ShellApprovalMatrixFixture fixtur
         var exactShell = await interactive.EvaluateShellAsync($"cat '{project}'", Ct);
         var variantShell = await interactive.EvaluateShellAsync($"cat '{projectVariant}'", Ct);
 
+        // The variant is outside the trust zone, so no approval can open it.
+        // Before #2554, a write profile of All let the variant into the trust
+        // zone, and the variant needed approval. Now the read reach includes
+        // every trust zone path, so no path in the zone needs approval here.
         Assert.Equal(ApprovalOutcome.Allowed, exactShell.Outcome);
-        Assert.Equal(ApprovalOutcome.RequiresApproval, variantShell.Outcome);
+        Assert.Equal(ApprovalOutcome.Denied, variantShell.Outcome);
+        Assert.Equal("shell_path_outside_trusted_roots", variantShell.DenyReason);
     }
 }

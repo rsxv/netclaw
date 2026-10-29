@@ -24,6 +24,11 @@
       },
       DeliveryKind: {
         type: string,
+        enum: [
+          current_session,
+          channel,
+          none
+        ],
         description: How to deliver results: 'current_session' (reply here), 'channel' (post to a target), or 'none' (silent execution).
       },
       DeliveryTransport: {
@@ -36,7 +41,7 @@
       },
       DeliveryRequired: {
         type: boolean,
-        description: Fail execution if delivery doesn't succeed. Default true. Set false for audit/cleanup tasks.
+        description: Fail execution if a channel delivery doesn't succeed. Default true. Set false for audit/cleanup tasks. No effect for current_session delivery.
       },
       DeliveryInstructions: {
         type: string,
@@ -69,6 +74,7 @@
       Prompt,
       ScheduleType,
       Schedule,
+      DeliveryKind,
       _rationale
     ],
     additionalProperties: false,
@@ -146,6 +152,14 @@
     properties: {
       Action: {
         type: string,
+        enum: [
+          create,
+          edit,
+          patch,
+          delete,
+          write_file,
+          remove_file
+        ],
         description: Action to perform: create, edit, patch, delete, write_file, remove_file
       },
       Name: {

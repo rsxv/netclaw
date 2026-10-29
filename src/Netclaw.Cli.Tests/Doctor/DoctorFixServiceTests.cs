@@ -134,6 +134,38 @@ public sealed class DoctorFixServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task LeavesColonOverrideKeysForTheOperator()
+    {
+        var paths = NewPaths();
+        var config =
+            """
+            {
+              "configVersion": 1,
+              "Tools": {
+                "AudienceProfiles": {
+                  "Personal": {
+                    "ApprovalPolicy": {
+                      "ToolOverrides": { "file_write:control-plane": "Approval", "mcp:memorizer:store": "Approval" },
+                      "McpServerDefaults": { "notion:pages": "Approval" }
+                    }
+                  }
+                }
+              }
+            }
+            """;
+        await File.WriteAllTextAsync(paths.NetclawConfigPath, config, TestContext.Current.CancellationToken);
+
+        var service = ConfigOnlyService(paths);
+        var plan = await service.BuildPlanAsync(TestContext.Current.CancellationToken);
+        await service.ApplyAsync(plan, TestContext.Current.CancellationToken);
+
+        var after = await File.ReadAllTextAsync(paths.NetclawConfigPath, TestContext.Current.CancellationToken);
+        Assert.Contains("\"file_write:control-plane\": \"Approval\"", after, StringComparison.Ordinal);
+        Assert.Contains("\"mcp:memorizer:store\": \"Approval\"", after, StringComparison.Ordinal);
+        Assert.Contains("\"notion:pages\": \"Approval\"", after, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task RemovesStalePropertyViaSchemaFix()
     {
         var paths = NewPaths();
@@ -205,6 +237,34 @@ public sealed class DoctorFixServiceTests : IDisposable
         Assert.Equal(DoctorSeverity.Pass, result.Severity);
     }
 
+    // doctor --fix must not delete or replace an invalid output limit. Doctor reports it, and the
+    // operator fixes it. The stale SkillSync switch makes sure that a fix plan exists.
+    [Fact]
+    public async Task doctor_fix_keeps_invalid_limit()
+    {
+        var paths = NewPaths();
+        await File.WriteAllTextAsync(paths.NetclawConfigPath,
+            """
+            {
+              "configVersion": 1,
+              "Models": {
+                "Definitions": {
+                  "primary": { "Provider": "example-provider", "ModelId": "example-model", "MaxOutputTokens": -1 }
+                },
+                "Roles": { "Main": "primary" }
+              },
+              "SkillSync": { "Enabled": true, "DisableSystemSkillSync": true }
+            }
+            """, TestContext.Current.CancellationToken);
+
+        var plan = await ConfigOnlyService(paths).BuildPlanAsync(TestContext.Current.CancellationToken);
+
+        var fix = Assert.Single(plan.Fixes);
+        using var updated = JsonDocument.Parse(fix.UpdatedText);
+        Assert.Equal(-1, updated.RootElement.GetProperty("Models").GetProperty("Definitions")
+            .GetProperty("primary").GetProperty("MaxOutputTokens").GetInt32());
+    }
+
     [Fact]
     public async Task DynamicDescriptionReflectsAppliedFixes()
     {
@@ -261,13 +321,48 @@ public sealed class DoctorFixServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task RehydratesEnvFile_KeepsOperatorLines_AndKeepsTheFileMode()
+    {
+        var paths = NewPaths();
+        var unitPath = WriteWiredUnit(paths);
+        await File.WriteAllTextAsync(
+            paths.DaemonEnvironmentFilePath,
+            "NETCLAW_HOME=/x/home\n# proxy\nHTTP_PROXY=http://proxy.example:3128\nPATH=/usr/bin\n",
+            TestContext.Current.CancellationToken);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                paths.DaemonEnvironmentFilePath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+
+        var service = new DoctorFixService(paths, unitPath, systemdEnabled: true);
+        var plan = await service.BuildPlanAsync(TestContext.Current.CancellationToken);
+        await service.ApplyAsync(plan, TestContext.Current.CancellationToken);
+
+        var lines = (await File.ReadAllTextAsync(paths.DaemonEnvironmentFilePath, TestContext.Current.CancellationToken))
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal("NETCLAW_HOME=/x/home", lines[0]);
+        Assert.Equal("# proxy", lines[1]);
+        Assert.Equal("HTTP_PROXY=http://proxy.example:3128", lines[2]);
+        Assert.StartsWith($"PATH={InstallDir}:", lines[3], StringComparison.Ordinal);
+        Assert.Equal(4, lines.Length);
+        if (!OperatingSystem.IsWindows())
+        {
+            Assert.Equal(
+                UnixFileMode.UserRead | UnixFileMode.UserWrite,
+                File.GetUnixFileMode(paths.DaemonEnvironmentFilePath));
+        }
+    }
+
+    [Fact]
     public async Task NoEnvFix_WhenHealthy()
     {
         var paths = NewPaths();
         var unitPath = WriteWiredUnit(paths);
         await File.WriteAllTextAsync(
             paths.DaemonEnvironmentFilePath,
-            DaemonPathEnvironmentFile.Render(InstallDir, "/usr/bin"),
+            DaemonPathEnvironmentFile.Merge(null, InstallDir, "/usr/bin"),
             TestContext.Current.CancellationToken);
 
         var service = new DoctorFixService(paths, unitPath, systemdEnabled: true);

@@ -21,9 +21,18 @@ on:
 permissions:
   contents: read
 
+# One run per ref (or per PR). A newer run cancels the older one in the same
+# group, so overlapping dev pushes do not pile jobs onto the runner pool.
+concurrency:
+  group: pr_validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Test-${{matrix.os}}
+    # The 3-OS matrix is the PR gate. A post-merge push runs Post-merge Verify
+    # instead, so the expensive cross-platform legs stay off the merge path.
+    if: github.event_name != 'push'
     runs-on: ${{matrix.os}}
     timeout-minutes: 30
 
@@ -149,25 +158,46 @@ jobs:
 
   mutation-gates:
     # One job definition for every focused Stryker gate. Each matrix group shares
-    # one checkout, SDK install, and tool restore. To add a gate, add its script
-    # name (scripts/run-<name>-mutations.sh) to the lightest group. The groups
-    # are balanced by measured gate time (about 13 to 14 minutes each) so each
-    # one finishes well inside the job timeout and before the Windows test job.
+    # one checkout, SDK install, and tool restore. The session readiness gate
+    # has its own group because the existing groups run near the Windows test.
     name: Mutation Gates (${{ matrix.group }})
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         include:
-          - group: shell-analysis
-            gates: shell-command-analysis tool-authorizer-order mcp-artifact-admission
+          - group: shell-command-analysis-a
+            gates: shell-command-analysis-a
+          - group: shell-command-analysis-b
+            gates: shell-command-analysis-b
           - group: shell-assignment-and-paths
-            gates: shell-assignment shell-config-read path-access
-          - group: verb-chain-and-reminder
-            gates: exact-verb-chain reminder-execution literal-twin
-          - group: approval-and-authorization
-            gates: tool-authorization approval-directory skill-manage-guard no-program
+            gates: shell-assignment path-access
+          - group: config-read-and-admission
+            gates: shell-config-read tool-authorizer-order mcp-artifact-admission
+          - group: verb-chain
+            gates: exact-verb-chain
+          - group: reminder
+            gates: reminder-execution literal-twin stream-commit-gate shutdown-notice-identity
+          - group: authorization-and-directory
+            gates: tool-authorization approval-directory
+          - group: shell-consent
+            gates: shell-once-identity compound-redirect thinking-settings
+          - group: guard-and-authority
+            gates: skill-manage-guard no-program input-one-authority skill-remove
+          - group: stop-proof
+            gates: stop-proof secrets-plaintext-leaf local-daemon-address
+          - group: daemon-log-retention
+            gates: daemon-log-retention config-startup-reconciliation
+          - group: session-reliability
+            gates: tool-batch-readiness headless-stop-rule open-child-runs local-control-proof stopped-turn-continuation
+          - group: child-owner-and-report
+            gates: child-owner-and-report chat-close-dispatch-expiry
+          - group: loopback-host-origin
+            gates: loopback-host-origin curation-same-name
+          - group: child-consent
+            gates: child-consent text-answer-guard child-resume-gate
 
     steps:
       - name: "Checkout"
@@ -268,6 +298,7 @@ jobs:
 
   install-smoke:
     name: Install Script Smoke-${{ matrix.os }}
+    if: github.event_name != 'push'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
 
@@ -314,10 +345,7 @@ jobs:
           bash -n evals/run-evals.sh
           bash -n evals/run-background-evals.sh
           bash -n evals/cycle_evals.sh
-          python3 -m unittest discover -s evals -p test_background_evals.py -v
-          python3 -m unittest discover -s evals -p test_cycle_evals.py -v
-          python3 -m unittest discover -s evals -p test_cli_detector_evals.py -v
-          python3 -m unittest discover -s evals -p test_spill_steer_evals.py -v
+          python3 -m unittest discover -s evals -p 'test_*.py' -v
 
   approval-outcome-direction:
     name: Approval Outcome Direction
@@ -383,3 +411,42 @@ jobs:
       # so the two implementations can't silently drift.
       - name: "Generator precedence key matches the shared fixture"
         run: python3 feeds/scripts/semver_key.py --check feeds/scripts/semver-order.txt
+
+  post-merge-verify:
+    # An admin can bypass review and push straight to dev. The PR gate does not
+    # run for such a commit, so confirm the merged tree with a build and the
+    # unit tests on ubuntu. The PR run remains the full cross-platform gate.
+    name: Post-merge Verify
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v7
+        with:
+          lfs: true
+          fetch-depth: 0
+
+      - name: "Install .NET SDK"
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: "./global.json"
+
+      - name: "Restore .NET tools"
+        run: dotnet tool restore
+
+      - name: "Validate release notes parser"
+        shell: pwsh
+        run: ./scripts/smoke/release-notes-smoke.ps1
+
+      - name: "Update release notes"
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: "dotnet build"
+        run: dotnet build -c Release
+
+      - name: "dotnet test"
+        shell: bash
+        run: dotnet test -c Release --no-build --filter "Category!=NativeShell" --blame-hang-timeout 300s --blame-hang-dump-type full --results-directory ./TestResults

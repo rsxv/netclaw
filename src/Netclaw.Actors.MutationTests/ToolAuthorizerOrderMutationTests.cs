@@ -34,7 +34,7 @@ public sealed class ToolAuthorizerOrderMutationTests : IDisposable
     {
         _paths.EnsureDirectoriesExist();
         _storage = SessionStoragePaths.CreateVersion2(
-            new SessionStorageEnvelopeRoot(Path.Combine(_paths.SessionsDirectory, "current")));
+            new SessionStorageEnvelopeRoot(Path.Combine(_paths.SessionsDirectory, "current")), ManagedTemporaryLayout.InsideSessionStorage.Instance);
         Directory.CreateDirectory(_storage.SessionDirectory.Value);
         _outsideDirectory = Path.Combine(_paths.BasePath, "outside");
         Directory.CreateDirectory(_outsideDirectory);
@@ -585,9 +585,6 @@ public sealed class ToolAuthorizerOrderMutationTests : IDisposable
         return current;
     }
 
-    private sealed class UnexpectedApprovalBridge : IParentConsentBridge
-    {
-        public Task<ConsentStep> RequestConsentAsync(ParentApprovalRequest request, CancellationToken ct) =>
-            throw new InvalidOperationException("The authorizer must not request consent.");
-    }
+    // Only the capability matters: the authorizer throws ToolApprovalRequiredException and never asks a bridge.
+    private sealed class UnexpectedApprovalBridge : IParentApprovalBridge;
 }

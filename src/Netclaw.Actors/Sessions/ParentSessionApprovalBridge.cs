@@ -45,43 +45,22 @@ internal sealed record ConsentStep(ConsentAnswer Answer, OneTimeConsent? RetryCo
 }
 
 /// <summary>
-/// The request contract of a parent consent bridge. A sub-agent sends the
-/// immutable approval context and receives the consent step. The parent
-/// session and the sub-agent use the same <see cref="ParentSessionApprovalBridge"/>.
+/// The consent loop of the session's own tool calls: one prompt shape, one wait with the session's approval timeout,
+/// and one decision from the answer. A child does not wait here: it parks, and the owner asks the run requester
+/// (durable-child-consent-wait, design D1).
 /// </summary>
-internal interface IParentConsentBridge : IParentApprovalBridge
-{
-    Task<ConsentStep> RequestConsentAsync(
-        ParentApprovalRequest request,
-        CancellationToken ct);
-}
-
-/// <summary>
-/// The one consent loop of an interactive session. The session's own tool
-/// calls and the tool calls of its sub-agents ask the operator here: one prompt
-/// shape, one wait with the session's approval timeout, and one decision from
-/// the answer. A sub-agent receives this object as its parent bridge.
-/// </summary>
-internal sealed class ParentSessionApprovalBridge : IParentConsentBridge
+internal sealed class ParentSessionApprovalBridge : IParentApprovalBridge
 {
     private readonly IApprovalChannel _channel;
     private readonly Action<ToolInteractionRequestDispatch> _emitRequest;
     private readonly ToolExecutionTimeout _timeout;
-    private readonly SessionId _sessionId;
-    private readonly string _approvalScopeId;
-    private readonly SenderId? _requesterSenderId;
-    private readonly PrincipalClassification? _requesterPrincipal;
-    private readonly bool _hasAdoptedContext;
-    private readonly bool _hasThirdPartyAdoptedContext;
-    private readonly IReadOnlyList<string> _adoptedSpeakerIds;
-    private int _nextApprovalRequestId;
+    private readonly ApprovalRequestBuilder _requests;
 
     public ParentSessionApprovalBridge(
         IApprovalChannel channel,
         Action<ToolInteractionRequestDispatch> emitRequest,
         ToolExecutionTimeout timeout,
         SessionId sessionId,
-        string approvalScopeId,
         SenderId? requesterSenderId,
         PrincipalClassification? requesterPrincipal,
         bool hasAdoptedContext,
@@ -94,13 +73,13 @@ internal sealed class ParentSessionApprovalBridge : IParentConsentBridge
         _channel = channel;
         _emitRequest = emitRequest;
         _timeout = timeout;
-        _sessionId = sessionId;
-        _approvalScopeId = approvalScopeId;
-        _requesterSenderId = requesterSenderId;
-        _requesterPrincipal = requesterPrincipal;
-        _hasAdoptedContext = hasAdoptedContext;
-        _hasThirdPartyAdoptedContext = hasThirdPartyAdoptedContext;
-        _adoptedSpeakerIds = adoptedSpeakerIds;
+        _requests = new ApprovalRequestBuilder(
+            sessionId,
+            requesterSenderId,
+            requesterPrincipal,
+            hasAdoptedContext,
+            hasThirdPartyAdoptedContext,
+            adoptedSpeakerIds);
     }
 
     /// <summary>
@@ -111,34 +90,103 @@ internal sealed class ParentSessionApprovalBridge : IParentConsentBridge
     public Task<ConsentStep> RequestSessionConsentAsync(
         ParentApprovalRequest request,
         CancellationToken ct)
-        => PromptAsync(request.CallId, request, persistApprovalState: true, ct);
-
-    /// <summary>
-    /// Asks for consent for a call of a sub-agent. The prompt gets a call id in
-    /// the spawning call's scope. The session does not journal the wait,
-    /// because a sub-agent cannot resume after passivation.
-    /// </summary>
-    public Task<ConsentStep> RequestConsentAsync(
-        ParentApprovalRequest request,
-        CancellationToken ct)
-    {
-        EnsureAuthorityContext();
-        return PromptAsync(CreateParentCallId(), request, persistApprovalState: false, ct);
-    }
+        => PromptAsync(_requests.ForSessionCall(request), request, ct);
 
     private async Task<ConsentStep> PromptAsync(
-        ToolCallId promptCallId,
+        ToolInteractionRequestDispatch dispatch,
         ParentApprovalRequest request,
-        bool persistApprovalState,
         CancellationToken ct)
     {
+        var waitTask = _channel.WaitForApprovalAsync(dispatch.Request.CallId, _timeout.Value, ct);
+        _emitRequest(dispatch);
+        return ConsentStep.From(await waitTask, request.CallName, request.Approval);
+    }
+}
+
+/// <summary>
+/// Makes the approval request of one session. The request of a session call and the request of a child call have one
+/// shape (durable-child-consent-wait, design D2). The builder copies the gate facts of the call to the request without
+/// change, and it binds the request to the requester of the session turn.
+/// </summary>
+internal sealed class ApprovalRequestBuilder
+{
+    private readonly SessionId _sessionId;
+    private readonly SenderId? _requesterSenderId;
+    private readonly PrincipalClassification? _requesterPrincipal;
+    private readonly bool _hasAdoptedContext;
+    private readonly bool _hasThirdPartyAdoptedContext;
+    private readonly IReadOnlyList<string> _adoptedSpeakerIds;
+
+    public ApprovalRequestBuilder(
+        SessionId sessionId,
+        SenderId? requesterSenderId,
+        PrincipalClassification? requesterPrincipal,
+        bool hasAdoptedContext,
+        bool hasThirdPartyAdoptedContext,
+        IReadOnlyList<string> adoptedSpeakerIds)
+    {
+        _sessionId = sessionId;
+        _requesterSenderId = requesterSenderId;
+        _requesterPrincipal = requesterPrincipal;
+        _hasAdoptedContext = hasAdoptedContext;
+        _hasThirdPartyAdoptedContext = hasThirdPartyAdoptedContext;
+        _adoptedSpeakerIds = adoptedSpeakerIds;
+    }
+
+    /// <summary>
+    /// Makes the request for a call of the session itself. The request uses the call ID of the call, and the session
+    /// journals the wait.
+    /// </summary>
+    public ToolInteractionRequestDispatch ForSessionCall(ParentApprovalRequest request)
+        => Build(request.CallId, request) with
+        {
+            ManagedTemporaryDirectory = request.Approval.IsManagedTemporaryRetry
+                ? request.Approval.ManagedTemporaryDirectory
+                : null
+        };
+
+    /// <summary>
+    /// Makes the request for a parked call of a child run, with the call ID <paramref name="promptCallId"/>. The
+    /// request keeps the call ID of the child. The owner of the run journals the request.
+    /// </summary>
+    /// <exception cref="ParentApprovalUnavailableException">
+    /// The builder has no requester that can answer the request.
+    /// </exception>
+    public ToolInteractionRequestDispatch ForChildCall(ToolCallId promptCallId, ParentApprovalRequest request)
+    {
+        EnsureAuthorityContext();
+        // The retry target of a parked child call is deferred, so a child prompt carries no managed temporary
+        // directory.
+        return Build(promptCallId, request) with { OriginalChildCallId = request.CallId };
+    }
+
+    private void EnsureAuthorityContext()
+    {
+        // Approval responses are authorized against the parent requester. If we
+        // cannot reconstruct that authority context, emitting a prompt would let
+        // the channel decide without a safe requester binding.
+        if (_requesterPrincipal is null)
+            throw new ParentApprovalUnavailableException(
+                "Sub-agent approval requires parent requester principal context.");
+
+        if (_requesterPrincipal is not PrincipalClassification.VerifiedAutomation
+            && _requesterSenderId is null)
+        {
+            throw new ParentApprovalUnavailableException(
+                "Sub-agent approval requires parent requester sender context.");
+        }
+    }
+
+    private ToolInteractionRequestDispatch Build(
+        ToolCallId promptCallId,
+        ParentApprovalRequest request)
+    {
         var approval = request.Approval;
-        var waitTask = _channel.WaitForApprovalAsync(promptCallId, _timeout.Value, ct);
 
         // Emit verbatim from the gate's computed options, so that the
         // persistent-grant buttons stay the same for the session and its
         // sub-agents.
-        _emitRequest(new ToolInteractionRequestDispatch(new ToolInteractionRequest
+        return new ToolInteractionRequestDispatch(new ToolInteractionRequest
         {
             SessionId = _sessionId,
             Kind = "approval",
@@ -163,45 +211,6 @@ internal sealed class ParentSessionApprovalBridge : IParentConsentBridge
                                  || approval.RepositoryCommonDirectory is not null)
                 .Select(static option => new ToolInteractionOption(option.Key, option.Label))
                 .ToList()
-        }, persistApprovalState)
-        {
-            // Only a journaled wait can restore the managed temporary retry after passivation.
-            ManagedTemporaryDirectory = persistApprovalState && approval.IsManagedTemporaryRetry
-                ? approval.ManagedTemporaryDirectory
-                : null
         });
-
-        return ConsentStep.From(await waitTask, request.CallName, approval);
-    }
-
-    private ToolCallId CreateParentCallId()
-    {
-        // This prompt is created by the session actor but used by thread-pool
-        // tool tasks. Multiple child tool calls can request approval at once,
-        // so the sequence allocation is not actor-mailbox confined.
-        var requestId = Interlocked.Increment(ref _nextApprovalRequestId);
-
-        // Child call ids are only unique inside the sub-agent's tool loop. The
-        // parent approval channel is session-wide, so include the spawning tool
-        // call scope plus a per-prompt sequence. Keep this short: approval
-        // button payloads are capped by the most restrictive channel adapter.
-        return new ToolCallId($"{_approvalScopeId}/subagent-approval/{requestId}");
-    }
-
-    private void EnsureAuthorityContext()
-    {
-        // Approval responses are authorized against the parent requester. If we
-        // cannot reconstruct that authority context, emitting a prompt would let
-        // the channel decide without a safe requester binding.
-        if (_requesterPrincipal is null)
-            throw new ParentApprovalUnavailableException(
-                "Sub-agent approval requires parent requester principal context.");
-
-        if (_requesterPrincipal is not PrincipalClassification.VerifiedAutomation
-            && _requesterSenderId is null)
-        {
-            throw new ParentApprovalUnavailableException(
-                "Sub-agent approval requires parent requester sender context.");
-        }
     }
 }

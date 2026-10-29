@@ -13,6 +13,7 @@ using Microsoft.Extensions.AI;
 using Netclaw.Actors.Channels;
 using Netclaw.Actors.Protocol;
 using Netclaw.Actors.Reminders;
+using Netclaw.Actors.Sessions;
 using Netclaw.Channels;
 using Netclaw.Channels.Telemetry;
 using Netclaw.Configuration;
@@ -39,9 +40,9 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
     // No streaming state needed — Slack receives TextOutput only, not TextDeltaOutput.
 
     // Slack tells the session about a delivery failure at turn completion, not
-    // at post time, so it keeps the failure descriptor of the last failed post.
-    // The engine's per-turn failure flag gates every read of this field, and
-    // both turn-completion hooks clear it.
+    // at post time, so it keeps the failure descriptor of the first failed post
+    // of the turn. The engine's per-turn failure flag gates every read of this
+    // field, and the output handler clears it when a turn completes.
     private PostResult? _lastFailedPost;
     private readonly List<PendingApprovalRequest> _pendingApprovalRequests = [];
     private readonly ApprovalResponseFlow<PendingApprovalRequest, SlackEventTs> _approvalFlow;
@@ -76,7 +77,6 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
     private const string BackfillDetectorWarning = ":warning: I couldn't safely analyze some earlier thread messages, so they were excluded from context.";
     private const string LiveDetectorUnavailableWarning = ":warning: I couldn't safely analyze your message — please try again in a moment.";
     private const string LiveInjectionBlockedWarning = ":warning: Message blocked by prompt-injection policy.";
-    private const string WrongRequesterWarning = ":warning: Only the requesting user can approve this tool action.";
 
     public ITimerScheduler Timers { get; set; } = null!;
 
@@ -105,8 +105,6 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
             .WithContext("SlackThreadTs", _threadTs);
 
         _outputEngine = new ChannelOutputEngine<PendingApprovalRequest, SlackEventTs>(
-            channelType: ChannelType.Slack,
-            channelName: "Slack",
             cursorComparer: CursorComparer,
             pendingRequests: _pendingApprovalRequests,
             createPendingRequest: request => new PendingApprovalRequest(request),
@@ -124,12 +122,12 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
             postApprovalPromptAsync: HandleApprovalRequestAsync,
             readPromptIdValue: promptMessageTs => promptMessageTs.Value,
             onApprovalPromptFailedAsync: SendApprovalPromptUnavailableAsync,
+            redrawClosedPromptAsync: RedrawClosedApprovalPromptAsync,
             persistPromptTracked: tracked => Persist(tracked, ApplyPendingApprovalPromptTracked),
             handleChannelSpecificOutputAsync: HandleChannelSpecificOutputAsync,
             advanceCursor: cursor => AdvanceCursor(new SlackEventTs(cursor)),
             postEmptyTurnFallbackAsync: PostEmptyTurnFallbackAsync,
-            onEmptyTurnSuppressedAsync: NotifyFailedTurnAsync,
-            readObservedAtMs: _ => _dependencies.TimeProvider.GetUtcNow().ToUnixTimeMilliseconds());
+            onEmptyTurnSuppressedAsync: NotifyFailedTurnAsync);
 
         _hydrationEngine = new ThreadGapHydrationEngine(
             sessionId: _sessionId,
@@ -157,11 +155,12 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
             operationTimeout: OperationTimeout,
             pendingRequests: _pendingApprovalRequests,
             hasObservedApprovalRequest: () => _outputEngine.HasObservedApprovalRequest,
-            postWrongRequesterWarningAsync: () => SafePostAsync(WrongRequesterWarning),
+            postNoticeAsync: text => SafePostAsync(text),
             persistPromptCleared: callId => Persist(
                 new PendingApprovalPromptCleared { CallId = callId.Value },
                 ApplyPendingApprovalPromptCleared),
             renderResolvedPromptAsync: TryResolveApprovalPromptAsync,
+            redrawClosedPromptAsync: RedrawClosedApprovalPromptAsync,
             log: _log);
 
         Recover<CursorAdvanced>(ApplyCursorAdvanced);
@@ -174,8 +173,6 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
         Recover<RecoveryCompleted>(_ => Self.Tell(PerformHydration.Instance));
 
         Initializing();
-
-        Context.SetReceiveTimeout(TimeSpan.FromHours(1));
     }
 
     public static Props CreateProps(
@@ -268,21 +265,12 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
             Self.Tell(new ReinitializePipeline(reason));
         });
         CommandAsync<ReinitializePipeline>(async msg => await ReinitializePipelineAsync(msg.Reason));
-        Command<ReceiveTimeout>(_ =>
-        {
-            if (_pendingApprovalRequests.Count > 0)
-            {
-                _log.Info("Thread idle but {0} approval(s) are pending; deferring passivation", _pendingApprovalRequests.Count);
-                return;
-            }
+    }
 
-            _log.Info("Thread idle for 1 hour, passivating");
-            RunTask(async () =>
-            {
-                await _handle.DrainAsync();
-                Context.Stop(Self);
-            });
-        });
+    private async Task HandleSessionDeactivatedAsync()
+    {
+        await _handle.DrainAsync();
+        Context.Stop(Self);
     }
 
     private async Task HandleProactiveThreadAsync(StartProactiveThread message)
@@ -341,15 +329,6 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
             ReminderId = message.Source.ReminderId,
             AckTarget = ackTarget
         };
-
-        // Only delivery-gated (DeliveryRequired) reminders carry a
-        // DeliveryObserver. Key it by the per-fire reminder delivery id so a
-        // second concurrent reminder to this session can't overwrite the
-        // first's observer before its turn reaches TurnCompleted.
-        if (message.Source.DeliveryObserver is { } deliveryObserver
-            && message.Source.ReminderId is { } reminderKey
-            && !string.IsNullOrWhiteSpace(reminderKey.Value))
-            _outputEngine.TrackReminderDeliveryObserver(reminderKey, deliveryObserver);
 
         try
         {
@@ -757,8 +736,8 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
             _pendingApprovalRequests,
             tracked,
             wrapPromptId: value => new SlackEventTs(value),
-            createRequest: (callId, requesterSenderId, requesterPrincipal, optionKeys, promptId, toolName, displayText) =>
-                new PendingApprovalRequest(callId, requesterSenderId, requesterPrincipal, optionKeys, promptId, toolName, displayText));
+            createRequest: (callId, requesterSenderId, requesterPrincipal, optionKeys, promptId, lifetime, toolName, displayText) =>
+                new PendingApprovalRequest(callId, requesterSenderId, requesterPrincipal, optionKeys, promptId, lifetime, toolName, displayText));
     }
 
     private void ApplyPendingApprovalPromptCleared(PendingApprovalPromptCleared cleared)
@@ -769,9 +748,9 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
         QueueProcessingIndicatorClearIfActive();
         // Reset the per-turn delivery state: a reinit aborts the in-flight
         // turn, and a stale delivered flag would otherwise leak into the next
-        // turn and falsely report a later reminder as delivered.
+        // turn and suppress its empty-turn fallback.
         _lastFailedPost = null;
-        _outputEngine.ResetForPipelineReinitialize(reason);
+        _outputEngine.ResetForPipelineReinitialize();
         await _handle.ReinitializeAsync(
             reason,
             () => Timers.StartSingleTimer(
@@ -782,7 +761,15 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
 
     private async Task HandleOutputAsync(ThreadOutput threadOutput)
     {
+        if (threadOutput.Output is SessionDeactivated)
+        {
+            await HandleSessionDeactivatedAsync();
+            return;
+        }
+
         var clearedPrompts = await _outputEngine.HandleOutputAsync(threadOutput.Output);
+        if (threadOutput.Output is TurnCompleted)
+            _lastFailedPost = null;
         if (clearedPrompts.Count > 0)
             PersistAll(clearedPrompts, ApplyPendingApprovalPromptCleared);
     }
@@ -802,13 +789,14 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
     /// <summary>
     /// Posts turn output text for the shared engine. Slack keeps the failure
     /// descriptor instead of telling the session now, because it reports a
-    /// delivery failure once at turn completion.
+    /// delivery failure once at turn completion. The first failure of the turn
+    /// stays; a later failure of the same turn does not replace it.
     /// </summary>
     private async Task<bool> PostOutputTextAsync(string text)
     {
         var result = await SafePostAsync(text);
         if (!result.Success)
-            _lastFailedPost = result;
+            _lastFailedPost ??= result;
         return result.Success;
     }
 
@@ -817,42 +805,52 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
     {
         var result = await SafeUploadFileAsync(file);
         if (!result.Success)
-            _lastFailedPost = result;
+            _lastFailedPost ??= result;
         return result.Success;
     }
 
-    private async Task PostEmptyTurnFallbackAsync()
+    /// <summary>
+    /// Posts the empty-turn fallback. A failed fallback post is a failed post of
+    /// the turn that the fallback answers, so it reports that turn.
+    /// </summary>
+    private async Task PostEmptyTurnFallbackAsync(TurnCompleted completed)
     {
         _lastFailedPost = null;
         _log.Warning("Turn completed without visible Slack output; posting fallback reply");
-        await SafePostAsync(EmptyTurnFallbackText);
+        var fallback = await SafePostAsync(EmptyTurnFallbackText);
+        await ReportFailedPostAsync(fallback, completed.TurnNumber);
     }
 
     /// <summary>
     /// Tells the session that the turn produced output the transport rejected.
-    /// Slack defers this report to turn completion and sends it once with the
-    /// completed turn's number. Discord and Mattermost report each failed post
-    /// inline instead, so their engine hook does nothing here.
+    /// All three channels defer this report to turn completion and send it once
+    /// with the completed turn's number.
     /// </summary>
     private async Task NotifyFailedTurnAsync(TurnCompleted completed)
     {
         var failedPost = _lastFailedPost;
         _lastFailedPost = null;
 
-        if (failedPost is { ShouldNotifySession: true, FailureKind: { } failureKind, ErrorMessage: { } errorMessage })
+        if (failedPost is { ShouldNotifySession: true })
         {
             _log.Warning(
                 "Turn completed with Slack delivery failure kind={FailureKind}; notifying session",
-                failureKind);
-            await NotifyDeliveryFailedAsync(completed.TurnNumber, failureKind, errorMessage);
+                failedPost.FailureKind);
+            await ReportFailedPostAsync(failedPost, completed.TurnNumber);
         }
         else
         {
             // Defensive: a failed post always carries a failure kind, so this
             // branch is unreachable today. Keep the empty-turn reply as the
             // safe outcome if that ever stops holding.
-            await PostEmptyTurnFallbackAsync();
+            await PostEmptyTurnFallbackAsync(completed);
         }
+    }
+
+    private async Task ReportFailedPostAsync(PostResult result, Actors.Protocol.TurnNumber turnNumber)
+    {
+        if (result is { ShouldNotifySession: true, FailureKind: { } failureKind, ErrorMessage: { } errorMessage })
+            await NotifyDeliveryFailedAsync(turnNumber, failureKind, errorMessage);
     }
 
     private Task RenderProcessingStateAsync(ProcessingStateOutput output)
@@ -1117,6 +1115,26 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
             $":warning: Netclaw could not show the approval prompt for `{request.ToolName}` in this channel. The call did not run.");
     }
 
+    private async Task RedrawClosedApprovalPromptAsync(PendingApprovalRequest pending, string closeText)
+    {
+        var promptTs = pending.PromptId ?? throw new InvalidOperationException("A closed prompt redraw needs its message.");
+        try
+        {
+            using var cts = new CancellationTokenSource(OperationTimeout);
+            await _dependencies.ReplyClient.UpdateThreadMessageAsync(
+                _channelId,
+                promptTs,
+                closeText,
+                SlackApprovalBlockBuilder.BuildClosedApprovalBlocks(closeText),
+                cts.Token);
+        }
+        catch (Exception ex)
+        {
+            _log.Warning(ex, "Failed to redraw closed approval prompt for call {CallId} messageTs={MessageTs}",
+                pending.CallId, promptTs);
+        }
+    }
+
     private async Task TryResolveApprovalPromptAsync(
         SlackEventTs? promptMessageTs,
         ToolInteractionRequest? request,
@@ -1240,9 +1258,10 @@ internal sealed class SlackThreadBindingActor : ReceivePersistentActor, IWithTim
             PrincipalClassification? requesterPrincipal,
             IReadOnlyList<string> optionKeys,
             SlackEventTs? promptMessageTs,
+            ToolInteractionLifetime lifetime,
             string? toolName = null,
             string? displayText = null)
-            : base(callId, requesterSenderId, requesterPrincipal, optionKeys, promptMessageTs, toolName, displayText)
+            : base(callId, requesterSenderId, requesterPrincipal, optionKeys, promptMessageTs, lifetime, toolName, displayText)
         {
         }
     }

@@ -401,7 +401,8 @@ public sealed class ToolPathPolicy
         if (MentionsGuardedDirectory(screened))
             return true;
 
-        if (StructuredAnalysisReferencesDeniedPath(analysis, shell)
+        if (CompoundRedirectReferencesDeniedPath(analysis, shell)
+            || StructuredAnalysisReferencesDeniedPath(analysis, shell)
             || PlainWordLinkReachesDeniedPath(analysis, shell))
         {
             return true;
@@ -439,6 +440,42 @@ public sealed class ToolPathPolicy
                 || screened.Contains(".netclaw/config", StringComparison.OrdinalIgnoreCase)))
         {
             return true;
+        }
+
+        return false;
+    }
+
+    private bool CompoundRedirectReferencesDeniedPath(
+        ShellCommandAnalysis analysis,
+        FileSystemAuthority shell)
+    {
+        if (!analysis.TryGetCompoundRedirectOwners(out var owners))
+            return true;
+
+        foreach (var owner in owners)
+        foreach (var redirect in owner.Syntax.Redirects)
+        {
+            if (redirect.Analysis is not FileRedirectAnalysis file)
+                continue;
+
+            var resolutionBase = owner.Syntax.WorkingDirectory is ShellValueDomain.Exact cwd
+                ? cwd.Value
+                : null;
+            var values = file.Target switch
+            {
+                ShellValueDomain.Exact exact => [exact.Value],
+                ShellValueDomain.FiniteSet finite => finite.Values,
+                ShellValueDomain.PathPattern pattern => [pattern.CoveringDirectory],
+                _ => Array.Empty<string>()
+            };
+            foreach (var value in values)
+            {
+                if (!CanonicalPath.TryCreate(value, resolutionBase, Environment.PathStyle, out var path))
+                    continue;
+
+                if (IsShellDenied(shell, path.Value))
+                    return true;
+            }
         }
 
         return false;
@@ -559,25 +596,40 @@ public sealed class ToolPathPolicy
             _ => false
         };
 
-    /// <summary>
-    /// Returns true when a glob word can reach a protected path or the default
-    /// credential store.
-    /// </summary>
-    /// <remarks>
-    /// SECURITY (decision D5, option A): a glob word reaches each path below its
-    /// covering directory that its segments can match. When the segments can match
-    /// a protected path, or a directory that contains one, the word gets the
-    /// decision of that literal path. The match is lexical. Netclaw does not list
-    /// the directory or follow links here, so a link below the covering directory
-    /// that leads to a protected path is an accepted gap.
-    /// </remarks>
+    /// <summary>Checks lexical glob reach and every known alias target, also when scope is incomplete.</summary>
     private bool GlobMayReachDeniedPath(ShellValueDomain.PathPattern pattern, FileSystemAuthority shell)
     {
         var glob = ShellGlobScope.AsGlobPattern(pattern);
-        return glob is not null
-               && shell.GetProtectedPaths(PathOperation.Shell)
-                   .Concat(DefaultCredentialStorePaths())
-                   .Any(target => MatchIsDenied(glob, target, shell));
+        if (glob is null)
+            return false;
+
+        var protectedPaths = shell.GetProtectedPaths(PathOperation.Shell)
+            .Concat(DefaultCredentialStorePaths())
+            .ToArray();
+        if (protectedPaths.Any(target => MatchIsDenied(glob, target, shell)))
+            return true;
+
+        if (!CanonicalPath.TryCreate(pattern.CoveringDirectory, null, Environment.PathStyle, out var covering))
+            return false;
+
+        var reach = ShellGlobScope.ResolveReach(covering, glob);
+        foreach (var known in reach.Targets)
+        {
+            if (IsProvedValueDenied(shell, known.Target.Value))
+                return true;
+
+            foreach (var target in protectedPaths)
+            {
+                var match = ShellGlobScope.MatchPathToward(glob, known, target);
+                if (match is not null
+                    && (string.Equals(match, target, StringComparison.OrdinalIgnoreCase) || IsShellDenied(shell, match)))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     // The match is the target itself, a directory that contains it (the glob

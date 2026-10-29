@@ -251,6 +251,10 @@ internal static class McpCommand
 
         var mcpServers = GetOrCreateSection(config, "McpServers");
 
+        // Configuration keys are case-insensitive, so "Git" beside "git" would make the next
+        // load fail on a duplicate key. A name that differs only by case is the same server.
+        serverName = new McpServerName(ConfigFileHelper.ResolveName(mcpServers.Keys, serverName.Value));
+
         // Re-running add on an existing name replaces the connection definition only. The
         // audience grants, approval modes and allow-lists belong to the operator, so only a
         // new server gets the secure defaults.
@@ -448,12 +452,12 @@ internal static class McpCommand
             if (!grantAll && audience != TrustAudience.Personal)
             {
                 var grants = GetOrCreateSection(audienceSection, "McpServerToolGrants");
-                grants[serverName.Value] = new List<string>();
+                ApprovalOverrideKeys.Set(grants, serverName.Value, new List<string>());
             }
 
             var approvalPolicy = GetOrCreateSection(audienceSection, "ApprovalPolicy");
             var serverDefaults = GetOrCreateSection(approvalPolicy, "McpServerDefaults");
-            serverDefaults[serverName.Value] = approvalMode.ToString();
+            ApprovalOverrideKeys.Set(serverDefaults, serverName.Value, approvalMode.ToString());
         }
     }
 
@@ -543,6 +547,15 @@ internal static class McpCommand
         if (TryEmitOsc52Copy(writer, authUrl))
             writer.WriteLine("Copied authorization URL to clipboard via OSC 52.");
         writer.WriteLine();
+        // A provider rejects a pre-registered client when the redirect URI does not match its
+        // registered value exactly, and it usually shows only a generic error page. The daemon
+        // builds this URI, so read it back from the authorization URL instead of rebuilding it.
+        if (TryReadRedirectUri(authUrl, out var redirectUri))
+        {
+            writer.WriteLine($"Redirect URI: {redirectUri}");
+            writer.WriteLine("  A pre-registered OAuth client must list this exact URI at the provider.");
+            writer.WriteLine();
+        }
         writer.WriteLine("Complete the authorization in your browser, then either:");
         writer.WriteLine("  1. Wait for the callback to be received automatically");
         writer.WriteLine("  2. Paste the redirect URL below if the callback can't reach this machine");
@@ -580,6 +593,20 @@ internal static class McpCommand
         writer.WriteLine($"Authorization failed or timed out for '{serverName.Value}'.");
         writer.WriteLine("Try again with: netclaw mcp auth " + serverName.Value);
         return 1;
+    }
+
+    internal static bool TryReadRedirectUri(string authorizationUrl, out string redirectUri)
+    {
+        redirectUri = "";
+        if (!Uri.TryCreate(authorizationUrl, UriKind.Absolute, out var uri))
+            return false;
+
+        var value = System.Web.HttpUtility.ParseQueryString(uri.Query)["redirect_uri"];
+        if (string.IsNullOrEmpty(value))
+            return false;
+
+        redirectUri = value;
+        return true;
     }
 
     private static async Task<bool> PollMcpOAuthStatusAsync(
@@ -901,16 +928,6 @@ internal static class McpCommand
         if (!TryReadExistingServerName(args, "Usage: netclaw mcp remove <name>", configured, writer, out var serverName, out var exitCode))
             return exitCode;
 
-        // Names are case-sensitive everywhere but the allow-list, so a name that differs from a
-        // configured server only by case is a typo, not a leftover to clean up.
-        if (!configured.Contains(serverName.Value, StringComparer.Ordinal)
-            && configured.FirstOrDefault(name => name.Equals(serverName.Value, StringComparison.OrdinalIgnoreCase)) is { } configuredName)
-        {
-            writer.WriteLine($"Error: There is no MCP server named '{serverName.Value}'. The configured server is '{configuredName}' "
-                + "(names are case-sensitive). Nothing was removed.");
-            return 1;
-        }
-
         // Check the approval store before changing anything, so a store that cannot be read
         // does not leave the server half removed.
         var savedApprovals = FindSavedApprovals(paths, serverName, configured, out var store);
@@ -971,8 +988,8 @@ internal static class McpCommand
            && !configuredServers.Any(other => other.Length > serverName.Value.Length && StartsWithServer(key, other));
 
     private static bool StartsWithServer(string key, string server)
-        => key.StartsWith(server + "/", StringComparison.Ordinal)
-           || key.StartsWith(server + "__", StringComparison.Ordinal);
+        => key.StartsWith(server + "/", StringComparison.OrdinalIgnoreCase)
+           || key.StartsWith(server + "__", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Removes the server's entries from every audience profile: the allow-list, the tool
@@ -1006,12 +1023,14 @@ internal static class McpCommand
                 removed = true;
             }
 
-            removed |= GetSectionOrNull(profile, "McpServerToolGrants")?.Remove(serverName.Value) == true;
+            removed |= GetSectionOrNull(profile, "McpServerToolGrants") is { } grants
+                && ApprovalOverrideKeys.Remove(grants, serverName.Value);
 
             if (GetSectionOrNull(profile, "ApprovalPolicy") is not { } approvalPolicy)
                 continue;
 
-            removed |= GetSectionOrNull(approvalPolicy, "McpServerDefaults")?.Remove(serverName.Value) == true;
+            removed |= GetSectionOrNull(approvalPolicy, "McpServerDefaults") is { } serverDefaults
+                && ApprovalOverrideKeys.Remove(serverDefaults, serverName.Value);
 
             if (GetSectionOrNull(approvalPolicy, "ToolOverrides") is { } toolOverrides)
             {
@@ -1019,7 +1038,7 @@ internal static class McpCommand
                     .Where(key => IsToolOfServer(key, serverName, configured))
                     .ToList();
                 foreach (var key in staleKeys)
-                    toolOverrides.Remove(key);
+                    ApprovalOverrideKeys.Remove(toolOverrides, key);
 
                 removed |= staleKeys.Count > 0;
             }
@@ -1106,7 +1125,7 @@ internal static class McpCommand
             return false;
         }
 
-        serverName = new McpServerName(args[nameIndex]);
+        serverName = new McpServerName(ConfigFileHelper.ResolveName(configuredServers, args[nameIndex]));
         return true;
     }
 
@@ -1341,8 +1360,8 @@ internal static class McpCommand
         var secretsText = File.Exists(paths.SecretsPath)
             ? File.ReadAllText(paths.SecretsPath) : "{}";
 
-        using var configDoc = JsonDocument.Parse(configText);
-        using var secretsDoc = JsonDocument.Parse(secretsText);
+        using var configDoc = JsonDocument.Parse(configText, JsonDefaults.ConfigDocument);
+        using var secretsDoc = JsonDocument.Parse(secretsText, JsonDefaults.ConfigDocument);
 
         var result = new Dictionary<string, McpServerEntry>();
 
@@ -1738,18 +1757,18 @@ internal static class McpCommand
                         continue;
 
                     if (serverDefaultIsDeny)
-                        toolOverrides[key] = ToolApprovalMode.Approval.ToString();
+                        ApprovalOverrideKeys.Set(toolOverrides, key, ToolApprovalMode.Approval.ToString());
                     else
-                        toolOverrides.Remove(key);
+                        ApprovalOverrideKeys.Remove(toolOverrides, key);
 
-                    toolOverrides.Remove(aliasKey);
+                    ApprovalOverrideKeys.Remove(toolOverrides, aliasKey);
                 }
 
             if (revokeTools is not null)
                 foreach (var tool in revokeTools)
                 {
-                    toolOverrides[$"{serverName.Value}/{tool}"] = ToolApprovalMode.Deny.ToString();
-                    toolOverrides.Remove($"{serverName.Value}__{tool}");
+                    ApprovalOverrideKeys.Set(toolOverrides, $"{serverName.Value}/{tool}", ToolApprovalMode.Deny.ToString());
+                    ApprovalOverrideKeys.Remove(toolOverrides, $"{serverName.Value}__{tool}");
                 }
 
             WriteConfigFile(paths.NetclawConfigPath, allConfig);
@@ -1892,7 +1911,7 @@ internal static class McpCommand
         if (approvalPolicy is null)
             return ToolApprovalMode.Auto;
 
-        return approvalPolicy.McpServerDefaults.TryGetValue(serverName, out var serverDefault)
+        return ApprovalOverrideKeys.TryGetMode(approvalPolicy.McpServerDefaults, serverName, out var serverDefault)
             ? serverDefault
             : approvalPolicy.DefaultMode;
     }
@@ -1904,8 +1923,8 @@ internal static class McpCommand
         out ToolApprovalMode mode)
     {
         if (policy is not null
-            && (policy.ToolOverrides.TryGetValue($"{serverName}/{toolName}", out mode)
-                || policy.ToolOverrides.TryGetValue($"{serverName}__{toolName}", out mode)))
+            && (ApprovalOverrideKeys.TryGetMode(policy.ToolOverrides, $"{serverName}/{toolName}", out mode)
+                || ApprovalOverrideKeys.TryGetMode(policy.ToolOverrides, $"{serverName}__{toolName}", out mode)))
             return true;
 
         mode = default;
@@ -1939,9 +1958,20 @@ internal static class McpCommand
         writer.WriteLine("                   This option requires --client-id.");
         writer.WriteLine("                   Caution: shell history and process inspection can expose");
         writer.WriteLine("                   this value. Use this option only on a trusted host.");
+        writer.WriteLine("  --scope      Space-separated OAuth scopes to request instead of the server default.");
+        writer.WriteLine("  --header     HTTP header for HTTP/SSE servers (\"Name: value\"). Repeatable.");
+        writer.WriteLine("  --env        Environment variable for stdio servers (KEY=VALUE). Repeatable.");
         writer.WriteLine();
         writer.WriteLine("On add, HTTP/SSE servers without an Authorization header print a hint to run");
         writer.WriteLine("`netclaw mcp auth` first. The daemon detects OAuth requirements at auth time.");
+        writer.WriteLine();
+        writer.WriteLine("OAuth redirect URI:");
+        writer.WriteLine("  The daemon receives the OAuth callback at this URI:");
+        writer.WriteLine("    http://127.0.0.1:<Daemon.Port>/api/mcp/oauth/callback   (default port 5199)");
+        writer.WriteLine("  A pre-registered client (--client-id) must list this exact URI at the provider.");
+        writer.WriteLine("  Use 127.0.0.1, not localhost. `netclaw mcp auth` prints the URI that it sends.");
+        writer.WriteLine("  On a remote host, the browser cannot load the callback. Copy the URL from the");
+        writer.WriteLine("  address bar and paste it at the `netclaw mcp auth` prompt.");
         writer.WriteLine();
         writer.WriteLine("Examples:");
         writer.WriteLine("  netclaw mcp add --transport stdio memorizer -- npx -y @memorizer/mcp-server");

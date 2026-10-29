@@ -288,6 +288,21 @@ the current daemon instance running. Valid changes SHALL trigger coordinated
 daemon restart: close new ingress, drain active sessions, restart, relaunch the
 sessions that were active, and resume from the last durable checkpoint.
 
+### FR-017 Durable Child Delegation
+
+Netclaw SHALL persist validated child-run acceptance before it starts child
+work. `spawn_agent` and routed skill activations SHALL return the accepted run
+identity without waiting for child completion. The parent session SHALL retain
+child status, cancellation, approval correlation, and terminal results across
+restart. It SHALL NOT repeat uncertain child actions after restart. When a
+child ends, the runtime SHALL write the result to `result.md` in the run folder
+and SHALL admit one notice for the parent. The notice SHALL name the agent, the
+run, the outcome, and the path of the file, and SHALL NOT hold the child output.
+The parent model SHALL read the file with a real `file_read` call. Notices and
+ordinary user inputs SHALL run in admission order, in batches of one requester,
+each under its own recorded authority. A notice SHALL NOT abandon an open
+approval.
+
 ## Operational Requirements
 
 - Daemon deploys as a user-level systemd service on `pi1` (no sudo required)

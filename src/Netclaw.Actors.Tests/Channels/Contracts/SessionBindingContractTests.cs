@@ -7,6 +7,7 @@ using Akka.Actor;
 using Akka.Configuration;
 using Akka.Hosting;
 using Akka.Hosting.TestKit;
+using Akka.Persistence;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -56,6 +57,10 @@ public abstract class SessionBindingContractTests : TestKit
     // while letting a follow-up (e.g. the empty-turn fallback) succeed.
     protected abstract void SetReplyClientThrowsOnce(Exception ex);
 
+    // Fail the next posts in order, one exception per post, and let later posts succeed. Lets a test give two
+    // failed posts of one turn two different error texts.
+    protected abstract void SetReplyClientThrowsInOrder(params Exception[] exceptions);
+
     protected abstract void ClearReplyClientThrows();
 
     protected abstract ChannelType ExpectedChannelType { get; }
@@ -81,6 +86,41 @@ public abstract class SessionBindingContractTests : TestKit
     protected virtual object CreateHydrationTriggerInboundMessage(string text, string senderId)
         => throw new NotImplementedException(
             "Override CreateHydrationTriggerInboundMessage to create an inbound that triggers hydration");
+
+    // The journal persistence id of the binding actor. The cursor events go to this id.
+    protected virtual string GetCursorPersistenceId(SessionId sessionId)
+        => throw new NotImplementedException(
+            "Override GetCursorPersistenceId to return the persistence id of the binding actor");
+
+    private async Task<IReadOnlyList<CursorAdvanced>> ReadCursorEventsAsync(SessionId sessionId)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var probe = CreateTestProbe();
+        Akka.Persistence.Persistence.Instance.Apply(Sys).JournalFor(null).Tell(
+            new ReplayMessages(0, long.MaxValue, long.MaxValue, GetCursorPersistenceId(sessionId), probe.Ref));
+        var cursors = new List<CursorAdvanced>();
+        while (true)
+        {
+            switch (await probe.ExpectMsgAsync<object>(cancellationToken: ct))
+            {
+                case ReplayedMessage { Persistent.Payload: CursorAdvanced cursor }:
+                    cursors.Add(cursor);
+                    break;
+                case RecoverySuccess:
+                    return cursors;
+                case ReplayMessagesFailure failure:
+                    throw new InvalidOperationException("The cursor journal replay failed.", failure.Cause);
+            }
+        }
+    }
+
+    // The binding posts a reply when it handles TextOutput. It advances the
+    // cursor later, when it handles TurnCompleted. A test that stops the actor
+    // after the reply can stop it before the cursor event is in the journal.
+    private Task AwaitCursorPersistedAsync(SessionId sessionId)
+        => AwaitAssertAsync(
+            async () => Assert.NotEmpty(await ReadCursorEventsAsync(sessionId)),
+            cancellationToken: TestContext.Current.CancellationToken);
 
     protected override void ConfigureServices(HostBuilderContext context, IServiceCollection services) { }
 
@@ -144,7 +184,8 @@ public abstract class SessionBindingContractTests : TestKit
         var turnCompleted = new TurnCompleted
         {
             SessionId = new SessionId("session-safe"),
-            TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1)
+            TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1),
+            OpenChildRunIds = []
         };
         var pipeline = new RecordingSessionPipeline(_ => [textOutput, turnCompleted]);
         var sid = new SessionId("session-safe");
@@ -171,7 +212,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("hello from LLM") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         CreateBindingActor(sid, pipeline, detector);
@@ -191,7 +232,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new ErrorOutput { SessionId = sid, Message = "something broke" },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         CreateBindingActor(sid, pipeline, detector);
@@ -212,7 +253,7 @@ public abstract class SessionBindingContractTests : TestKit
         [
             new TextOutput("file context") { SessionId = sid },
             new FileOutput { SessionId = sid, FilePath = "/tmp/report.pdf", FileName = "report.pdf", MimeType = new Netclaw.Media.MimeType("application/pdf") },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var actor = CreateBindingActor(sid, pipeline, detector);
@@ -240,7 +281,7 @@ public abstract class SessionBindingContractTests : TestKit
         var sid = new SessionId("session-empty-turn");
         var pipeline = new RecordingSessionPipeline(_ =>
         [
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         CreateBindingActor(sid, pipeline, detector);
@@ -249,6 +290,64 @@ public abstract class SessionBindingContractTests : TestKit
             var texts = GetPostedTexts();
             Assert.Contains(texts, t => t.Contains("didn't manage to produce a reply", StringComparison.OrdinalIgnoreCase)
                                         || t.Contains("warning", StringComparison.OrdinalIgnoreCase));
+        }, cancellationToken: ct);
+    }
+
+    // Rule of Aaron (18 Oct 2026): a person never sees a Netclaw error unless the model narrates it. The session ends
+    // a refused loop quietly with no reply when the model ignored the escalated nudge. The binding must then
+    // post no empty-turn fallback, because "I didn't manage to produce a reply" is Netclaw text, and its advice
+    // to send the message again starts the same loop again.
+    [Fact]
+    public async Task Quiet_end_with_no_text_posts_no_fallback()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
+        var sid = new SessionId("session-quiet-end");
+        // Turn 2 is a barrier: once its reply is visible, turn 1 (including its fallback decision) is processed.
+        var pipeline = new RecordingSessionPipeline(_ =>
+        [
+            new TurnCompleted
+            {
+                SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), QuietEnd = true, OpenChildRunIds = []
+            },
+            new TextOutput("barrier reply") { SessionId = sid },
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2), OpenChildRunIds = [] }
+        ]);
+
+        CreateBindingActor(sid, pipeline, detector);
+
+        await AwaitAssertAsync(() =>
+        {
+            Assert.Contains(GetPostedTexts(), t => t.Contains("barrier reply", StringComparison.Ordinal));
+        }, cancellationToken: ct);
+
+        var texts = GetPostedTexts();
+        Assert.DoesNotContain(texts, t => t.Contains("didn't manage to produce a reply", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(texts, t => t.Contains(":warning:", StringComparison.Ordinal));
+    }
+
+    // The quiet end skips only the fallback. An empty turn without the flag still posts it, also directly after
+    // a quiet end: the flag belongs to one turn.
+    [Fact]
+    public async Task Empty_turn_after_a_quiet_end_still_posts_fallback()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
+        var sid = new SessionId("session-quiet-end-then-empty");
+        var pipeline = new RecordingSessionPipeline(_ =>
+        [
+            new TurnCompleted
+            {
+                SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), QuietEnd = true, OpenChildRunIds = []
+            },
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2), OpenChildRunIds = [] }
+        ]);
+
+        CreateBindingActor(sid, pipeline, detector);
+
+        await AwaitAssertAsync(() =>
+        {
+            Assert.Single(GetPostedTexts(), t => t.Contains("didn't manage to produce a reply", StringComparison.OrdinalIgnoreCase));
         }, cancellationToken: ct);
     }
 
@@ -261,7 +360,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("real reply") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         CreateBindingActor(sid, pipeline, detector);
@@ -275,102 +374,6 @@ public abstract class SessionBindingContractTests : TestKit
         // "real reply" is confirmed above, the fallback decision is already made.
         var allTexts = GetPostedTexts();
         Assert.DoesNotContain(allTexts, t => t.Contains("didn't manage to produce a reply", StringComparison.OrdinalIgnoreCase));
-    }
-
-    [Fact]
-    public async Task Reminder_delivery_reports_success_when_post_succeeds()
-    {
-        var ct = TestContext.Current.CancellationToken;
-        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
-        var sid = new SessionId("session-reminder-success");
-        const string reminderKey = "reminder-1:123456";
-        var pipeline = new RecordingSessionPipeline(_ =>
-        [
-            new TextOutput("reminder output") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), SourceReminderId = new ReminderId(reminderKey) }
-        ], reactive: true);
-
-        var observer = CreateTestProbe();
-        var binding = CreateBindingActor(sid, pipeline, detector);
-        await pipeline.Created;
-        binding.Tell(new DeliverTrustedSessionTurn(sid, "run the reminder", CreateReminderSource(reminderKey, observer.Ref)));
-
-        var result = await observer.ExpectMsgAsync<ReminderDeliveryResult>(
-            TimeSpan.FromSeconds(5), cancellationToken: ct);
-        Assert.Equal(new ReminderId(reminderKey), result.ReminderDeliveryKey);
-        Assert.Equal(ExpectedChannelType, result.ChannelType);
-        Assert.True(result.Delivered);
-    }
-
-    // Regression for the silent-loss class of bugs (Discord/Mattermost marked
-    // a reminder turn delivered even when the post threw). A failed post must
-    // report Delivered=false so the execution actor redelivers instead of
-    // acking a delivery that never happened.
-    [Fact]
-    public async Task Reminder_delivery_reports_failure_when_post_throws()
-    {
-        var ct = TestContext.Current.CancellationToken;
-        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
-        var sid = new SessionId("session-reminder-failure");
-        const string reminderKey = "reminder-1:123456";
-        var pipeline = new RecordingSessionPipeline(_ =>
-        [
-            new TextOutput("reminder output") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), SourceReminderId = new ReminderId(reminderKey) }
-        ], reactive: true);
-
-        SetReplyClientThrows(new InvalidOperationException("channel API down"));
-        var observer = CreateTestProbe();
-        var binding = CreateBindingActor(sid, pipeline, detector);
-        await pipeline.Created;
-        binding.Tell(new DeliverTrustedSessionTurn(sid, "run the reminder", CreateReminderSource(reminderKey, observer.Ref)));
-
-        var result = await observer.ExpectMsgAsync<ReminderDeliveryResult>(
-            TimeSpan.FromSeconds(5), cancellationToken: ct);
-        Assert.Equal(new ReminderId(reminderKey), result.ReminderDeliveryKey);
-        Assert.Equal(ExpectedChannelType, result.ChannelType);
-        Assert.False(result.Delivered);
-
-        ClearReplyClientThrows();
-    }
-
-    // Regression for the observer-clobber bug: two distinct reminders can target
-    // the same session concurrently. A single observer field is overwritten by
-    // the second dispatch before the first turn completes, so the first
-    // reminder's result is misrouted. Each observer must receive ITS OWN keyed
-    // result.
-    [Fact]
-    public async Task Concurrent_reminders_to_same_session_each_get_their_own_result()
-    {
-        var ct = TestContext.Current.CancellationToken;
-        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
-        var sid = new SessionId("session-reminder-concurrent");
-        const string keyA = "reminder-A:111";
-        const string keyB = "reminder-B:222";
-        var pipeline = new RecordingSessionPipeline(_ =>
-        [
-            new TextOutput("reply A") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), SourceReminderId = new ReminderId(keyA) },
-            new TextOutput("reply B") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2), SourceReminderId = new ReminderId(keyB) }
-        ], reactive: true);
-
-        var observerA = CreateTestProbe();
-        var observerB = CreateTestProbe();
-        var binding = CreateBindingActor(sid, pipeline, detector);
-        await pipeline.Created;
-
-        // Both reminders dispatched before either turn completes.
-        binding.Tell(new DeliverTrustedSessionTurn(sid, "reminder A", CreateReminderSource(keyA, observerA.Ref)));
-        binding.Tell(new DeliverTrustedSessionTurn(sid, "reminder B", CreateReminderSource(keyB, observerB.Ref)));
-
-        var resultA = await observerA.ExpectMsgAsync<ReminderDeliveryResult>(
-            TimeSpan.FromSeconds(5), cancellationToken: ct);
-        Assert.Equal(new ReminderId(keyA), resultA.ReminderDeliveryKey);
-
-        var resultB = await observerB.ExpectMsgAsync<ReminderDeliveryResult>(
-            TimeSpan.FromSeconds(5), cancellationToken: ct);
-        Assert.Equal(new ReminderId(keyB), resultB.ReminderDeliveryKey);
     }
 
     // Regression for the misleading-fallback bug: when the real content post
@@ -391,9 +394,9 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("real reply") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) },
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] },
             new TextOutput("barrier reply") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2), OpenChildRunIds = [] }
         ]);
 
         // Fail only the first post (the real reply); the fallback, if attempted,
@@ -409,23 +412,6 @@ public abstract class SessionBindingContractTests : TestKit
         var texts = GetPostedTexts();
         Assert.DoesNotContain(texts, t => t.Contains("didn't manage to produce a reply", StringComparison.OrdinalIgnoreCase));
     }
-
-    private MessageSource CreateReminderSource(string reminderKey, IActorRef deliveryObserver)
-        => new()
-        {
-            ChannelType = ExpectedChannelType,
-            SenderId = new Netclaw.Actors.Protocol.SenderId("reminder-system"),
-            Audience = TrustAudience.Public,
-            Boundary = TrustBoundary.TrustedInstance,
-            Principal = PrincipalClassification.VerifiedAutomation,
-            Provenance = new SourceProvenance(TransportAuthenticity.LocalProcess, PayloadTaint.Trusted)
-            {
-                SourceKind = new SourceKind("reminder")
-            },
-            ReceivedAt = DateTimeOffset.UnixEpoch,
-            ReminderId = new ReminderId(reminderKey),
-            DeliveryObserver = deliveryObserver
-        };
 
     // --- Approval Flow ---
 
@@ -757,21 +743,22 @@ public abstract class SessionBindingContractTests : TestKit
         }, cancellationToken: ct);
     }
 
-    // Cross-channel match-order contract. Slack resolved the earliest pending
-    // approval; Discord and Mattermost resolved the most recent one. The
-    // consolidation found the divergence and the maintainer chose one rule for
-    // every channel: a text reply answers the earliest pending approval, which
-    // is the first prompt the channel shows.
+    // Cross-channel match-order contract (channel-binding-parity "Text approval resolves the earliest pending approval").
+    // The review of PR 2 of child-approval-events-and-parent-pause changed design D7: the text answer guard applies only
+    // when a child prompt is among the prompts that the sender can answer. With parent prompts only, a text reply
+    // resolves the earliest pending approval of the sender. A text-only Mattermost binding (no CallbackUrl, the default)
+    // has no buttons, so this rule is its only way to answer parallel parent calls.
+    // Planted bug: the channel resolves no prompt when the sender can answer two parent prompts (PR 2 as reviewed).
     [Fact]
-    public async Task Text_approval_response_resolves_earliest_pending_approval()
+    public async Task Text_approval_with_two_pending_parent_approvals_of_the_sender_resolves_the_earliest()
     {
         var ct = TestContext.Current.CancellationToken;
         var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
-        var sid = new SessionId("session-text-approve-order");
+        var sid = new SessionId("session-text-approve-two");
         var pipeline = new RecordingSessionPipeline(_ =>
         [
-            ApprovalRequest(sid, "call-order-1", "write_file"),
-            ApprovalRequest(sid, "call-order-2", "execute_shell")
+            ApprovalRequest(sid, "call-two-1", "write_file"),
+            ApprovalRequest(sid, "call-two-2", "execute_shell")
         ]);
 
         var actor = CreateBindingActor(sid, pipeline, detector);
@@ -783,25 +770,84 @@ public abstract class SessionBindingContractTests : TestKit
             Assert.Contains(texts, t => t.Contains("execute_shell"));
         }, cancellationToken: ct);
 
-        // The same sender can approve both prompts, so only the order decides.
+        // The same sender can answer both prompts.
         actor.Tell(CreateInboundMessage("A", "user-1"), TestActor);
 
         await AwaitAssertAsync(() =>
         {
-            var feedback = pipeline.RecordedFeedback.OfType<ToolInteractionResponse>().ToList();
-            Assert.Single(feedback);
-            Assert.Equal("call-order-1", feedback[0].CallId.Value);
-            Assert.Equal(ApprovalOptionKeys.ApproveOnce, feedback[0].SelectedKey.Value);
+            var feedback = Assert.Single(pipeline.RecordedFeedback.OfType<ToolInteractionResponse>());
+            Assert.Equal("call-two-1", feedback.CallId.Value);
+            Assert.Equal(ApprovalOptionKeys.ApproveOnce, feedback.SelectedKey.Value);
+        }, cancellationToken: ct);
+        Assert.DoesNotContain(GetPostedTexts(), t => t.Contains("approval prompts are open", StringComparison.Ordinal));
+    }
+
+    // Design D7 for a child prompt (strict). A child prompt does not name the child, so model text can describe one
+    // command while a text reply approves another. When a child prompt is among the prompts that the sender can answer,
+    // the channel resolves none and tells the sender to use the buttons. A child prompt needs buttons, so this spec
+    // uses a binding that renders buttons.
+    // Planted bug: the guard checks only parent prompts, or a mixed set resolves the earliest prompt.
+    [Fact]
+    public async Task Text_approval_with_a_pending_parent_approval_and_a_child_prompt_resolves_neither()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
+        var sid = new SessionId("session-text-approve-parent-and-child");
+        var pipeline = new RecordingSessionPipeline(_ =>
+        [
+            ApprovalRequest(sid, "call-parent-1", "write_file"),
+            ChildApprovalRequest(sid),
+            // The binding handles outputs in order, so this post proves that it holds both prompts.
+            new TextOutput("both-prompts-marker") { SessionId = sid }
+        ]);
+
+        var actor = CreateButtonBindingActor(sid, pipeline, detector);
+        await AwaitAssertAsync(
+            () => Assert.Contains(GetPostedTexts(), t => t.Contains("both-prompts-marker", StringComparison.Ordinal)),
+            cancellationToken: ct);
+
+        actor.Tell(CreateInboundMessage("A", "user-1"), TestActor);
+
+        await AwaitAssertAsync(() =>
+        {
+            var texts = GetPostedTexts();
+            Assert.Contains(texts, t => t.Contains(
+                "2 approval prompts are open. Use the buttons on the prompt you mean.", StringComparison.Ordinal));
+        }, cancellationToken: ct);
+        Assert.Empty(pipeline.RecordedFeedback.OfType<ToolInteractionResponse>());
+        Assert.Empty(pipeline.RecordedFeedback.OfType<ToolInteractionTextResponse>());
+    }
+
+    // The guard counts only the prompts that the sender can answer. Bob can answer only the second prompt, so his text
+    // reply resolves it, and Alice's earlier prompt stays pending.
+    [Fact]
+    public async Task Text_approval_resolves_the_one_pending_approval_that_the_sender_can_answer()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
+        var sid = new SessionId("session-text-approve-one-of-two");
+        var pipeline = new RecordingSessionPipeline(_ =>
+        [
+            ApprovalRequest(sid, "call-alice", "write_file"),
+            ApprovalRequest(sid, "call-bob", "execute_shell") with { RequesterSenderId = new SenderId("user-2") }
+        ]);
+
+        var actor = CreateBindingActor(sid, pipeline, detector);
+
+        await AwaitAssertAsync(() =>
+        {
+            var texts = GetPostedTexts();
+            Assert.Contains(texts, t => t.Contains("write_file"));
+            Assert.Contains(texts, t => t.Contains("execute_shell"));
         }, cancellationToken: ct);
 
-        // The second prompt stays pending and the next reply resolves it.
-        actor.Tell(CreateInboundMessage("A", "user-1"), TestActor);
+        actor.Tell(CreateInboundMessage("A", "user-2"), TestActor);
 
         await AwaitAssertAsync(() =>
         {
-            var feedback = pipeline.RecordedFeedback.OfType<ToolInteractionResponse>().ToList();
-            Assert.Equal(2, feedback.Count);
-            Assert.Equal("call-order-2", feedback[1].CallId.Value);
+            var feedback = Assert.Single(pipeline.RecordedFeedback.OfType<ToolInteractionResponse>());
+            Assert.Equal("call-bob", feedback.CallId.Value);
+            Assert.Equal(ApprovalOptionKeys.ApproveOnce, feedback.SelectedKey.Value);
         }, cancellationToken: ct);
     }
 
@@ -843,7 +889,7 @@ public abstract class SessionBindingContractTests : TestKit
                     new ToolInteractionOption(ApprovalOptionKeys.DenyKey, ApprovalOptionKeys.DenyLabel)
                 ]
             },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var actor = CreateBindingActor(sid, pipeline, detector);
@@ -872,6 +918,96 @@ public abstract class SessionBindingContractTests : TestKit
         }, cancellationToken: ct);
     }
 
+    // --- Child prompt lifetime (child-approval-events-and-parent-pause, PR 1, task 1.10) ---
+
+    // A child consent prompt has the lifetime "until closed". The parent turn can end or fail while the child waits,
+    // and the prompt must stay pending on Slack, Discord, and Mattermost (#2523). A text answer resolves a prompt
+    // that the binding still holds, so a local ToolInteractionResponse proves that the turn end kept the prompt. A
+    // binding that dropped the prompt forwards the text on the cold path as a ToolInteractionTextResponse.
+    // A child prompt has buttons only (PR 2, design D3), so these specs use a binding that renders buttons.
+    // Planted bug: the engine clears every prompt at TurnCompleted, as it does today.
+    [Fact]
+    public async Task Child_prompt_stays_pending_after_the_parent_turn_completes()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
+        var sid = new SessionId("session-child-prompt-outlives-turn");
+        var pipeline = new RecordingSessionPipeline(_ =>
+        [
+            ChildPrompt(sid, "r-7f2/subagent-approval/1"),
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
+        ]);
+
+        var actor = CreateButtonBindingActor(sid, pipeline, detector);
+        await AwaitAssertAsync(() => Assert.Contains(GetPostedTexts(), IsEmptyTurnFallback), cancellationToken: ct);
+
+        actor.Tell(CreateInboundMessage("A", "user-1"), TestActor);
+
+        await AwaitAssertAsync(() =>
+        {
+            Assert.Empty(pipeline.RecordedFeedback.OfType<ToolInteractionTextResponse>());
+            var answer = Assert.Single(pipeline.RecordedFeedback.OfType<ToolInteractionResponse>());
+            Assert.Equal("r-7f2/subagent-approval/1", answer.CallId.Value);
+            Assert.Equal(ApprovalOptionKeys.ApproveOnce, answer.SelectedKey.Value);
+        }, cancellationToken: ct);
+    }
+
+    // A cold-spawned binding rebuilds its pending prompts from PendingApprovalPromptTracked. The record carries the
+    // lifetime, so the next turn end keeps the child prompt.
+    // Planted bug: the journal drops the lifetime, and the recovered prompt reads as a turn prompt.
+    [Fact]
+    public async Task Cold_spawned_binding_keeps_a_child_prompt_at_turn_end()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
+        var sid = new SessionId("session-child-prompt-cold-spawn");
+        var firstPipeline = new RecordingSessionPipeline(_ => [ChildPrompt(sid, "r-7f2/subagent-approval/1")]);
+
+        var first = CreateButtonBindingActor(sid, firstPipeline, detector);
+        await AwaitAssertAsync(() => Assert.Contains(GetPostedTexts(),
+            text => text.Contains("shell_execute", StringComparison.Ordinal)), cancellationToken: ct);
+        var stopped = CreateTestProbe("child-prompt-cold-spawn-stop");
+        stopped.Watch(first);
+        Sys.Stop(first);
+        await stopped.ExpectTerminatedAsync(first, cancellationToken: ct);
+
+        var recoveredPipeline = new RecordingSessionPipeline(_ =>
+        [
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2), OpenChildRunIds = [] }
+        ]);
+        var recovered = CreateButtonBindingActor(sid, recoveredPipeline, detector);
+        await AwaitAssertAsync(() => Assert.Contains(GetPostedTexts(), IsEmptyTurnFallback), cancellationToken: ct);
+
+        recovered.Tell(CreateInboundMessage("A", "user-1"), TestActor);
+
+        await AwaitAssertAsync(() =>
+        {
+            Assert.Empty(recoveredPipeline.RecordedFeedback.OfType<ToolInteractionTextResponse>());
+            var answer = Assert.Single(recoveredPipeline.RecordedFeedback.OfType<ToolInteractionResponse>());
+            Assert.Equal("r-7f2/subagent-approval/1", answer.CallId.Value);
+        }, cancellationToken: ct);
+    }
+
+    private static bool IsEmptyTurnFallback(string text)
+        => text.Contains("didn't manage to produce a reply", StringComparison.OrdinalIgnoreCase)
+           || text.Contains("warning", StringComparison.OrdinalIgnoreCase);
+
+    private static ToolInteractionRequest ChildPrompt(SessionId sid, string callId) => new()
+    {
+        SessionId = sid,
+        Kind = "approval",
+        CallId = new Netclaw.Tools.ToolCallId(callId),
+        ToolName = new Netclaw.Tools.ToolName("shell_execute"),
+        DisplayText = "gh pr view 12",
+        RequesterSenderId = new SenderId("user-1"),
+        Lifetime = ToolInteractionLifetime.UntilClosed,
+        Options =
+        [
+            new ToolInteractionOption(ApprovalOptionKeys.ApproveOnceKey, ApprovalOptionKeys.ApproveOnceLabel),
+            new ToolInteractionOption(ApprovalOptionKeys.DenyKey, ApprovalOptionKeys.DenyLabel)
+        ]
+    };
+
     // --- Failure Notification ---
 
     [Fact]
@@ -883,7 +1019,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("this will fail to post") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         SetReplyClientThrows(new InvalidOperationException("channel API down"));
@@ -896,6 +1032,153 @@ public abstract class SessionBindingContractTests : TestKit
             Assert.NotEqual(DeliveryFailureKind.ContentRejected, failures[0].FailureKind);
             Assert.Contains("channel API down", failures[0].ErrorMessage);
         }, cancellationToken: ct);
+
+        ClearReplyClientThrows();
+    }
+
+    // Cross-boundary contract with the session (spec netclaw-session, "A failed post on a reminder turn is
+    // visible to the operator"). The session ignores feedback for a turn that is not its latest eligible turn.
+    // A binding posts text while the turn runs and learns the turn number only from TurnCompleted. It must
+    // report the turn whose output failed to post, once per turn: 2, 3, 4 here. It must not report the last
+    // completed turn (0, 2, 3), and it must not report one failed turn twice. Turn 1 would hide the defect,
+    // because turn 0 is the unset value that the session also treats as "no turn".
+    [Fact]
+    public async Task Failed_post_reports_the_turn_it_belongs_to_once_per_turn()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
+        var sid = new SessionId("session-failed-post-turn-number");
+        var pipeline = new RecordingSessionPipeline(_ =>
+        [
+            new TextOutput("turn two reply") { SessionId = sid },
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2), OpenChildRunIds = [] },
+            new TextOutput("turn three first part") { SessionId = sid },
+            new TextOutput("turn three second part") { SessionId = sid },
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(3), OpenChildRunIds = [] },
+            new TextOutput("turn four reply") { SessionId = sid },
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(4), OpenChildRunIds = [] }
+        ]);
+
+        // Every post fails, so each turn has a failed post. Turn 3 has two of them.
+        SetReplyClientThrows(new InvalidOperationException("channel API down"));
+        CreateBindingActor(sid, pipeline, detector);
+
+        await AwaitAssertAsync(
+            () => Assert.True(
+                pipeline.RecordedFeedback.OfType<DeliveryFailed>().Count() >= 3,
+                "expected one DeliveryFailed per failed turn"),
+            cancellationToken: ct);
+
+        var reportedTurns = pipeline.RecordedFeedback.OfType<DeliveryFailed>()
+            .Select(f => f.TurnNumber.Value)
+            .ToList();
+        Assert.Equal([2, 3, 4], reportedTurns);
+
+        ClearReplyClientThrows();
+    }
+
+    // A turn with one delivered post and one failed post sends no report. Slack has this rule today: the
+    // reply reached the thread in part, and a retry would post the delivered part twice. Discord and Mattermost
+    // follow the same rule, so the three channels give the session the same signal.
+    [Fact]
+    public async Task Failed_post_in_a_turn_with_a_delivered_post_sends_no_DeliveryFailed()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
+        var sid = new SessionId("session-partial-delivery");
+        var pipeline = new RecordingSessionPipeline(_ =>
+        [
+            new TextOutput("lost part") { SessionId = sid },
+            new TextOutput("delivered part") { SessionId = sid },
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(3), OpenChildRunIds = [] },
+            new TextOutput("barrier reply") { SessionId = sid },
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(4), OpenChildRunIds = [] }
+        ]);
+
+        // Only the first post fails. The next two posts succeed.
+        SetReplyClientThrowsOnce(new InvalidOperationException("transient channel error"));
+        CreateBindingActor(sid, pipeline, detector);
+
+        await AwaitAssertAsync(() =>
+        {
+            var texts = GetPostedTexts();
+            Assert.Contains(texts, t => t.Contains("barrier reply", StringComparison.Ordinal));
+        }, cancellationToken: ct);
+
+        Assert.Contains(GetPostedTexts(), t => t.Contains("delivered part", StringComparison.Ordinal));
+        Assert.Empty(pipeline.RecordedFeedback.OfType<DeliveryFailed>());
+    }
+
+    // The empty-turn fallback ("I didn't manage to produce a reply") is a post of the turn that it answers.
+    // When it fails, the session must hear about that turn, not about the turn before it.
+    [Fact]
+    public async Task Failed_empty_turn_fallback_post_reports_the_turn_it_answers()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
+        var sid = new SessionId("session-failed-fallback-turn-number");
+        var pipeline = new RecordingSessionPipeline(_ =>
+        [
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(3), OpenChildRunIds = [] },
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(4), OpenChildRunIds = [] }
+        ]);
+
+        SetReplyClientThrows(new InvalidOperationException("channel API down"));
+        CreateBindingActor(sid, pipeline, detector);
+
+        await AwaitAssertAsync(
+            () => Assert.True(
+                pipeline.RecordedFeedback.OfType<DeliveryFailed>().Count() >= 2,
+                "expected one DeliveryFailed per empty turn whose fallback post failed"),
+            cancellationToken: ct);
+
+        var reportedTurns = pipeline.RecordedFeedback.OfType<DeliveryFailed>()
+            .Select(f => f.TurnNumber.Value)
+            .ToList();
+        Assert.Equal([3, 4], reportedTurns);
+
+        ClearReplyClientThrows();
+    }
+
+    // The report names the first failed post of the turn's output. A failed post that is not turn output (here the
+    // warning for a blocked message, which the binding posts between turns) is not output of any turn. It must
+    // not take the place of the failure that the session receives for the next turn. Slack has this rule today.
+    // Discord and Mattermost sent the warning posts through the same failure notifier as the output posts. The
+    // first failure wins, so a failed warning post won over the real failure of the next turn.
+    [Fact]
+    public async Task Failed_post_that_is_not_turn_output_does_not_replace_the_failure_of_the_next_turn()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var detector = new ConfigurablePromptInjectionDetector((text, _, _) => Task.FromResult(
+            text.Contains("blocked message", StringComparison.Ordinal)
+                ? PromptInjectionResult.Detected(PromptInjectionRisk.High, "injection detected")
+                : PromptInjectionResult.Safe()));
+        var sid = new SessionId("session-warning-then-output");
+        var pipeline = new RecordingSessionPipeline(_ =>
+        [
+            new TextOutput("turn reply") { SessionId = sid },
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(5), OpenChildRunIds = [] }
+        ], reactive: true);
+
+        // The first post is the warning for the blocked message. The second post is the output of the turn.
+        SetReplyClientThrowsInOrder(
+            new InvalidOperationException("warning post rejected"),
+            new InvalidOperationException("output post rejected"));
+        var actor = CreateBindingActor(sid, pipeline, detector);
+        await pipeline.Created.WaitAsync(ct);
+
+        // The actor handles inbound messages one after the other, so the warning post ends before the second message starts.
+        actor.Tell(CreateInboundMessage("blocked message", "user-1"), TestActor);
+        actor.Tell(CreateInboundMessage("hello", "user-1"), TestActor);
+
+        await AwaitAssertAsync(
+            () => Assert.Single(pipeline.RecordedFeedback.OfType<DeliveryFailed>()),
+            cancellationToken: ct);
+
+        var failure = pipeline.RecordedFeedback.OfType<DeliveryFailed>().Single();
+        Assert.Equal(5, failure.TurnNumber.Value);
+        Assert.Contains("output post rejected", failure.ErrorMessage, StringComparison.Ordinal);
+        Assert.DoesNotContain("warning post rejected", failure.ErrorMessage, StringComparison.Ordinal);
 
         ClearReplyClientThrows();
     }
@@ -913,7 +1196,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("this will fail to post") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ])
         {
             FeedbackException = new InvalidOperationException("feedback pipe down")
@@ -958,7 +1241,7 @@ public abstract class SessionBindingContractTests : TestKit
         var sid = new SessionId("session-stash");
         var pipeline = new RecordingSessionPipeline(_ =>
         [
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ], reactive: true);
 
         var actor = CreateBindingActor(sid, pipeline, detector);
@@ -1239,7 +1522,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("hydrated reply") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         CreateBindingActorWithHydration(sid, pipeline, detector, historyFetcher);
@@ -1281,7 +1564,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("hydrated reply") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         CreateBindingActorWithHydration(sid, pipeline, detector, historyFetcher);
@@ -1325,7 +1608,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("hydrated reply") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         CreateBindingActorWithHydration(sid, pipeline, detector, historyFetcher);
@@ -1354,7 +1637,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("reply") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var actor = CreateBindingActorWithHydration(sid, pipeline, detector, historyFetcher);
@@ -1391,7 +1674,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("reply") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var actor = CreateBindingActorWithHydration(sid, pipeline, detector, historyFetcher);
@@ -1437,7 +1720,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("reply") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var actor = CreateBindingActorWithHydration(sid, pipeline, detector, historyFetcher);
@@ -1448,7 +1731,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline2 = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("reply 2") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2), OpenChildRunIds = [] }
         ]);
         CreateBindingActorWithHydration(sid, pipeline2, detector, historyFetcher);
         await pipeline2.Created.WaitAsync(ct);
@@ -1487,7 +1770,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("reply") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var actor = CreateBindingActorWithHydration(sid, pipeline, detector, historyFetcher);
@@ -1523,11 +1806,12 @@ public abstract class SessionBindingContractTests : TestKit
         historyFetcher.SetHistory(Array.Empty<ChannelInput>());
 
         // First lifecycle: live inbound arrives, turn outcome is Failed.
-        // Cursor must NOT advance (PR #733 amnesia fix).
+        // Cursor must NOT advance (PR #733 amnesia fix). The turn has no
+        // output, so the binding posts the empty-turn fallback when it handles
+        // TurnCompleted. That post proves that the binding handled the turn end.
         var pipeline = new RecordingSessionPipeline(_ =>
         [
-            new TextOutput("partial") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), Outcome = TurnOutcome.Failed }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), Outcome = TurnOutcome.Failed, OpenChildRunIds = [] }
         ], reactive: true);
 
         var actor = CreateBindingActorWithHydration(sid, pipeline, detector, historyFetcher);
@@ -1538,10 +1822,11 @@ public abstract class SessionBindingContractTests : TestKit
         await AwaitAssertAsync(() =>
         {
             Assert.True(pipeline.CapturedInputs.Count >= 1);
-            Assert.Contains(GetPostedTexts(), t => t.Contains("partial"));
+            Assert.Contains(GetPostedTexts(), IsEmptyTurnFallback);
         }, cancellationToken: ct);
 
         await actor.GracefulStop(TimeSpan.FromSeconds(5));
+        Assert.Empty(await ReadCursorEventsAsync(sid));
 
         // Second lifecycle: history contains TWO items with snowflakes/ts
         // earlier than the first-live inbound's. If the cursor had advanced
@@ -1555,7 +1840,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline2 = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("reply 2") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2), Outcome = TurnOutcome.Completed }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2), Outcome = TurnOutcome.Completed, OpenChildRunIds = [] }
         ]);
 
         CreateBindingActorWithHydration(sid, pipeline2, detector, historyFetcher);
@@ -1586,7 +1871,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("reply") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var actor = CreateBindingActorWithHydration(sid, pipeline, detector, historyFetcher);
@@ -1638,7 +1923,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("hydrated reply") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var actor = CreateBindingActorWithHydration(sid, pipeline, detector, historyFetcher);
@@ -1670,7 +1955,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("reply without history") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1) }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1), OpenChildRunIds = [] }
         ]);
 
         var actor = CreateBindingActorWithHydration(sid, pipeline, detector, historyFetcher);
@@ -1721,7 +2006,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput($"reply {Interlocked.Increment(ref turnNumber)}") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(turnNumber), Outcome = TurnOutcome.Completed }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(turnNumber), Outcome = TurnOutcome.Completed, OpenChildRunIds = [] }
         ], reactive: true);
 
         var actor = CreateBindingActorWithHydration(sid, pipeline, detector, historyFetcher);
@@ -1739,13 +2024,9 @@ public abstract class SessionBindingContractTests : TestKit
             Assert.Contains("history message 0", text);
         }, cancellationToken: ct);
 
-        // Wait for the turn to complete — the reply proves TurnCompleted ran,
-        // which triggers cursor persistence via Persist(CursorAdvanced).
-        await AwaitAssertAsync(() =>
-        {
-            var posts = GetPostedTexts();
-            Assert.Contains(posts, p => p.Contains("reply"));
-        }, cancellationToken: ct);
+        // A posted reply proves only that the binding handled TextOutput. Wait for
+        // the CursorAdvanced event in the journal before the restart.
+        await AwaitCursorPersistedAsync(sid);
 
         // GracefulStop drains the mailbox and waits for termination.
         ClearPostedTexts();
@@ -1758,7 +2039,7 @@ public abstract class SessionBindingContractTests : TestKit
         pipeline = new RecordingSessionPipeline(_ =>
         [
             new TextOutput("reply after restart") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2), Outcome = TurnOutcome.Completed }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(2), Outcome = TurnOutcome.Completed, OpenChildRunIds = [] }
         ], reactive: true);
 
         var actor2 = CreateBindingActorWithHydration(sid, pipeline, detector, historyFetcher);
@@ -1804,7 +2085,7 @@ public abstract class SessionBindingContractTests : TestKit
         var pipeline1 = new RecordingSessionPipeline(_ =>
         [
             new TextOutput($"reply {Interlocked.Increment(ref turnNumber)}") { SessionId = sid },
-            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(turnNumber), Outcome = TurnOutcome.Completed }
+            new TurnCompleted { SessionId = sid, TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(turnNumber), Outcome = TurnOutcome.Completed, OpenChildRunIds = [] }
         ], reactive: true);
 
         var actor1 = CreateBindingActorWithHydration(sid, pipeline1, detector, historyFetcher);
@@ -1816,11 +2097,9 @@ public abstract class SessionBindingContractTests : TestKit
         await AwaitAssertAsync(() => Assert.True(pipeline1.CapturedInputs.Count >= 1),
             cancellationToken: ct);
 
-        // Wait for TurnCompleted — this advances the cursor to the trigger's ts.
-        await AwaitAssertAsync(() =>
-        {
-            Assert.Contains(GetPostedTexts(), p => p.Contains("reply"));
-        }, cancellationToken: ct);
+        // TurnCompleted advances the cursor to the trigger's ts. Wait for the
+        // CursorAdvanced event in the journal before the restart.
+        await AwaitCursorPersistedAsync(sid);
 
         ClearPostedTexts();
         await actor1.GracefulStop(TimeSpan.FromSeconds(5));
@@ -1874,12 +2153,12 @@ public abstract class SessionBindingContractTests : TestKit
                 ? []
                 :
                 [
-                    new TextOutput("reply after reinitialize") { SessionId = sid },
                     new TurnCompleted
                     {
                         SessionId = sid,
                         TurnNumber = new Netclaw.Actors.Protocol.TurnNumber(1),
-                        Outcome = TurnOutcome.Completed
+                        Outcome = TurnOutcome.Completed,
+                        OpenChildRunIds = []
                     }
                 ]);
 
@@ -1896,13 +2175,14 @@ public abstract class SessionBindingContractTests : TestKit
         // A second pipeline creation proves the actor ran the reinitialize path.
         await AwaitAssertAsync(() => Assert.Equal(2, pipeline.CreateCount), cancellationToken: ct);
 
-        // The posted reply proves the new generation's TurnCompleted ran.
+        // Only the turn end posts this response, after the cursor decision.
         await AwaitAssertAsync(
-            () => Assert.Contains(GetPostedTexts(), t => t.Contains("reply after reinitialize")),
+            () => Assert.Contains(GetPostedTexts(), IsEmptyTurnFallback),
             cancellationToken: ct);
 
         ClearPostedTexts();
         await actor.GracefulStop(TimeSpan.FromSeconds(5));
+        Assert.Empty(await ReadCursorEventsAsync(sid));
 
         // The next actor lifetime recovers the cursor from the journal. The
         // abandoned turn's message must still be in the gap. A committed cursor
@@ -1919,5 +2199,333 @@ public abstract class SessionBindingContractTests : TestKit
             var text = string.Join("\n", input.Contents.OfType<TextContent>().Select(t => t.Text));
             Assert.Contains("history message 0", text);
         }, cancellationToken: ct);
+    }
+
+    // --- Child prompts: closed redraw and buttons only (PR 2 of child-approval-events-and-parent-pause) ---
+
+    /// <summary>A rendered prompt or redraw: the text that a person can read, and whether buttons stay on it.</summary>
+    protected sealed record RenderedPrompt(string VisibleText, bool HasButtons);
+
+    /// <summary>Every prompt redraw (message update) that the binding sent, in order.</summary>
+    protected abstract IReadOnlyList<RenderedPrompt> GetPromptRedraws();
+
+    /// <summary>
+    /// Creates a binding that renders approval prompts with buttons. Slack and Discord always do. A Mattermost binding
+    /// needs a callback URL for buttons; without one it is text-only.
+    /// </summary>
+    protected virtual IActorRef CreateButtonBindingActor(
+        SessionId sessionId,
+        RecordingSessionPipeline pipeline,
+        ConfigurablePromptInjectionDetector detector)
+        => CreateBindingActor(sessionId, pipeline, detector);
+
+    private const string ChildRunId = "0f3c9a7d5e2b41c8a6d4e1f2b3c4d5e6";
+
+    // The bridge makes this call ID for a child prompt: the run ID, then "subagent-approval", then a counter. The
+    // request carries no agent name. The run ID must not reach any text that a person reads.
+    protected static ToolInteractionRequest ChildApprovalRequest(SessionId sessionId, int number = 1) => new()
+    {
+        SessionId = sessionId,
+        Kind = "approval",
+        CallId = new Netclaw.Tools.ToolCallId($"{ChildRunId}/subagent-approval/{number}"),
+        ToolName = new Netclaw.Tools.ToolName("shell_execute"),
+        DisplayText = "gh pr view 2558",
+        RequesterSenderId = new SenderId("user-1"),
+        Lifetime = ToolInteractionLifetime.UntilClosed,
+        Options =
+        [
+            new ToolInteractionOption(ApprovalOptionKeys.ApproveOnceKey, ApprovalOptionKeys.ApproveOnceLabel),
+            new ToolInteractionOption(ApprovalOptionKeys.DenyKey, ApprovalOptionKeys.DenyLabel)
+        ]
+    };
+
+    private static string WithdrawalText(Netclaw.Actors.Sessions.WithdrawReason reason)
+        => Netclaw.Actors.Tests.Sessions.ChildWithdrawalTexts.For(reason);
+
+    // Design D6 and channel-binding-parity "Closed and replayed prompts": the binding finds the prompt by its call ID
+    // and redraws it as closed, with the reason text and with no buttons. The redraw does not name the child run.
+    // Planted bug: the binding ignores the closed output (today), so the old buttons stay live; or the redraw keeps the
+    // buttons; or it prints the call ID, which holds the run ID.
+    [Theory]
+    [InlineData(Netclaw.Actors.Sessions.WithdrawReason.CancelledByParent)]
+    [InlineData(Netclaw.Actors.Sessions.WithdrawReason.ChildEnded)]
+    [InlineData(Netclaw.Actors.Sessions.WithdrawReason.ChildLost)]
+    [InlineData(Netclaw.Actors.Sessions.WithdrawReason.DaemonRestarted)]
+    [InlineData(Netclaw.Actors.Sessions.WithdrawReason.PromptUnavailable)]
+    public async Task Closed_output_redraws_the_child_prompt_as_closed_with_its_reason(
+        Netclaw.Actors.Sessions.WithdrawReason reason)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
+        var sid = new SessionId($"session-child-closed-{reason}");
+        var request = ChildApprovalRequest(sid);
+        var pipeline = new RecordingSessionPipeline(_ =>
+        [
+            request,
+            new ToolInteractionClosed(request.CallId, new Netclaw.Actors.Sessions.ToolInteractionCloseReason.Withdrawn(reason)) { SessionId = sid }
+        ]);
+
+        CreateButtonBindingActor(sid, pipeline, detector);
+
+        await AwaitAssertAsync(() =>
+        {
+            var redraw = Assert.Single(GetPromptRedraws());
+            Assert.Contains(WithdrawalText(reason), redraw.VisibleText, StringComparison.Ordinal);
+            Assert.False(redraw.HasButtons);
+            Assert.DoesNotContain(ChildRunId, redraw.VisibleText, StringComparison.Ordinal);
+        }, cancellationToken: ct);
+    }
+
+    // The binding removes the closed prompt from its pending list and journals PendingApprovalPromptCleared. A text
+    // reply then is ordinary conversation, also after the binding restarts from its journal.
+    // Planted bug: the binding keeps the closed prompt pending (today), so "A" answers a withdrawn prompt; or it removes
+    // the prompt in memory only, so a cold-spawned binding restores the prompt from PendingApprovalPromptTracked.
+    [Fact]
+    public async Task Closed_prompt_leaves_the_pending_list_and_the_binding_journal()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
+        var sid = new SessionId("session-child-closed-cleared");
+        var request = ChildApprovalRequest(sid);
+        var pipeline = new RecordingSessionPipeline(_ =>
+        [
+            request,
+            new ToolInteractionClosed(request.CallId,
+                new Netclaw.Actors.Sessions.ToolInteractionCloseReason.Withdrawn(Netclaw.Actors.Sessions.WithdrawReason.CancelledByParent))
+            { SessionId = sid },
+            // The binding handles outputs in order, so this post proves that it handled the closed output.
+            new TextOutput("after-close-marker") { SessionId = sid }
+        ]);
+
+        var first = CreateButtonBindingActor(sid, pipeline, detector);
+        await AwaitAssertAsync(
+            () => Assert.Contains(GetPostedTexts(), text => text.Contains("after-close-marker", StringComparison.Ordinal)),
+            cancellationToken: ct);
+
+        first.Tell(CreateInboundMessage("A", "user-1"), TestActor);
+        await AwaitAssertAsync(() => Assert.Contains(pipeline.CapturedInputs, IsTextA), cancellationToken: ct);
+        Assert.Empty(pipeline.RecordedFeedback.OfType<ToolInteractionResponse>());
+
+        var stopProbe = CreateTestProbe();
+        stopProbe.Watch(first);
+        Sys.Stop(first);
+        await stopProbe.ExpectTerminatedAsync(first, cancellationToken: ct);
+
+        var recoveryPipeline = new RecordingSessionPipeline(_ => []);
+        var recovered = CreateButtonBindingActor(sid, recoveryPipeline, detector);
+        await recoveryPipeline.Created.WaitAsync(ct);
+        recovered.Tell(CreateInboundMessage("A", "user-1"), TestActor);
+
+        await AwaitAssertAsync(() => Assert.Contains(recoveryPipeline.CapturedInputs, IsTextA), cancellationToken: ct);
+        Assert.Empty(recoveryPipeline.RecordedFeedback.OfType<ToolInteractionResponse>());
+
+        static bool IsTextA(ChannelInput input)
+            => input.Contents.OfType<TextContent>().Any(content => content.Text == "A");
+    }
+
+    // Review fix S4 of PR 2 (channel part). A person answered the child prompt on another surface, for example the TUI.
+    // The session closes the prompt on every subscriber with the reason "answered". The binding redraws its tracked
+    // prompt with no buttons and with a text that says the request has an answer. The call ran, so the text must not say
+    // "withdrawn" or "Nothing ran". The binding also journals the clear, so a binding that recovers from its journal does
+    // not send a text "A" to the answered call.
+    // Planted bug: the binding redraws every close with a withdrawal text; or it keeps the buttons; or it clears the
+    // prompt in memory only.
+    [Fact]
+    public async Task Answered_close_redraws_the_child_prompt_as_answered_and_clears_the_journal()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
+        var sid = new SessionId("session-child-closed-answered");
+        var request = ChildApprovalRequest(sid);
+        var pipeline = new RecordingSessionPipeline(_ =>
+        [
+            request,
+            // The binding handles outputs in order, so this post proves that it tracked and journaled the prompt.
+            new TextOutput("tracked-marker") { SessionId = sid }
+        ]);
+
+        var first = CreateButtonBindingActor(sid, pipeline, detector);
+        await AwaitAssertAsync(
+            () => Assert.Contains(GetPostedTexts(), text => text.Contains("tracked-marker", StringComparison.Ordinal)),
+            cancellationToken: ct);
+        Assert.Empty(GetPromptRedraws());
+
+        pipeline.EmitOutput(new ToolInteractionClosed(request.CallId,
+            new Netclaw.Actors.Sessions.ToolInteractionCloseReason.Answered()) { SessionId = sid });
+        pipeline.EmitOutput(new TextOutput("after-close-marker") { SessionId = sid });
+
+        await AwaitAssertAsync(() =>
+        {
+            Assert.Contains(GetPostedTexts(), text => text.Contains("after-close-marker", StringComparison.Ordinal));
+            var redraw = Assert.Single(GetPromptRedraws());
+            Assert.False(redraw.HasButtons);
+            Assert.Contains("has an answer", redraw.VisibleText, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("withdrawn", redraw.VisibleText, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("Nothing ran", redraw.VisibleText, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain(ChildRunId, redraw.VisibleText, StringComparison.Ordinal);
+        }, cancellationToken: ct);
+        Assert.DoesNotContain(GetPostedTexts(), text => text.Contains("withdrawn", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Nothing ran", StringComparison.OrdinalIgnoreCase));
+
+        await StopBindingAsync(first);
+
+        // The binding journal holds no entry for the answered prompt. A recovered binding does not send "A" to it.
+        var recoveryPipeline = new RecordingSessionPipeline(_ => []);
+        var recovered = CreateButtonBindingActor(sid, recoveryPipeline, detector);
+        await recoveryPipeline.Created.WaitAsync(ct);
+        recovered.Tell(CreateInboundMessage("A", "user-1"), TestActor);
+
+        await AwaitAssertAsync(() => Assert.True(
+                recoveryPipeline.RecordedFeedback.OfType<ToolInteractionTextResponse>().Any()
+                || recoveryPipeline.RecordedFeedback.OfType<ToolInteractionResponse>().Any()
+                || recoveryPipeline.CapturedInputs.Any(input =>
+                    input.Contents.OfType<TextContent>().Any(content => content.Text == "A")),
+                "The recovered binding did not handle the text \"A\"."),
+            cancellationToken: ct);
+        Assert.DoesNotContain(recoveryPipeline.RecordedFeedback.OfType<ToolInteractionResponse>(),
+            feedback => feedback.CallId == request.CallId);
+    }
+
+    // Design D3 (S7) and channel-binding-parity "Child prompts have buttons only": when the binding cannot post the
+    // buttons of a child prompt, it posts no text-only prompt and reports the prompt as unavailable. The session then
+    // withdraws the request.
+    // Planted bug: the binding falls back to a text prompt with "Reply with" (Discord and Mattermost today), so a text
+    // reply can answer a prompt that does not name the child.
+    [Fact]
+    public async Task Failed_child_prompt_post_posts_no_text_prompt_and_reports_the_prompt_unavailable()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
+        var sid = new SessionId("session-child-prompt-post-failed");
+        var request = ChildApprovalRequest(sid);
+        var pipeline = new RecordingSessionPipeline(_ => [request]);
+
+        // The first post is the button prompt.
+        SetReplyClientThrowsOnce(new InvalidOperationException("transport rejected the buttons"));
+        CreateButtonBindingActor(sid, pipeline, detector);
+
+        await AwaitAssertAsync(() =>
+        {
+            var feedback = Assert.Single(pipeline.RecordedFeedback.OfType<ToolInteractionResponse>());
+            Assert.Equal(request.CallId, feedback.CallId);
+            Assert.Equal(ApprovalOptionKeys.PromptUnavailable, feedback.SelectedKey.Value);
+        }, cancellationToken: ct);
+        Assert.DoesNotContain(GetPostedTexts(), text => text.Contains("reply with", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(GetPostedTexts(), text => text.Contains(ChildRunId, StringComparison.Ordinal));
+    }
+
+    // --- A refused answer for a dead child prompt (review fix B1 of PR 2) ---
+
+    // A daemon restart and a passivation remove the in-memory closes of the session. The binding still restores the
+    // UntilClosed child prompt from its own journal (PendingApprovalPromptTracked), and it never gets a close. When the
+    // session refuses an answer for that call as withdrawn, expired, or already answered, the binding removes the entry,
+    // journals PendingApprovalPromptCleared, and redraws the prompt with no buttons. A later live parent prompt then
+    // answers by text.
+    // Planted bug: the binding logs "skipping redraw" and keeps the entry (today). Every text "A" then goes to the dead
+    // call, and a later live prompt makes the text lookup ambiguous, so text cannot answer the live prompt either.
+    [Theory]
+    [InlineData(ApprovalNackReasons.Withdrawn, false)]
+    [InlineData(ApprovalNackReasons.Withdrawn, true)]
+    [InlineData(ApprovalNackReasons.PromptExpired, false)]
+    [InlineData(ApprovalNackReasons.PromptExpired, true)]
+    [InlineData(ApprovalNackReasons.AlreadyAnswered, false)]
+    [InlineData(ApprovalNackReasons.AlreadyAnswered, true)]
+    public async Task Refused_answer_for_a_restored_child_prompt_clears_and_redraws_the_prompt(
+        string nackReason,
+        bool answerByText)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var detector = new ConfigurablePromptInjectionDetector(PromptInjectionResult.Safe());
+        var sid = new SessionId($"session-dead-child-{nackReason}-{(answerByText ? "text" : "click")}");
+        var child = ChildApprovalRequest(sid);
+
+        // Seed the binding journal. The first binding posts the child prompt and journals PendingApprovalPromptTracked.
+        // The binding handles outputs in order, so the marker post proves that the journal write is done.
+        var seedPipeline = new RecordingSessionPipeline(_ =>
+        [
+            child,
+            new TextOutput("seeded-marker") { SessionId = sid }
+        ]);
+        var seed = CreateButtonBindingActor(sid, seedPipeline, detector);
+        await AwaitAssertAsync(
+            () => Assert.Contains(GetPostedTexts(), text => text.Contains("seeded-marker", StringComparison.Ordinal)),
+            cancellationToken: ct);
+        await StopBindingAsync(seed);
+
+        // The restored binding holds the child prompt from its journal. The session has no close for it and only
+        // refuses the answer. Every other answer gets an acknowledgement.
+        var pipeline = new RecordingSessionPipeline(_ => [])
+        {
+            ResponseFactory = (feedback, _) => Task.FromResult<ISessionResponse>(
+                feedback is ToolInteractionResponse response && response.CallId == child.CallId
+                    ? CommandNack.For(sid, nackReason)
+                    : CommandAck.For(sid))
+        };
+        var restored = CreateButtonBindingActor(sid, pipeline, detector);
+        await pipeline.Created.WaitAsync(ct);
+
+        restored.Tell(
+            answerByText
+                ? CreateInboundMessage("A", "user-1")
+                : CreateApprovalResponse(child.CallId.Value, ApprovalOptionKeys.ApproveOnce, "user-1"),
+            TestActor);
+
+        await AwaitAssertAsync(() =>
+        {
+            Assert.Contains(pipeline.RecordedFeedback.OfType<ToolInteractionResponse>(),
+                feedback => feedback.CallId == child.CallId);
+            var redraw = Assert.Single(GetPromptRedraws());
+            Assert.False(redraw.HasButtons);
+            Assert.DoesNotContain(ChildRunId, redraw.VisibleText, StringComparison.Ordinal);
+        }, cancellationToken: ct);
+
+        // A later live parent prompt answers by text.
+        pipeline.EmitOutput(ApprovalRequest(sid, "call-live-parent", "write_file"));
+        await AwaitAssertAsync(
+            () => Assert.Contains(GetPostedTexts(), text => text.Contains("write_file", StringComparison.Ordinal)),
+            cancellationToken: ct);
+
+        restored.Tell(CreateInboundMessage("A", "user-1"), TestActor);
+
+        await AwaitAssertAsync(() =>
+        {
+            var answer = Assert.Single(pipeline.RecordedFeedback.OfType<ToolInteractionResponse>(),
+                feedback => feedback.CallId.Value == "call-live-parent");
+            Assert.Equal(ApprovalOptionKeys.ApproveOnce, answer.SelectedKey.Value);
+        }, cancellationToken: ct);
+        Assert.Single(pipeline.RecordedFeedback.OfType<ToolInteractionResponse>(),
+            feedback => feedback.CallId == child.CallId);
+        Assert.DoesNotContain(GetPostedTexts(), text => text.Contains("approval prompts are open", StringComparison.Ordinal));
+
+        // The marker post proves that the binding handled the live answer and its journal writes.
+        pipeline.EmitOutput(new TextOutput("answered-marker") { SessionId = sid });
+        await AwaitAssertAsync(
+            () => Assert.Contains(GetPostedTexts(), text => text.Contains("answered-marker", StringComparison.Ordinal)),
+            cancellationToken: ct);
+        await StopBindingAsync(restored);
+
+        // The binding journal holds no child prompt. A binding that recovers from it does not send "A" to the dead call.
+        var reloadedPipeline = new RecordingSessionPipeline(_ => []);
+        var reloaded = CreateButtonBindingActor(sid, reloadedPipeline, detector);
+        await reloadedPipeline.Created.WaitAsync(ct);
+        reloaded.Tell(CreateInboundMessage("A", "user-1"), TestActor);
+
+        await AwaitAssertAsync(() => Assert.True(
+                reloadedPipeline.RecordedFeedback.OfType<ToolInteractionTextResponse>().Any()
+                || reloadedPipeline.RecordedFeedback.OfType<ToolInteractionResponse>().Any()
+                || reloadedPipeline.CapturedInputs.Any(input =>
+                    input.Contents.OfType<TextContent>().Any(content => content.Text == "A")),
+                "The reloaded binding did not handle the text \"A\"."),
+            cancellationToken: ct);
+        Assert.DoesNotContain(reloadedPipeline.RecordedFeedback.OfType<ToolInteractionResponse>(),
+            feedback => feedback.CallId == child.CallId);
+    }
+
+    private async Task StopBindingAsync(IActorRef binding)
+    {
+        var stopped = CreateTestProbe();
+        stopped.Watch(binding);
+        Sys.Stop(binding);
+        await stopped.ExpectTerminatedAsync(binding, cancellationToken: TestContext.Current.CancellationToken);
     }
 }

@@ -26,7 +26,9 @@ These checks run first and cannot be overridden by an approval:
 - The audience profile must allow the tool.
 - Shell calls need the Personal audience and a shell mode that allows the host
   shell.
-- A hard-deny rule or a protected path denies the call. A glob word that can
+- A hard-deny rule or a protected path denies the call. A file tool cannot
+  write to the config directory, whatever the approval mode or a grant.
+- A glob word that can
   match a protected path or the credential store (`~/.netclaw/keys`,
   `~/.netclaw/config/secrets.json`), such as `cat ~/.netclaw/k*/*.xml`, is
   denied as the literal path is (owner decision D5). The check compares the
@@ -66,16 +68,18 @@ Set the mode in the `ApprovalPolicy` of each audience profile in
 ```
 
 This means: all tools run without a prompt, but `shell_execute` needs approval
-for the Personal audience. Add other tools to `ToolOverrides` as needed, for
-example `"mcp:filesystem:write_file": "Approval"`. `McpServerDefaults` sets a
-mode for every tool of one MCP server.
+for the Personal audience. Add other tools to `ToolOverrides` as needed. Key an
+MCP tool as `server/tool` (for example `"filesystem/write_file": "Approval"`)
+or `server__tool`. Keys match tool names without regard to case, so
+`"File_Write": "Deny"` denies `file_write`. `McpServerDefaults` sets a mode for
+every tool of one MCP server. `netclaw doctor` warns about a key that cannot be
+a tool name.
 
 Defaults you get without an `ApprovalPolicy`:
 
 - Personal `shell_execute` uses `Approval`, even when `DefaultMode` is `Auto`.
-  Only an exact `shell_execute` override of `Auto` removes the prompt.
-- Personal `file_write` and `file_edit` on a Netclaw control-plane path use
-  `Approval`.
+  Only a `shell_execute` override of `Auto` removes the prompt. Keys match
+  without regard to case, so `Shell_Execute` counts.
 - Other tools use `Auto`.
 - Team and Public cannot use `shell_execute`.
 
@@ -190,8 +194,21 @@ offer.
 
 A prompt waits until you answer. No timer denies it. If the daemon restarts or
 the session goes idle, your later answer still resumes the call. A new message
-in the thread abandons the calls that wait. A subagent prompt does not survive a
-restart; Netclaw rejects the old prompt as expired.
+in the thread abandons the calls that wait.
+
+A subagent (child) prompt is different:
+
+- It has buttons only. Answer it with a button, not with a text reply.
+- A text reply such as "A" answers nothing while a child prompt is among two or
+  more prompts that you can answer. Netclaw replies "N approval prompts are
+  open. Use the buttons on the prompt you mean."
+- A cancel, the end of the child, a lost child, a restart, or a channel that
+  cannot show the prompt withdraws it. The prompt then shows the reason, for
+  example "This approval request was withdrawn because the task that asked
+  for it was cancelled. Nothing ran." A later click gets the same text.
+- When you answer it in one client, the prompt in every other client shows
+  "This approval request has an answer."
+- It does not survive a restart. Netclaw withdraws it.
 
 ## What runs without a prompt
 
@@ -380,6 +397,10 @@ The store keeps itself clean when it saves a grant:
 - It never removes a stored grant when it saves one, so a later revoke keeps
   its meaning.
 
+For Bash 5.2 or 5.3, an exact effective assignment value can give two source
+forms the same digest. For example, `$HOME/.dotnet` can match its exact launch
+value. A source change that makes the effective value unknown stays one-time.
+
 ### Upgrade, rollback, and repair
 
 - On the first load of a version 2 file, Netclaw writes a byte-identical
@@ -447,7 +468,7 @@ built-in list; they do not replace it:
 | --- | --- | --- |
 | Slack | Yes | Block Kit buttons |
 | Discord | Yes | Native buttons |
-| Mattermost | Yes | Interactive buttons, or a text reply when no callback URL is set |
+| Mattermost | Yes | Interactive buttons, or a text reply when no callback URL is set. With no callback URL, Mattermost refuses every child consent request |
 | TUI (`netclaw chat`) | Yes | Inline prompt |
 | SignalR (web client) | Yes | Inline prompt |
 | Headless (`netclaw chat -p`) | No | The call is denied with the headless result text |
@@ -456,7 +477,10 @@ built-in list; they do not replace it:
 
 In a channel without prompts, a saved grant or an output command can still
 cover a call. If a channel cannot post a prompt (for example, the platform
-rejects the message), the channel answers `Deny` for that call.
+rejects the message), the channel answers `prompt_unavailable` for that call,
+and the call does not run. A child prompt has no text-only fallback, so a
+Mattermost binding with no callback URL refuses each child consent request
+this way, and the session withdraws it.
 
 ## Diagnostics
 
@@ -519,8 +543,10 @@ Read a trace from the last row back:
 1. `Completion/RequiresApproval/UncoveredCandidates` means at least one
    command had no coverage.
 2. Find that candidate ID in the `StoredGrantMatch` rows. `NoGrant` means no
-   saved grant matched. `TokenMismatch`, `ShellMismatch`, `OutsideDirectory`,
-   or `Symlink` explains a near miss.
+   saved grant matched the candidate. A `LegacyExact` grant can still appear
+   as a near miss when its command words differ. Netclaw reads those words
+   from the stored phrase. `TokenMismatch`, `ShellMismatch`,
+   `AssignmentMismatch`, `OutsideDirectory`, or `Symlink` explains a near miss.
 3. A `ReviewedSafePolicy` or `OneTimeApproval` row for that ID means a later
    stage covered it.
 4. `Completion/Deny/InternalPolicyFailure` is a defect, not an approval case.
@@ -539,7 +565,7 @@ Use the trace before you ask for a policy change:
 ## FAQ
 
 **Q: Can I turn off approval for shell commands?**
-A: Yes. Set an exact `shell_execute` override to `Auto`. A removed override
+A: Yes. Set a `shell_execute` override to `Auto`. A removed override
 does not turn off the Personal default.
 
 **Q: Can I require approval for an MCP tool?**
@@ -548,13 +574,14 @@ A: Yes. Add the tool to `ToolOverrides`:
 ```json
 "ToolOverrides": {
   "shell_execute": "Approval",
-  "mcp:memorizer:store": "Approval"
+  "memorizer/store": "Approval"
 }
 ```
 
 **Q: What happens if I do not answer a prompt?**
 A: The call waits. No timer denies it. Your answer still works after a daemon
-restart, except for a subagent prompt.
+restart, except for a subagent prompt. A restart withdraws a subagent prompt,
+and the prompt shows the reason.
 
 **Q: Can I approve common commands in advance?**
 A: Yes. Use `netclaw approvals trust-verb`, or choose a saved-grant option in a

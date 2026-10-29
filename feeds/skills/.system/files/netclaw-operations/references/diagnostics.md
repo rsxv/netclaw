@@ -6,13 +6,30 @@
 
 When something seems wrong with Netclaw itself:
 
+`netclaw daemon --help` prints command help and exits with code 0. It does not control the daemon or change service files.
+
 1. Run `netclaw doctor` via `shell_execute` — validates config, providers,
    MCP connections, memory health, and recent daemon crash logs
 2. If doctor reports fixable issues, run `netclaw doctor --fix --dry-run` to
    preview auto-repairs (schema-driven: stale properties, enum coercion, missing defaults)
 3. Run `netclaw status` via `shell_execute` — live runtime state from daemon
-3. Check daemon logs at `<NETCLAW_HOME>/logs/daemon-{yyyy-MM-dd}.log` (`NETCLAW_HOME` defaults to `~/.netclaw`)
+3. Check daemon logs at `<NETCLAW_HOME>/logs/daemon-{yyyy-MM-dd}*.log` (`NETCLAW_HOME` defaults to `~/.netclaw`)
 4. Check session logs at `<NETCLAW_HOME>/logs/sessions/{sanitized-session-id}/session.log`
+
+Use `netclaw doctor --fix --yes --format json` for a repair with JSON output.
+When stdout is present, parse it as one JSON document. Backup notices use stderr.
+A file access failure during the repair returns exit code 1 with stderr only.
+Text output keeps backup notices on stdout. A dry run creates no backup.
+
+If a local config source cannot be read, `netclaw daemon status` reports an unknown address and skips its readiness probe.
+`netclaw daemon stop` also skips its shutdown notice. It still requires proof that the process serves this home.
+Repair or restore the file that the command names, then retry.
+
+The daemon compares the loaded `netclaw.json` hash with disk after its config actor starts the watcher.
+A startup difference or a later config event triggers validation after application startup.
+Validation uses canonical sources, including secrets and environment overrides, and accepts comments and trailing commas.
+An invalid candidate preserves the current host and reports its rejection through `netclaw status`.
+A secret-only change, including an OAuth token refresh, creates no reload signal.
 
 The daemon deletes `daemon-*.log` and `crash-*.log` files older than `Retention:Logs:Days`
 (default 14, `0` keeps them forever). It does not delete anything under `logs/sessions/`.
@@ -43,7 +60,10 @@ Log split — one stream, partitioned locally by session:
   the notification sink). Note the *per-call* failover/retry
   log lines emitted while serving a specific session carry that session's id, so they
   partition into its `session.log`; the daemon-wide outage signal is the alert in
-  `daemon.log`. Rolled daily, capped at 10 MB per file.
+  the daemon log. Each UTC date starts a new file series. At 10 MiB,
+  the writer adds `.1.log`, then `.2.log`, to the dated base name.
+  One complete entry can exceed the threshold. A restart preserves previous entries.
+  The retention policy also covers numbered segments. The doctor reads all valid segments in its date window.
 - The **full** stream (daemon and session lines alike) is also exported to OTEL/Seq
   with the session id as an attribute; do the global slicing/distilling on the OTEL
   receiver side.
@@ -68,7 +88,19 @@ What to expect inside `session.log`:
   per file.
 - Because the partition is by session id, you usually do **not** need to grep — open
   the one file for the session and read top to bottom. To correlate across sessions
-  or globally, use Seq/OTLP (every line is there with `SessionId` as a field).
+  or globally, use Seq/OTLP. The operational lines are there with `SessionId` as a
+  field. The conversation audit lines (`User:`, `Assistant:`, `Tool result:`) stay
+  only in `session.log`.
+- For tool calls, OTLP has the `Invoking tool [...]` line with the fields
+  `ToolName`, `CallId`, `Args`, `Rationale`, `AuthorizationAttemptId`, and
+  `SessionId`. `Args` is redacted JSON: secret-named keys and known token shapes
+  show `***REDACTED***`, a string longer than 256 characters shows
+  `<N chars, sha256:...>` (or `<N chars, redacted>` when it held a secret), a
+  value of another type shows `<TypeName>` (only `int` and `long` integers
+  show their value), and the text stops at 4,096 characters. A text that ends
+  with `...` is not complete. `Args` is `<arguments unavailable>` when the daemon cannot read
+  the arguments. `Rationale` stops at 500 characters and is empty for a
+  rejected call or an unknown tool. OTLP does not have the tool result.
 - The session-log writer's own failure lines are the one exception: they go to
   `daemon.log`, never routed back into the file that just failed.
 - Writes are split by kind. The **conversation audit** (User/Assistant/Tool/Usage
@@ -85,22 +117,35 @@ debugging a daemon-wide problem → read `daemon.log`.
 |---------|-------|
 | No LLM responses | `netclaw doctor`; verify provider credentials |
 | Missing tools | `netclaw mcp list`; check MCP connection state |
+| An OAuth provider stops working | `netclaw status` lists `provider:<name>: auth-failed`. The line under it gives the code from the token server, for example `refresh_token_reused`. Each rejection writes one Error: `Provider <name> needs a new OAuth sign-in. Reason: <code>`. The line goes to the `session.log` of the session that made the call, or to `daemon.log` when no session made it. Run `netclaw provider` to sign in again. The status goes away after a new sign-in or the next good refresh. |
 | An MCP tool call fails | Grep `<NETCLAW_HOME>/logs/daemon-*.log` for `MCP tool '` and `invocation failed`. Each failed call writes one Warning that names the server, the tool, and the HTTP status when the server sent one. The tool-result text gives the kind: `reported a failure:` is an error the tool declared, and `failed:` is an exception from the server or the transport. |
 | Memory recall degraded | `netclaw status` memory section |
 | Memory embedding/relevance model unavailable | Fires a `memory.embedding_model.unavailable` / `memory.relevance_model.unavailable` operational alert (once per model per daemon run) naming the model, failure reason, and consequence when `Memory.Embeddings.Enabled=true` and either ONNX model fails to provision or load; see `netclaw-memory`'s Embeddings section and `netclaw doctor`'s Memory Embeddings / Memory Relevance Gate checks |
 | Daemon won't start | crash logs at `<NETCLAW_HOME>/logs/crash-*.log` (`NETCLAW_HOME` defaults to `~/.netclaw`) |
 | Docker daemon cannot create `/home/netclaw/.netclaw/*` | Official image entrypoint repairs writable bind mounts to UID/GID `1654:1654`; if bypassed or read-only, run `sudo chown -R 1654:1654 <host-data-dir>` or use a Docker named volume |
 | Discord/Slack channel offline | `netclaw status` shows the channel `disconnected` with a reason. Discord may also report `degraded` when Discord.Net says the socket is connected but the gateway is not ready, such as after a resumed session that Netclaw is replacing with a clean reconnect. A misconfigured channel (bad token, missing Discord Message Content intent) degrades only that channel — the daemon keeps running and other channels are unaffected. A transient network failure retries automatically; a config/permission failure stays offline until the operator fixes the config and restarts the daemon. |
-| `command not found` for `netclaw`/`dotnet`/a user tool from the shell tool when the daemon runs as a systemd service | The systemd `--user` service does not inherit your login-shell `PATH`; `netclaw daemon install` captures it into `~/.netclaw/config/daemon.env`. Run `netclaw doctor` (the **Systemd Unit PATH** check flags a missing/stale/legacy env file), then `netclaw doctor --fix` to rehydrate `PATH` from your current shell (or re-run `netclaw daemon install`), and finally `systemctl --user restart netclaw`. Installed a new tool after install? Its dir won't be seen until you re-run one of those and restart. Per-directory managers (`mise`/`asdf`/`direnv`) are not captured. |
+| `command not found` for `netclaw`/`dotnet`/a user tool from the shell tool when the daemon runs as a systemd service | The systemd `--user` service does not inherit your login-shell `PATH`; `netclaw daemon install` captures it into `~/.netclaw/config/daemon.env`. Run `netclaw doctor` (the **Systemd Unit PATH** check flags a missing/stale/legacy env file), then `netclaw doctor --fix` to rehydrate `PATH` from your current shell (or re-run `netclaw daemon install`), and finally `systemctl --user restart netclaw`. Both commands keep the other lines of `daemon.env`. Installed a new tool after install? Its dir won't be seen until you re-run one of those and restart. Per-directory managers (`mise`/`asdf`/`direnv`) are not captured. |
 
 Slack health reads the live Socket Mode state. The connection supervisor checks this state every five seconds.
 A disconnect emits `channel.disconnected`. The supervisor retries with exponential backoff up to five minutes.
 A successful recovery emits `channel.reconnected`.
 
 A graceful stop can resume a safe model turn through a standard reminder.
-The reminder expires ten minutes after the interruption. A completed reply,
-partial reply, or possible tool effect leaves the session quiet. A crash does
-not create a restart reminder.
+This includes a turn that the drain stopped after a tool batch: the drain keeps
+one continuation input without text, and the reminder starts the next model call
+of that turn. A message that arrives before the reminder ends that resume, and
+the session then posts the stop notice. The reminder expires ten minutes after the interruption.
+When the daemon starts after that time, startup logs a Warning `Restart reminder <id> expired before startup
+recovery; the session closes the stopped work with a notice.` The session closes the stopped turn, posts the
+stop notice once, and runs nothing. A child park stays open. A
+completed reply leaves the session quiet. A partial reply, a live background
+job, an overflow replay, or a turn without a channel type gets no reminder. The
+session log then has
+`Restart drain stopped the turn of session <id>, and no restart reminder resumes that turn.`
+and the session posts a notice that tells the person to send a message. A tool
+that still runs at the drain deadline gets no reminder and no session notice.
+The session does not acknowledge the drain, and only the daemon shutdown alert
+names it (`timedOutSessionIds`). A crash does not create a restart reminder.
 
 The daemon gives session drain 20 seconds within a 30-second shutdown phase.
 The CLI allows 45 seconds, and the generated systemd unit allows 60 seconds.
@@ -146,9 +191,22 @@ and trusted proxies later once the proxy topology is known.
 Config files: `~/.netclaw/config/netclaw.json` (daemon-owned base config,
 including `Daemon.Host`, `Daemon.Port`, `Daemon.ExposureMode`),
 `~/.netclaw/client/config.json` (local CLI endpoint state),
-`~/.netclaw/config/secrets.json` (credentials — never display API keys), and
+`~/.netclaw/config/secrets.json` (credentials — never display API keys; it also
+holds the OAuth token expiry of each provider, the one value there that is not
+encrypted), and
 `~/.netclaw/config/editor-state.json` (passive config-editor state for dormant
 mode-specific values).
+
+An OAuth token refresh writes `secrets.json` only. It does not change
+`netclaw.json` and does not restart the daemon. An older release wrote
+`Providers.<name>.OAuthTokenExpiry` to `netclaw.json`. `netclaw doctor` reports
+that key as information and does not change its exit code. `netclaw doctor --fix`
+copies the file to `netclaw.json.retired-oauth-expiry.bak`, copies each date to
+an existing provider entry in `secrets.json`, and removes the key. When
+`netclaw.json` has comments, `doctor --fix` changes nothing, so remove the key by
+hand. An encrypted `OAuthTokenExpiry` in `secrets.json` comes from an older
+build. The daemon stops at startup with an error that names `Providers:<name>`.
+Run `netclaw provider` and sign in again. The sign-in saves the date unencrypted.
 
 ## Feature Kill Switches
 

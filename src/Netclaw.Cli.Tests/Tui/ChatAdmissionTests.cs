@@ -46,26 +46,76 @@ public sealed class ChatAdmissionTests : IDisposable
         var navigation = new ChatNavigationState();
         var input = new VirtualInputSource();
         using var chat = new ChatViewModel(client, TimeProvider.System, new ModelCapabilities { ModelId = "test" }, navigation, Paths);
+        var ready = Gate();
+        using var statusSub = chat.StatusMessage.Subscribe(value =>
+        {
+            if (value == "Ready") ready.TrySetResult();
+        });
         await using var provider = CreateHost(chat, input, new VirtualTerminal(100, 30));
-        input.EnqueueString("typed-before-quit");
-        input.EnqueueKey(ConsoleKey.Enter);
-        input.EnqueueKey(ConsoleKey.Q, false, false, true);
-        input.EnqueueKey(ConsoleKey.Q, false, false, true);
-        input.EnqueueString("rejected-after-quit");
-        input.EnqueueKey(ConsoleKey.Enter);
         var run = provider.GetRequiredService<TerminaApplication>().RunAsync(TestContext.Current.CancellationToken);
         try
         {
-            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            var cancellationToken = TestContext.Current.CancellationToken;
+            await ready.Task.WaitAsync(TimeSpan.FromSeconds(10), cancellationToken);
+            input.EnqueueString("typed-before-quit");
+            input.EnqueueKey(ConsoleKey.Enter);
+            input.EnqueueKey(ConsoleKey.Q, false, false, true);
+            input.EnqueueKey(ConsoleKey.Q, false, false, true);
+            input.EnqueueString("rejected-after-quit");
+            input.EnqueueKey(ConsoleKey.Enter);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), cancellationToken);
             if (heldAdmission) Assert.False(run.IsCompleted);
             release.TrySetResult();
-            await run.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await run.WaitAsync(TimeSpan.FromSeconds(10), cancellationToken);
             Assert.Empty(Assert.IsType<ChatCloseReceipt>(navigation.CloseReceipt).Inputs);
             Assert.Same(client.CloseReceipt, navigation.CloseReceipt);
             var send = Assert.Single(transport.Invocations, call => call.Method == "SendMessage");
             Assert.Equal("typed-before-quit", send.Args[1]);
         }
         finally { release.TrySetResult(); }
+    }
+
+    [Fact]
+    public async Task Over_limit_text_is_refused_with_a_transcript_error_and_stays_in_the_composer()
+    {
+        var transport = new FakeDaemonHubTransport();
+        await using var client = new DaemonClient("http://localhost", transport, reconnectDelays: [TimeSpan.Zero]);
+        var input = new VirtualInputSource();
+        var terminal = new VirtualTerminal(80, 30);
+        using var chat = new ChatViewModel(client, TimeProvider.System, new ModelCapabilities { ModelId = "test" }, new ChatNavigationState(), Paths);
+        var ready = Gate();
+        var refused = Gate();
+        using var statusSub = chat.StatusMessage.Subscribe(value =>
+        {
+            if (value == "Ready") ready.TrySetResult();
+            if (value.StartsWith("Message is too large", StringComparison.Ordinal)) refused.TrySetResult();
+        });
+        await using var provider = CreateHost(chat, input, terminal);
+        var run = provider.GetRequiredService<TerminaApplication>().RunAsync(TestContext.Current.CancellationToken);
+        await ready.Task.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+
+        // 600,000 raw ASCII characters is past the 512 KB frame limit. Paste it, press Enter (refused), then
+        // press Enter again: the composer must still hold the text, so the second Enter is refused too.
+        input.EnqueuePaste(new string('a', 600_000));
+        input.EnqueueKey(ConsoleKey.Enter);
+        await refused.Task.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        input.EnqueueKey(ConsoleKey.Enter);
+        input.EnqueueKey(ConsoleKey.Q, false, false, true);
+        await run.WaitAsync(TimeSpan.FromSeconds(60), TestContext.Current.CancellationToken);
+
+        Assert.DoesNotContain(transport.Invocations, call => call.Method == "SendMessage");
+        var screen = terminal.ToString();
+        Assert.Contains("limit 512 KB)", screen);
+        Assert.Equal(2, CountOccurrences(screen, "[error] Message is too large"));
+        Assert.DoesNotContain("You:", screen);
+    }
+
+    private static int CountOccurrences(string text, string value)
+    {
+        var count = 0;
+        for (var i = text.IndexOf(value, StringComparison.Ordinal); i >= 0; i = text.IndexOf(value, i + value.Length, StringComparison.Ordinal))
+            count++;
+        return count;
     }
 
     private static ServiceProvider CreateHost(ChatViewModel chat, VirtualInputSource input, VirtualTerminal terminal)
@@ -142,6 +192,110 @@ public sealed class ChatAdmissionTests : IDisposable
         Assert.DoesNotContain(transport.Invocations, call => call.Method == "RespondToInteraction");
     }
 
+    // Review nit of PR 2 (TUI status). The operator answers the first of two child prompts with Enter. The answered close
+    // of that prompt reaches the TUI before the result of the respond call. The close removes the prompt, so the respond
+    // path finds another current prompt and returns early. The second prompt waits for the operator, so the TUI must not
+    // show "generating".
+    // Planted bug: the respond path sets IsGenerating and clears it only when it removes the prompt itself (today), so
+    // IsGenerating stays true while the second prompt waits.
+    [Fact]
+    public async Task Answered_close_before_the_respond_result_leaves_the_next_prompt_waiting_and_not_generating()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var respondEntered = Gate();
+        var respondRelease = Gate();
+        var transport = new FakeDaemonHubTransport
+        {
+            VoidInvokeHook = (method, _, token) =>
+            {
+                if (method != "RespondToInteraction") return Task.CompletedTask;
+                respondEntered.TrySetResult();
+                return respondRelease.Task.WaitAsync(token);
+            }
+        };
+        await using var client = new DaemonClient("http://localhost", transport, reconnectDelays: [TimeSpan.Zero]);
+        var input = new VirtualInputSource();
+        var terminal = new VirtualTerminal(120, 40);
+        using var chat = new ChatViewModel(client, TimeProvider.System, new ModelCapabilities { ModelId = "test" }, new ChatNavigationState(), Paths);
+        var ready = Gate();
+        var promptsShown = Gate();
+        var closeShown = Gate();
+        var prompts = 0;
+        using var statusSub = chat.StatusMessage.Subscribe(value =>
+        {
+            if (value == "Ready") ready.TrySetResult();
+        });
+        using var outputSub = chat.SessionOutput.Subscribe(output =>
+        {
+            if (output is ToolInteractionRequest && ++prompts == 2) promptsShown.TrySetResult();
+            if (output is ToolInteractionClosed) closeShown.TrySetResult();
+        });
+        await using var provider = CreateHost(chat, input, terminal);
+        var run = provider.GetRequiredService<TerminaApplication>().RunAsync(ct);
+        try
+        {
+            await ready.Task.WaitAsync(TimeSpan.FromSeconds(30), ct);
+            transport.PushOutput(ChildPromptDto("child-run/subagent-approval/1", "echo FIRST"));
+            transport.PushOutput(ChildPromptDto("child-run/subagent-approval/2", "echo SECOND"));
+            await promptsShown.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
+
+            input.EnqueueKey(ConsoleKey.Enter); // approve the first prompt once
+            await respondEntered.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
+
+            // The answered close arrives while the respond call waits for its result.
+            transport.PushOutput(new SessionOutputDto
+            {
+                Type = SessionOutputTypes.ToolInteractionClosed,
+                SessionId = "fake/session",
+                CallId = "child-run/subagent-approval/1",
+                InteractionCloseKind = "answered"
+            });
+            await closeShown.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
+            respondRelease.TrySetResult();
+
+            var notGenerating = Gate();
+            using var generatingSub = chat.IsGenerating.Subscribe(value =>
+            {
+                if (!value) notGenerating.TrySetResult();
+            });
+            try
+            {
+                await notGenerating.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
+            }
+            catch (TimeoutException)
+            {
+                Assert.Fail($"The TUI shows generating while a prompt waits. Status: \"{chat.StatusMessage.Value}\".");
+            }
+
+            Assert.True(chat.HasPendingInteraction);
+            Assert.Equal("child-run/subagent-approval/2", chat.CurrentInteraction?.CallId.Value);
+            Assert.Equal("Approval required", chat.StatusMessage.Value);
+
+            input.EnqueueKey(ConsoleKey.Q, false, false, true);
+            await run.WaitAsync(TimeSpan.FromSeconds(10), ct);
+            Assert.False(chat.IsGenerating.Value);
+            var respond = Assert.Single(transport.Invocations, call => call.Method == "RespondToInteraction");
+            Assert.Equal("child-run/subagent-approval/1", respond.Args[1]);
+        }
+        finally { respondRelease.TrySetResult(); }
+    }
+
+    private static SessionOutputDto ChildPromptDto(string callId, string displayText) => new()
+    {
+        Type = SessionOutputTypes.ToolInteraction,
+        SessionId = "fake/session",
+        InteractionKind = "approval",
+        CallId = callId,
+        ToolName = "shell_execute",
+        InteractionDisplayText = displayText,
+        InteractionOptions =
+        [
+            new ToolInteractionOption(ApprovalOptionKeys.ApproveOnceKey, ApprovalOptionKeys.ApproveOnceLabel),
+            new ToolInteractionOption(ApprovalOptionKeys.DenyKey, ApprovalOptionKeys.DenyLabel)
+        ],
+        InteractionLifetime = nameof(ToolInteractionLifetime.UntilClosed)
+    };
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -192,25 +346,35 @@ public sealed class ChatAdmissionTests : IDisposable
     [Fact]
     public async Task A_late_admission_response_does_not_restore_generation_after_turn_completion()
     {
+        var entered = Gate();
+        var deliverOutput = Gate();
         var release = Gate();
         var completed = Gate();
         var transport = new FakeDaemonHubTransport();
-        transport.VoidInvokeHook = (_, args, token) =>
+        transport.VoidInvokeHook = async (_, args, token) =>
         {
+            entered.TrySetResult();
+            await deliverOutput.Task.WaitAsync(token);
             transport.PushOutput(new SessionOutputDto { Type = "turn_completed", SessionId = (string)args[0]!, TurnNumber = new TurnNumber(1) });
-            return release.Task.WaitAsync(token);
+            await release.Task.WaitAsync(token);
         };
         await using var client = new DaemonClient("http://localhost", transport, reconnectDelays: [TimeSpan.Zero]);
         using var chat = new ChatViewModel(client, TimeProvider.System, new ModelCapabilities { ModelId = "test" }, new ChatNavigationState(), Paths);
         chat.OnActivated();
         await client.ConnectAsync(TestContext.Current.CancellationToken);
-        using var status = chat.StatusMessage.Subscribe(value =>
+        using var output = chat.SessionOutput.Subscribe(value =>
         {
-            if (value == "Ready" && transport.Invocations.Any(call => call.Method == "SendMessage")) completed.TrySetResult();
+            if (value is TurnCompleted) completed.TrySetResult();
         });
         try
         {
             await chat.SubmitAsync("first");
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            // An unrelated Ready event must not acknowledge turn completion.
+            chat.StatusMessage.Value = "Generating...";
+            chat.StatusMessage.Value = "Ready";
+            Assert.False(completed.Task.IsCompleted);
+            deliverOutput.TrySetResult();
             await completed.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
             Assert.False(chat.IsGenerating.Value);
             release.TrySetResult();
@@ -218,6 +382,6 @@ public sealed class ChatAdmissionTests : IDisposable
             Assert.False(chat.IsGenerating.Value);
             Assert.Equal("Ready", chat.StatusMessage.Value);
         }
-        finally { release.TrySetResult(); }
+        finally { deliverOutput.TrySetResult(); release.TrySetResult(); }
     }
 }

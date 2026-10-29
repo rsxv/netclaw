@@ -64,11 +64,22 @@ credentials, missing provider `Type`, schema-invalid config, or invalid explicit
 startup loudly.
 
 For OpenAI ChatGPT subscription auth, Netclaw persists the OAuth access token,
-refresh token, and ChatGPT account ID returned by the OpenAI ID token. The
-account ID is required by the Codex backend. If OpenAI OAuth validation reports
+refresh token, ChatGPT account ID returned by the OpenAI ID token, and token
+expiry in `secrets.json`. The account ID is required by the Codex backend. If OpenAI OAuth validation reports
 that the account ID is missing, re-authenticate the provider with `netclaw
 provider` or remove and add it again. API-key OpenAI auth does not
 use the Codex backend or this account-ID metadata.
+
+When the token server rejects a refresh token (`invalid_grant`,
+`refresh_token_reused`, `refresh_token_expired`, or
+`refresh_token_invalidated`), only a new sign-in helps. OpenAI sends the code
+as `{"error":{"code":"..."}}`. Other servers send a string. The daemon writes
+an Error log line with the provider name and the code. It sends the
+`provider.auth.expired` alert with the code in its `reason` field. It shows the
+provider as `auth-failed` in `netclaw status` and `/api/health/status`. Run
+`netclaw provider` to sign in again. A transient refresh failure (a network
+error, a timeout, HTTP 5xx, or HTTP 429) gets one retry after 2 seconds. A
+rejected token gets none.
 
 For `openai` OAuth providers, `netclaw model discover <provider>` queries the
 Codex backend model catalog with the OAuth bearer token and
@@ -119,6 +130,57 @@ definitions and repairs the selected entry while keeping the fields it can
 still read. `model list` reports an unparseable config instead of crashing.
 `netclaw doctor --fix` applies only repairs it can derive safely; it does not
 invent missing named definitions or role assignments.
+
+### Output limit and thinking level
+
+A model definition has two provider-neutral settings. You do not need to know
+the switch of each provider: Netclaw maps them.
+
+- `--max-output-tokens <n>` sets the output limit of every call of the model.
+  Thinking tokens count inside the limit, so a low limit with a high level can
+  truncate the reply. The value must be below the context window and not above
+  the model maximum that the probe reports.
+- Without a limit, a hosted API gets 32000, capped to its known model maximum
+  and clamped to its known context window minus the estimated prompt and tool
+  schemas. Anthropic replies are therefore no longer cut at 1024 tokens.
+  A self-hosted server gets the same clamp, but only when its window is known
+  from `ContextWindow` or from the server's own probe; a catalog value does not
+  count. Otherwise it gets no limit field, and the server decides.
+- A self-hosted server must use the `ollama` or `openai-compatible` provider
+  type. A hosted type (`deepseek`, `openrouter`, `veniceai`) that points at
+  your own server is treated as hosted: catalog values apply to it.
+- `--thinking <off|low|medium|high|max>` sets the thinking level. `max` is the
+  highest level that the provider offers. A call site can set its own value:
+  memory curation keeps 4096 tokens and no reasoning.
+- `--clear-max-output-tokens` and `--clear-thinking` remove a setting. A set
+  flag and its clear flag cannot be combined.
+
+`model set` probes the provider and offers a level only when the provider
+dialect can send it and the model accepts it. It never sends a nearby level.
+A rejected command prints the offered levels and leaves `netclaw.json`
+unchanged. When the probe does not report the capability, only `off` is
+offered ("thinking support unknown for this endpoint"); for a hosted API
+with the Native dialect, no level is offered. DeepSeek offers no
+`medium`. Ollama and `ReasoningEffort` offer no `max`.
+
+An `openai-compatible` provider needs a thinking dialect before it can send a
+level. `model set` saves `ReasoningEffort` when it detects llama.cpp. For
+vLLM, SGLang, ds4, or a proxy, set
+`Providers:<name>:VendorOptions:ThinkingDialect` in `netclaw.json` to
+`ChatTemplateKwargs`, `ReasoningEffort`, `DeepSeek`, or `None`. There is no
+CLI command for this key. Without it, only the output limit works.
+
+In the TUI (`netclaw model`), press `P` on a role to edit both settings of its
+definition. A greyed level shows the reason that it is not offered. The
+settings belong to the definition, so a definition that two roles share
+changes for both. For different settings per role, make a second definition of
+the same model.
+
+A hand-edited level that the dialect cannot send fails startup and
+`netclaw doctor`, and so does a level other than `off` on an Ollama provider
+with `DisableThinking: true`. `doctor --fix` does not change these values. The startup log
+has one `Model client:` line for each client with its limit, level, dialect,
+and capability.
 
 ### Session input compatibility errors
 

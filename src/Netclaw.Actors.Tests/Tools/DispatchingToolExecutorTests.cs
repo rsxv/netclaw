@@ -3,6 +3,7 @@
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
 // -----------------------------------------------------------------------
+using System.Diagnostics;
 using Akka.Actor;
 using Akka.Hosting;
 using Microsoft.Extensions.AI;
@@ -2318,6 +2319,13 @@ public partial class DispatchingToolExecutorTests : IDisposable
     [Fact]
     public async Task One_time_approval_allows_immediate_retry_only()
     {
+        using var setup = Process.Start(new ProcessStartInfo("git")
+        {
+            ArgumentList = { "init", "--quiet", BoundSessionDirectory },
+            UseShellExecute = false
+        }) ?? throw new InvalidOperationException("The test could not start git.");
+        await setup.WaitForExitAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(0, setup.ExitCode);
         var (registry, policy) = CreateApprovalGatedShellRegistryAndPolicy(ShellEnvironment);
 
         var system = ActorSystem.Create($"tool-approval-{Guid.NewGuid():N}");
@@ -2352,10 +2360,8 @@ public partial class DispatchingToolExecutorTests : IDisposable
 
             context.Approval.SeedOneTimeConsent(new OneTimeConsent(toolCall.Name, OneTimeApprovalKeys.Create(firstAttempt.ApprovalContext)));
 
-            // The one-time-approval bypass should let the call succeed.
-            // Output text varies by test environment (git status); meaningful
-            // assertion is that no ToolApprovalRequiredException is thrown.
-            _ = await executor.ExecuteAsync(toolCall, context, TestContext.Current.CancellationToken);
+            var result = await executor.ExecuteAsync(toolCall, context, TestContext.Current.CancellationToken);
+            Assert.Contains("Exit code: 0", result, StringComparison.Ordinal);
             Assert.Equal(ToolInvocationOutcomeCategory.Success, context.Receipt?.Category);
 
             context.Approval.ClearOneTimeConsent();
@@ -2367,6 +2373,176 @@ public partial class DispatchingToolExecutorTests : IDisposable
         {
             await system.Terminate();
         }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Exception_logs_preserve_approval_and_failure_outcomes(bool approvalRequired)
+    {
+        var logger = new RecordingLogger<DispatchingToolExecutor>();
+        var context = CreateInteractivePersonalContext(
+            approvalRequired ? "signalr/approval-log" : "signalr/failure-log");
+        Exception? expectedException = null;
+        if (approvalRequired)
+        {
+            var approvalService = new FixedShellApprovalService(request =>
+                ShellApprovalMatchResult.Create(
+                    request.Candidates,
+                    null,
+                    request.Candidates.Select(candidate =>
+                        ShellGrantCandidateResult.Uncovered(candidate)).ToArray()));
+            var executor = CreateApprovalGatedShellExecutor(approvalService, logger);
+            var toolCall = CreateToolCall(
+                "call-approval-log",
+                "shell_execute",
+                ToolInput.Create("Command", "git status"));
+
+            await Assert.ThrowsAsync<ToolApprovalRequiredException>(() =>
+                executor.ExecuteAsync(toolCall, context, TestContext.Current.CancellationToken));
+
+            Assert.Null(context.Receipt);
+        }
+        else
+        {
+            expectedException = new InvalidOperationException("The tool failed.");
+            var registry = new ToolRegistry();
+            registry.Register(new ThrowingTestTool(expectedException));
+            var config = new ToolConfig();
+            var executor = new DispatchingToolExecutor(
+                registry,
+                new ToolAccessPolicy(new NetclawPaths(), config,
+                    new EffectivePolicyDefaults(DeploymentPosture.Personal, TrustAudience.Personal,
+                        ShellExecutionMode.HostAllowed, UsedStrictFallback: false),
+                    new ShellCommandPolicy(), new ToolPathPolicy([])),
+                logger: logger);
+            var toolCall = CreateToolCall("call-failure-log", "failure_probe", ToolInput.Empty());
+
+            var propagated = await Assert.ThrowsAnyAsync<InvalidOperationException>(() =>
+                executor.ExecuteAsync(toolCall, context, TestContext.Current.CancellationToken));
+
+            Assert.Same(expectedException, propagated);
+            Assert.IsType<ToolInvocationReceipt.OtherOutcome>(context.Receipt);
+        }
+
+        var attemptId = context.Approval.AuthorizationAttemptId.Value;
+        if (approvalRequired)
+        {
+            var authorizationLog = Assert.Single(logger.LogRecords, entry =>
+                Equals(entry.Properties.GetValueOrDefault("AuthorizationAttemptId"), attemptId)
+                && Equals(entry.Properties.GetValueOrDefault("AuthorizationOutcome"),
+                    nameof(ToolAuthorizationOutcome.RequiresApproval)));
+            Assert.Equal(LogLevel.Information, authorizationLog.Level);
+            Assert.Null(authorizationLog.Exception);
+            Assert.DoesNotContain(logger.LogRecords, entry =>
+                entry.Level == LogLevel.Error
+                && Equals(entry.Properties.GetValueOrDefault("AuthorizationAttemptId"), attemptId));
+        }
+        else
+        {
+            var executionLog = Assert.Single(logger.LogRecords, entry =>
+                Equals(entry.Properties.GetValueOrDefault("AuthorizationAttemptId"), attemptId)
+                && !entry.Properties.ContainsKey("AuthorizationOutcome"));
+            Assert.Equal(LogLevel.Error, executionLog.Level);
+            Assert.Same(expectedException, executionLog.Exception);
+            Assert.Equal(attemptId, executionLog.Properties["AuthorizationAttemptId"]);
+        }
+    }
+
+    [Theory]
+    [InlineData("# approved prefix\ngit status", "# changed prefix\ngit status")]
+    [InlineData("git status # source-A", "git status # source-a")]
+    [MemberData(nameof(HostGrammarContinuationCases))]
+    public async Task One_time_shell_approval_does_not_cover_changed_source_with_same_candidates(
+        string approvedSource,
+        string changedSource)
+    {
+        var (registry, policy) = CreateApprovalGatedShellRegistryAndPolicy(ShellEnvironment);
+        var executor = new DispatchingToolExecutor(registry, policy);
+        var approvedCall = CreateToolCall(
+            "call-source-approved",
+            "shell_execute",
+            ToolInput.Create("Command", approvedSource));
+        var changedCall = CreateToolCall(
+            "call-source-changed",
+            "shell_execute",
+            ToolInput.Create("Command", changedSource));
+        var approvedContext = CreateInteractivePersonalExecutionContext("signalr/source-approved");
+        var changedContext = CreateInteractivePersonalExecutionContext("signalr/source-changed");
+
+        var approvedDecision = await executor.EvaluateAuthorizationAsync(
+            approvedCall,
+            approvedContext,
+            TestContext.Current.CancellationToken);
+        var changedDecision = await executor.EvaluateAuthorizationAsync(
+            changedCall,
+            changedContext,
+            TestContext.Current.CancellationToken);
+
+        Assert.True(
+            approvedDecision.Outcome == ToolAuthorizationOutcome.RequiresApproval,
+            $"The approved source did not request consent: {approvedDecision.DenyReason}");
+        Assert.True(
+            changedDecision.Outcome == ToolAuthorizationOutcome.RequiresApproval,
+            $"The changed source did not request consent: {changedDecision.DenyReason}");
+        var approved = Assert.IsType<ToolApprovalContext>(approvedDecision.ApprovalContext);
+        var changed = Assert.IsType<ToolApprovalContext>(changedDecision.ApprovalContext);
+        Assert.Equal(approved.Candidates!.Count, changed.Candidates!.Count);
+        Assert.All(approved.Candidates.Zip(changed.Candidates), pair =>
+            Assert.True(pair.Item1.HasSameApprovalFacts(pair.Item2)));
+
+        approvedContext.Approval.SeedOneTimeConsent(
+            new OneTimeConsent(approvedCall.Name, OneTimeApprovalKeys.Create(approved)));
+
+        var retry = await executor.EvaluateAuthorizationAsync(
+            changedCall,
+            approvedContext,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(ToolAuthorizationOutcome.RequiresApproval, retry.Outcome);
+    }
+
+    public static TheoryData<string, string> HostGrammarContinuationCases =>
+        TestShellEnvironment.Current.Grammar == ShellGrammar.PowerShell
+            ? new TheoryData<string, string>
+            {
+                { "git status `\n", "git status" }
+            }
+            : new TheoryData<string, string>
+            {
+                { "git status \\\n", "git status" }
+            };
+
+    [Theory]
+    [InlineData("cat /protected/secret.txt", nameof(ToolAuthorizationOutcome.Denied), LogLevel.Warning,
+        nameof(ToolAccessDeniedException))]
+    [InlineData("file_read --path notes.txt", nameof(ToolAuthorizationOutcome.RequiresAgentCorrection), LogLevel.Information,
+        nameof(ToolCorrectionRequiredException))]
+    public async Task Expected_authorization_outcome_logs_one_line_and_no_error(
+        string command,
+        string outcome,
+        LogLevel expectedLevel,
+        string expectedExceptionType)
+    {
+        var logger = new RecordingLogger<DispatchingToolExecutor>();
+        var executor = CreateApprovalGatedShellExecutor(deniedPaths: ["/protected"], logger: logger);
+        var context = CreateInteractivePersonalContext("signalr/expected-outcome-log");
+        var toolCall = CreateToolCall("call-expected-outcome-log", "shell_execute", ToolInput.Create("Command", command));
+
+        var thrown = await Assert.ThrowsAnyAsync<InvalidOperationException>(() =>
+            executor.ExecuteAsync(toolCall, context, TestContext.Current.CancellationToken));
+
+        Assert.Equal(expectedExceptionType, thrown.GetType().Name);
+        var outcomeLog = Assert.Single(logger.LogRecords, entry =>
+            Equals(entry.Properties.GetValueOrDefault("AuthorizationOutcome"), outcome));
+        Assert.Equal(expectedLevel, outcomeLog.Level);
+        if (thrown is ToolAccessDeniedException denied)
+        {
+            Assert.Equal("shell_references_protected_path", denied.DenyReason);
+            Assert.Equal("shell_references_protected_path", outcomeLog.Properties["AuthorizationReason"]);
+        }
+
+        Assert.DoesNotContain(logger.LogRecords, entry => entry.Level >= LogLevel.Error);
     }
 
     [Fact]
@@ -2456,14 +2632,17 @@ public partial class DispatchingToolExecutorTests : IDisposable
     }
 
     [Fact]
-    public async Task One_time_approval_bypasses_policy_for_path_aware_file_patterns()
+    public async Task File_write_prompt_shows_the_path_and_one_time_approval_allows_the_retry()
     {
-        var controlPlaneRoot = Path.Combine(
-            AppContext.BaseDirectory,
-            $"netclaw-control-plane-{Guid.NewGuid():N}");
-        var targetPath = Path.Combine(controlPlaneRoot, "netclaw.json");
-        var secondPath = Path.Combine(controlPlaneRoot, "devices.json");
-        Directory.CreateDirectory(controlPlaneRoot);
+        // The root must not sit under a platform temp root. A file_write under a temp
+        // root gets managed temp-directory advice, which takes precedence over the
+        // approval prompt. The test binaries may run from /tmp, so the root uses the
+        // user profile, as other approval tests do.
+        var root = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            $".netclaw-file-approval-{Guid.NewGuid():N}");
+        var targetPath = Path.Combine(root, "notes.txt");
+        Directory.CreateDirectory(root);
 
         try
         {
@@ -2472,7 +2651,7 @@ public partial class DispatchingToolExecutorTests : IDisposable
             {
                 ToolOverrides = new Dictionary<string, ToolApprovalMode>(StringComparer.Ordinal)
                 {
-                    ["shell_execute"] = ToolApprovalMode.Approval
+                    ["file_write"] = ToolApprovalMode.Approval
                 }
             };
 
@@ -2490,10 +2669,10 @@ public partial class DispatchingToolExecutorTests : IDisposable
                         UsedStrictFallback: false),
                     new ShellCommandPolicy(),
                     new ToolPathPolicy([]),
-                    fileApprovalMatcher: new FilePathApprovalMatcher(controlPlaneRoot)));
+                    fileApprovalMatcher: new FilePathApprovalMatcher()));
 
             var toolCall = CreateToolCall(
-                "call-file-approve-once-bypass",
+                "call-file-approve-once",
                 "file_write",
                 ToolInput.Create("Path", targetPath, "Content", "approved once"));
 
@@ -2508,19 +2687,16 @@ public partial class DispatchingToolExecutorTests : IDisposable
             var firstAttempt = await Assert.ThrowsAsync<ToolApprovalRequiredException>(() =>
                 executor.ExecuteAsync(toolCall, context, TestContext.Current.CancellationToken));
 
+            // The prompt names the path. The saved grant is the tool name alone, so it does not
+            // pin the path of the call that was approved.
+            Assert.Equal($"file_write: {targetPath}", firstAttempt.ApprovalContext.DisplayText);
+            Assert.Equal(["file_write"], firstAttempt.ApprovalContext.Patterns);
+
             context.Approval.SeedOneTimeConsent(new OneTimeConsent(toolCall.Name, OneTimeApprovalKeys.Create(firstAttempt.ApprovalContext)));
 
             var retryResult = await executor.ExecuteAsync(toolCall, context, TestContext.Current.CancellationToken);
             Assert.Contains("Successfully wrote", retryResult, StringComparison.Ordinal);
             Assert.True(File.Exists(targetPath));
-
-            var secondCall = CreateToolCall(
-                "call-file-approve-once-bypass-second",
-                "file_write",
-                ToolInput.Create("Path", secondPath, "Content", "different path"));
-
-            await Assert.ThrowsAsync<ToolApprovalRequiredException>(() =>
-                executor.ExecuteAsync(secondCall, context, TestContext.Current.CancellationToken));
 
             context.Approval.ClearOneTimeConsent();
 
@@ -2529,8 +2705,8 @@ public partial class DispatchingToolExecutorTests : IDisposable
         }
         finally
         {
-            if (Directory.Exists(controlPlaneRoot))
-                Directory.Delete(controlPlaneRoot, recursive: true);
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
         }
     }
 
@@ -2566,7 +2742,7 @@ public partial class DispatchingToolExecutorTests : IDisposable
                 UsedStrictFallback: false),
             commandPolicy,
             protectedPaths,
-            fileApprovalMatcher: new FilePathApprovalMatcher(paths.ConfigDirectory));
+            fileApprovalMatcher: new FilePathApprovalMatcher());
         var registry = new ToolRegistry();
         registry.WithFirstPartyTools(policy);
         var executor = new DispatchingToolExecutor(registry, policy, new UnexpectedApprovalService());
@@ -2917,10 +3093,9 @@ public partial class DispatchingToolExecutorTests : IDisposable
             // carry the canonical name, not the sanitized alias.
             Assert.Equal(canonicalName, firstAttempt.ApprovalContext.ToolName);
 
-            // Simulate LlmSessionActor.PersistApprovalCandidatesAsync on an
-            // ApprovedSession click: the grant is recorded under the
-            // canonical name (pending.ToolName), with the canonical
-            // candidate verb extracted by DefaultApprovalMatcher.
+            // SessionToolWorkflow.CreateApprovalGrants selects canonical
+            // candidates. The actor writes those grants under the canonical
+            // tool name after an ApprovedSession response.
             await approvalService.RecordApprovalCandidatesAsync(
                 (ToolApprovalSessionId)"slack/D0/1779",
                 TrustAudience.Personal,
@@ -3126,9 +3301,10 @@ public partial class DispatchingToolExecutorTests : IDisposable
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task Approved_shell_without_command_reaches_argument_error(bool includeNullCommand)
+    public async Task Shell_once_without_command_does_not_bypass_authorization(bool includeNullCommand)
     {
-        var executor = CreateApprovalGatedShellExecutor();
+        var (registry, policy) = CreateApprovalGatedShellRegistryAndPolicy(ShellEnvironment);
+        var executor = new DispatchingToolExecutor(registry, policy);
         var arguments = includeNullCommand
             ? ToolInput.Create("Command", null, "_rationale", "Probe argument error handling.")
             : ToolInput.Create("_rationale", "Probe argument error handling.");
@@ -3140,15 +3316,15 @@ public partial class DispatchingToolExecutorTests : IDisposable
 
         var firstAttempt = await Assert.ThrowsAsync<ToolApprovalRequiredException>(() =>
             executor.ExecuteAsync(call, context, TestContext.Current.CancellationToken));
+        Assert.Null(firstAttempt.ApprovalContext.ShellSourceKey);
         context.Approval.SeedOneTimeConsent(
             OneTimeApprovalKeys.CreateConsent(call.Name, firstAttempt.ApprovalContext));
 
-        var result = await executor.ExecuteAsync(
+        var retry = await Assert.ThrowsAsync<ToolApprovalRequiredException>(() => executor.ExecuteAsync(
             call,
             context,
-            TestContext.Current.CancellationToken);
-
-        Assert.Equal(MissingShellCommandError, result);
+            TestContext.Current.CancellationToken));
+        Assert.Null(retry.ApprovalContext.ShellSourceKey);
     }
 
     [Fact]
@@ -4227,6 +4403,7 @@ public partial class DispatchingToolExecutorTests : IDisposable
     private sealed class RecordingLogger<T> : ILogger<T>
     {
         public List<IReadOnlyDictionary<string, object?>> Entries { get; } = [];
+        public List<LogRecord> LogRecords { get; } = [];
 
         public IDisposable BeginScope<TState>(TState state) where TState : notnull
             => EmptyScope.Instance;
@@ -4243,11 +4420,18 @@ public partial class DispatchingToolExecutorTests : IDisposable
             if (state is not IEnumerable<KeyValuePair<string, object?>> properties)
                 return;
 
-            Entries.Add(properties.ToDictionary(
+            var captured = properties.ToDictionary(
                 property => property.Key,
                 property => property.Value,
-                StringComparer.Ordinal));
+                StringComparer.Ordinal);
+            Entries.Add(captured);
+            LogRecords.Add(new LogRecord(logLevel, exception, captured));
         }
+
+        public sealed record LogRecord(
+            LogLevel Level,
+            Exception? Exception,
+            IReadOnlyDictionary<string, object?> Properties);
 
         private sealed class EmptyScope : IDisposable
         {
@@ -4257,6 +4441,21 @@ public partial class DispatchingToolExecutorTests : IDisposable
             {
             }
         }
+    }
+
+    private sealed class ThrowingTestTool(Exception exception) : INetclawTool
+    {
+        public string Name => "failure_probe";
+        public LlmFacingToolName LlmFacingName => LlmFacingToolName.FromCanonical(Name);
+        public string Description => "A test tool that throws.";
+        public string GrantCategory => "test";
+        public System.Text.Json.JsonElement ParameterSchema => default;
+        public AITool ToAITool() => AIFunctionFactory.Create(() => "unused", Name);
+        public Task<string> ExecuteAsync(
+            IDictionary<string, object?>? arguments,
+            ToolInvocationContext context,
+            CancellationToken ct = default)
+            => Task.FromException<string>(exception);
     }
 
     private sealed class StubRequiredActor : IRequiredActor<ToolApprovalActorKey>

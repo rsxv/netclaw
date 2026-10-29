@@ -19,10 +19,16 @@ public sealed class SystemdUserServiceTests : IDisposable
 
     // environ == null means the process environment is unreadable. Never reads the real /proc.
     private SystemdUserService ServiceFor(FakeSystemCommandRunner runner, string homePath, string? environ = null)
-        => new(WriteUnit(), runner, enabledOnThisPlatform: true, homePath: homePath, environReader: _ => environ);
+        => new(homePath, WriteUnit(), runner, enabledOnThisPlatform: true, environReader: _ => environ);
 
+    // A process with no NETCLAW_HOME serves $HOME/.netclaw, with the HOME of its own environment. The default
+    // home of the test process is the one that the process names here.
     private static string Environ(string? netclawHome) =>
-        "PATH=/usr/bin\0" + (netclawHome is null ? string.Empty : $"NETCLAW_HOME={netclawHome}\0") + "LANG=C\0";
+        "PATH=/usr/bin\0"
+        + (netclawHome is null
+            ? $"HOME={Path.GetDirectoryName(SystemdUserService.DefaultHomePath)}\0"
+            : $"NETCLAW_HOME={netclawHome}\0")
+        + "LANG=C\0";
 
     private string ScratchHome => Path.Combine(_dir.Path, "scratch-home");
 
@@ -45,7 +51,7 @@ public sealed class SystemdUserServiceTests : IDisposable
     {
         var runner = new FakeSystemCommandRunner();
         var service = new SystemdUserService(
-            Path.Combine(_dir.Path, "missing.service"), runner, enabledOnThisPlatform: true, homePath: DefaultHome);
+            DefaultHome, Path.Combine(_dir.Path, "missing.service"), runner, enabledOnThisPlatform: true);
 
         AssertKind(SystemdUserServiceOwnershipKind.Unmanaged, await service.GetStopOwnershipAsync(NotRunning));
         Assert.Empty(runner.Commands);
@@ -98,6 +104,22 @@ public sealed class SystemdUserServiceTests : IDisposable
 
         AssertKind(SystemdUserServiceOwnershipKind.Managed,
             await ServiceFor(runner, DefaultHome, Environ(null)).GetStopOwnershipAsync(RunningAs(4242)));
+    }
+
+    [Theory]
+    [InlineData("HOME=/home/another-user")]
+    [InlineData("")]
+    public async Task Stop_ReturnsUnmanaged_WhenTheProcessHasNoNetclawHomeAndItsOwnHomeFolderIsNotThisDefaultHome(string homeEntry)
+    {
+        // B1: the HOME of the process decides, not the HOME of the CLI. With no HOME at all there is no proof,
+        // and the PID match is not a fallback because the environment could be read.
+        var runner = new FakeSystemCommandRunner();
+        runner.Enqueue(State("active"));
+        runner.Enqueue(MainPid("4242"));
+        var environ = "PATH=/usr/bin\0" + (homeEntry.Length == 0 ? string.Empty : homeEntry + "\0");
+
+        AssertKind(SystemdUserServiceOwnershipKind.Unmanaged,
+            await ServiceFor(runner, DefaultHome, environ).GetStopOwnershipAsync(RunningAs(4242)));
     }
 
     [Fact]
@@ -358,7 +380,7 @@ public sealed class SystemdUserServiceTests : IDisposable
         var runner = new FakeSystemCommandRunner();
         runner.Enqueue(new SystemCommandResult(0, string.Empty));
         runner.Enqueue(new SystemCommandResult(0, string.Empty));
-        var service = new SystemdUserService(unitPath, runner, enabledOnThisPlatform: true, homePath: SystemdUserService.DefaultHomePath);
+        var service = new SystemdUserService(SystemdUserService.DefaultHomePath, unitPath, runner, enabledOnThisPlatform: true);
 
         var stop = await service.StopAsync();
         var start = await service.StartAsync();

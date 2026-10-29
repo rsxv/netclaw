@@ -753,6 +753,28 @@ public class SetReminderToolTests : TestKit
     }
 
     [Fact]
+    public async Task Rejects_channel_delivery_with_blank_address_with_the_tool_error()
+    {
+        var probe = CreateTestProbe();
+        var tool = new SetReminderTool(probe, _timeProvider, new SchedulingConfig(), []);
+
+        var result = await tool.ExecuteAsync(new Dictionary<string, object?>
+        {
+            ["Id"] = "blank-address",
+            ["Name"] = "blank-address",
+            ["Prompt"] = "Post status",
+            ["ScheduleType"] = "once",
+            ["Schedule"] = "30m",
+            ["DeliveryKind"] = "channel",
+            ["DeliveryTransport"] = "slack",
+            ["DeliveryAddress"] = ""
+        }, TestToolExecutionContext.CreateUnbound(), TestContext.Current.CancellationToken);
+
+        Assert.StartsWith("Error: delivery_address is required for channel delivery", result);
+        await probe.ExpectNoMsgAsync(TimeSpan.FromMilliseconds(100), TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
     public async Task Rejects_invalid_report_to_channel_when_resolver_fails()
     {
         var probe = CreateTestProbe();
@@ -1138,6 +1160,34 @@ public class SetReminderToolTests : TestKit
 
         Assert.Contains("Cannot parse expires_in", result);
         await probe.ExpectNoMsgAsync(TimeSpan.FromMilliseconds(100), TestContext.Current.CancellationToken);
+    }
+
+    [Theory]
+    [InlineData("once", "30m", true)]
+    [InlineData("interval", "2h", false)]
+    public async Task Reply_tells_a_oneshot_that_it_deletes_itself_and_a_recurring_reminder_nothing_of_the_sort(
+        string scheduleType, string schedule, bool oneShot)
+    {
+        var probe = CreateTestProbe();
+        var tool = new SetReminderTool(probe, _timeProvider, new SchedulingConfig());
+
+        var execution = tool.ExecuteAsync(new Dictionary<string, object?>
+        {
+            ["Id"] = "reply-text",
+            ["Name"] = "reply-text",
+            ["Prompt"] = "Check the server",
+            ["ScheduleType"] = scheduleType,
+            ["Schedule"] = schedule,
+            ["DeliveryKind"] = "none"
+        }, TestToolExecutionContext.CreateUnbound(), TestContext.Current.CancellationToken);
+        var cmd = await probe.ExpectMsgAsync<SaveReminderCommand>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        probe.Reply(new ReminderSavedResponse(
+            cmd.Definition.Id, cmd.Definition.Title, Success: true, NextFire: _timeProvider.GetUtcNow().AddMinutes(30)));
+        var result = await execution;
+
+        const string Promise = "The reminder deletes itself after it runs or after you cancel it.";
+        Assert.Equal(oneShot, result.Contains(Promise, StringComparison.Ordinal));
     }
 
 }

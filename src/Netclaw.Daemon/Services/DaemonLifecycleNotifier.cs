@@ -12,7 +12,7 @@ namespace Netclaw.Daemon.Services;
 
 /// <summary>
 /// Fires operational webhook notifications for daemon lifecycle events (start/stop).
-/// Called directly by the shutdown endpoint, <see cref="ConfigWatcherService"/>, and
+/// Called directly by the shutdown endpoint, <see cref="DaemonRestartCoordinator"/>, and
 /// the <see cref="Microsoft.Extensions.Hosting.IHostApplicationLifetime.ApplicationStarted"/> hook.
 /// </summary>
 public sealed class DaemonLifecycleNotifier
@@ -65,7 +65,7 @@ public sealed class DaemonLifecycleNotifier
         // (ShutdownDaemonRequest in LifecycleEndpointRouteBuilderExtensions), so a
         // caller can inject CR/LF into log lines. Sanitize before logging or
         // propagating into the alert context. (cs/log-forging)
-        var safeReason = SanitizeReason(reason);
+        var safeReason = SanitizeForLog(reason);
         _logger.LogInformation("Netclaw daemon stopping (PID {Pid}, reason: {Reason})", pid, safeReason);
 
         var context = new Dictionary<string, string>
@@ -108,7 +108,7 @@ public sealed class DaemonLifecycleNotifier
         // Today every caller passes a code-side constant for `reason`, but
         // sanitizing here keeps the contract symmetric with NotifyShutdown and
         // forecloses on future callers that might forward HTTP input.
-        var safeReason = SanitizeReason(reason);
+        var safeReason = SanitizeForLog(reason);
 
         _logger.LogCritical(
             exception,
@@ -170,7 +170,7 @@ public sealed class DaemonLifecycleNotifier
     private static bool IsLogLineBreak(char c)
         => char.IsControl(c) || c is '\u2028' or '\u2029';
 
-    private static string SanitizeReason(string reason)
+    internal static string SanitizeForLog(string reason)
     {
         if (string.IsNullOrEmpty(reason))
             return string.Empty;

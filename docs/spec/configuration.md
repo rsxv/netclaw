@@ -99,7 +99,69 @@ keys used by model references.
 | `Type` | string | `"ollama"` | Provider SDK to use. Supported: `ollama`, `openai-compatible`, `openrouter`, `openai`, `anthropic`, `github-copilot`, `veniceai`. |
 | `Endpoint` | string | `"http://localhost:11434"` | Base URL for the provider API. |
 | `ApiKey` | string? | `null` | API key. Should go in `secrets.json` or an environment variable. |
+| `OAuthTokenExpiry` | string? | `null` | Written by Netclaw to `secrets.json`, beside the OAuth tokens. It is the one `secrets.json` value that Netclaw does not encrypt, because the configuration binder cannot read an encrypted date. A key in `netclaw.json` is retired. See [OAuth token expiry](#oauth-token-expiry). |
 | `VendorOptions` | object? | `null` | Provider-owned non-secret options. For `github-copilot`, `GitHubHost` and `GitHubApiBase` select the GitHub Enterprise host used for OAuth and Copilot token exchange; the Copilot API base remains `Endpoint`. |
+
+### OAuth token expiry
+
+Netclaw keeps the OAuth access token, the refresh token, the ChatGPT account ID, and the token
+expiry of a provider in `secrets.json`. One refresh writes all of them in one save. A refresh does
+not write `netclaw.json`, so it does not restart the daemon.
+
+```json
+{ "Providers": { "my-codex": { "OAuthAccessToken": "ENC:...", "OAuthTokenExpiry": "2026-06-01T01:00:00.0000000+00:00" } } }
+```
+
+- `secrets.json` encrypts every string value except `Providers.<name>.OAuthTokenExpiry`. The path
+  has exactly three segments, and the names match without regard to case. The daemon reads the
+  expiry as a date through the configuration binder, and the binder cannot read ciphertext. The
+  expiry is refresh timing and not a credential. A value in another place is encrypted, even with
+  the same key name.
+- A refresh without an expiry writes a JSON `null`. The `null` hides a retired `netclaw.json` key.
+- `netclaw secrets set Providers.<name>.OAuthTokenExpiry <date>` stores the date unencrypted. It
+  rejects a value that is not an ISO 8601 date and changes nothing.
+- A value that is not a date stops the daemon at startup with a message that names the provider.
+  `netclaw provider` and the refresh service reject it too.
+- An encrypted `OAuthTokenExpiry` in `secrets.json` comes from an older build. The daemon stops at
+  startup with a message that names `Providers:<name>`. Sign in again with `netclaw provider`. The
+  sign-in saves the date unencrypted.
+- Caution: before you run an older release, delete each `Providers.<name>.OAuthTokenExpiry` from
+  `secrets.json`. That value is plaintext, and an older daemon cannot read it. An older build
+  encrypts the leaf again on its next save or `secrets set`, and its binder then fails on the
+  encrypted date.
+
+The refresh service reads `secrets.json` before it spends a refresh token. A refresh that the CLI
+does (`netclaw provider` probes each provider) reaches a running daemon through that file.
+
+- The daemon takes the stored refresh token only when it differs from the last token that the
+  daemon read from or wrote to `secrets.json`. After a failed save, `secrets.json` holds a spent
+  token, so the daemon keeps the live token in memory and never presents the spent one.
+- The daemon remembers each refresh token that it exchanged for another one. When an older copy of
+  `secrets.json` brings such a token back, the daemon keeps its in-memory tokens and logs a warning.
+- A server that sends no new refresh token keeps the old one valid. The daemon writes the live
+  refresh token again, so the file never keeps a spent one.
+- When a save fails after a good refresh, the daemon logs an Error that names `secrets.json`. The
+  file can hold a spent refresh token until the next good save.
+
+The CLI and the daemon share no lock. A refresh at the same moment can present a token that the
+other process just spent.
+
+Older releases wrote `Providers.<name>.OAuthTokenExpiry` to `netclaw.json`. That key is retired.
+
+- The daemon still binds the key. A value in `secrets.json`, a JSON `null` included, takes
+  precedence. After the first token refresh the `secrets.json` value wins.
+- The daemon logs a startup warning for each retired key that holds a value.
+- `netclaw doctor` reports each retired key as information. The report does not change the exit
+  code.
+- `netclaw doctor --fix` copies `netclaw.json` to `netclaw.json.retired-oauth-expiry.bak`, or to the
+  next free `netclaw.json.retired-oauth-expiry.N.bak`. Then it copies each date to an existing
+  `secrets.json` provider entry that has no expiry, and it removes the key from `netclaw.json`. It
+  does not create a provider entry, and it keeps a key whose value is not a date. It writes
+  `secrets.json` first, so a crash between the two writes leaves both values, and the `secrets.json`
+  value wins. It makes no `secrets.json` backup, because the backup of `netclaw.json` holds the date.
+- When `netclaw.json` has comments, `doctor --fix` changes nothing, because the CLI would drop the
+  comments. The report and the startup warning stay. Remove the key by hand. The daemon works
+  meanwhile, because the `secrets.json` value wins after the first refresh.
 
 ### Models
 
@@ -152,6 +214,13 @@ runtime detection for an affected definition.
 | `ContextWindow` | int? | `null` | Operator override for the runtime context window. When set, it clamps the detected provider value. If not set, Netclaw uses the provider-reported value when available, otherwise defaults to 32,768. Model selection does not persist a discovered value here. |
 | `InputModalities` | string? | `null` | Manual override for input modalities. Comma-separated flags from `Text`, `Image`, `Audio`, `Video` — e.g. `"Text"` or `"Text, Image"`. When set, bypasses automated capability detection. |
 | `OutputModalities` | string? | `null` | Manual override for output modalities. Same form as `InputModalities`. |
+| `MaxOutputTokens` | int? | `null` | Output limit for every call of this model, unless the call site sets its own. Must be positive, and below `ContextWindow` when that is set. Thinking tokens count inside it. If not set, each call sends 32,000, capped to the known model maximum and clamped to the known context window minus the estimated prompt and tool schemas (margin: 5% of the window, at least 1,024; floor: 1,024). A self-hosted provider counts only a window from `ContextWindow` or from the endpoint's own probe, ignores a catalog model maximum, and sends no limit field when the window is unknown. A self-hosted server must use the `ollama` or `openai-compatible` type; a hosted type (`deepseek`, `openrouter`, `veniceai`) pointed at your own server is treated as hosted. Set with `netclaw model set ... --max-output-tokens <n>`. |
+| `Thinking` | string? | `null` | Provider-neutral thinking level: `Off`, `Low`, `Medium`, `High`, or `Max` (the highest level that the provider offers). If not set, the model's default applies. Netclaw rejects a level that the provider dialect or the model does not offer. Set with `netclaw model set ... --thinking <level>`. |
+
+An `openai-compatible` provider needs `Providers:<name>:VendorOptions:ThinkingDialect` before it
+can send a thinking level: `ChatTemplateKwargs`, `ReasoningEffort`, `DeepSeek`, or `None`.
+`netclaw model set` saves `ReasoningEffort` when it detects llama.cpp. For another server, edit
+the key in `netclaw.json`. Without the key, only `MaxOutputTokens` works.
 
 **Invalid Models configuration.** One check, `ModelConfigurationValidation.Check`, validates the
 Models section. The daemon runs it at startup. The config watcher runs it before it restarts the
@@ -163,6 +232,10 @@ daemon. It rejects these cases:
 - a role that names an unknown definition
 - a definition with a value that cannot be read (for example `InputModalities: "banana"`)
 - a role-bound `ContextWindow` below 4,096
+- a role-bound `MaxOutputTokens` that is not positive, or that is not below its `ContextWindow`
+- a role-bound `Thinking` level that the provider's thinking dialect cannot send, an invalid
+  `VendorOptions:ThinkingDialect` value, or a level other than `Off` on an `ollama` provider with
+  `VendorOptions:DisableThinking: true`. `netclaw doctor --fix` does not change these values.
 - a Fallback or Compaction model whose provider is not configured
 - a provider that a role uses and that cannot be built: an unknown `Type`, a missing credential for
   `openai` or `anthropic`, an `openai-compatible` provider without `Endpoint`, or a `Providers` entry
@@ -204,8 +277,8 @@ Tuning parameters for LLM session behavior.
 | `CompactionThreshold` | double | `0.75` | Context usage ratio (0.0–1.0) at which compaction triggers. |
 | `SnapshotInterval` | int | `20` | Number of turns between persistence snapshots. |
 | `KeepRecentToolResults` | int | `3` | Recent tool call/result pairs kept in full during compaction. |
-| `MaxToolIterationsPerTurn` | int | `60` | Max LLM-to-tools-to-LLM iterations per turn. One LLM response with any number of parallel tool calls counts as exactly one iteration. At ~75% a budget nudge is injected; at 100% tools are stripped and the model is asked to summarize. |
-| `SidecarLlmTimeoutSeconds` | int | `90` | Timeout for sidecar LLM calls (title generation, observer summaries, memory extraction). |
+| `MaxToolIterationsPerTurn` | int | `60` | Legacy compatibility field. The default remains `60`, and old values stay readable. The runtime does not enforce this limit; tool loops follow recurrence governance. |
+| `SidecarLlmTimeoutSeconds` | int | `90` | Timeout for sidecar LLM calls (title generation and compaction observations). |
 | `TurnLlmTimeoutSeconds` | int | `180` | Timeout for the primary per-turn LLM streaming call before forcing an error/recovery path. |
 | `ToolExecutionTimeoutSeconds` | int | `90` | Per-tool-call inactivity budget. A tool must produce its first result or stream item within this time, and each later item resets the budget. |
 
@@ -436,8 +509,11 @@ Slack Socket Mode channel configuration.
 
 Unified daemon logging settings used by both Microsoft.Extensions.Logging and
 Akka.NET logger integration. Daemon-global logs write to
-`~/.netclaw/logs/daemon-{yyyy-MM-dd}.log` (rolled daily, capped at 10 MB
-per file). Session-owned diagnostics and session audit lines are consolidated
+`~/.netclaw/logs/daemon-{yyyy-MM-dd}.log`. At 10 MiB, the writer starts
+`daemon-{yyyy-MM-dd}.1.log`, then `.2.log`, and subsequent numbered files.
+One complete entry can exceed the threshold. A restart preserves existing entries
+and appends to the first segment below the threshold. The UTC date starts a new series.
+Session-owned diagnostics and session audit lines are consolidated
 into `~/.netclaw/logs/sessions/{sanitized-session-id}/session.log` when they
 execute under a session diagnostics context.
 
@@ -466,6 +542,8 @@ are not size-rotated today (tracked separately).
 | `LogLevel:Default` | string | `Warning` | Minimum log level (`Debug`, `Information`, `Warning`, `Error`, etc.) shared by MEL and Akka.NET. Standard `Logging:LogLevel:{Category}` overrides also apply. |
 | `Console:Enabled` | bool | `false` | Enables console logger provider output for daemon debugging. |
 
+The doctor includes valid numbered daemon segments in its diagnostic date window.
+
 ### Retention
 
 A daemon actor (`DataRetentionActor`) deletes expired data shortly after the daemon starts and then every
@@ -486,7 +564,7 @@ value without a manual restart. Set a value in the `netclaw config` dashboard (D
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `Logs:Days` | int | `14` | Days to keep `daemon-{yyyy-MM-dd}.log` and `crash-*.log` in `~/.netclaw/logs`, judged by the date in the file name. `0` keeps them forever. The newest 3 daemon logs and the newest 3 crash logs are always kept, so a wrong clock cannot delete the whole history. A value that is not an integer falls back to `14` with a startup warning. `logs/sessions/` and other files in the directory are never pruned. Environment form: `NETCLAW_Retention__Logs__Days`. |
+| `Logs:Days` | int | `14` | Days to keep `daemon-{yyyy-MM-dd}.log`, its numbered segments, and `crash-*.log` in `~/.netclaw/logs`, judged by the date in the file name. `0` keeps them forever. The newest 3 daemon logs and the newest 3 crash logs are always kept, so a wrong clock cannot delete the whole history. A value that is not an integer falls back to `14` with a startup warning. `logs/sessions/` and other files in the directory are never pruned. Environment form: `NETCLAW_Retention__Logs__Days`. |
 
 ### Webhooks
 

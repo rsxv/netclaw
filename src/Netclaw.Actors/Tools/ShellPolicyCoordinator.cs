@@ -5,6 +5,7 @@
 // -----------------------------------------------------------------------
 using Microsoft.Extensions.AI;
 using Netclaw.Actors.Authorization.Consent;
+using Netclaw.Actors.Protocol;
 using Netclaw.Configuration;
 using Netclaw.Security;
 using Netclaw.Security.Authorization.Consent;
@@ -295,6 +296,9 @@ internal sealed class ShellPolicyCoordinator(
             // unusable input keeps failing closed.
             if (candidate.Candidate.VerbTokens is not { } tokens)
             {
+                if (candidate.SourceCompoundOwner is not null)
+                    continue;
+
                 // A redirect-only command has no parser verb. It never asks
                 // for a grant, so it needs no command identity.
                 if (candidate.Candidate.RunsNoProgram
@@ -387,6 +391,7 @@ internal sealed class ShellPolicyCoordinator(
         var remaining = evaluation.UncoveredCandidates;
         var approvalContext = evaluation.GetUncoveredApprovalContext(
             ToolAccessPolicy.GetSessionOwnedApprovalDirectories(context));
+        approvalContext = ExplainGrantScope(approvalContext, evaluation);
         var hasExactOneTimeApproval = projection.HasExactOneTimeApproval(
             toolName,
             approvalContext);
@@ -416,6 +421,48 @@ internal sealed class ShellPolicyCoordinator(
             approvalContext,
             approvalMatches,
             SelectCommandWordsCorrection(remaining) ?? corrections);
+    }
+
+    private static ToolApprovalContext ExplainGrantScope(ToolApprovalContext request, ShellPolicyEvaluation evaluation)
+    {
+        var notes = new List<string>();
+        if (request.Options.Any(static option => option.Key != ApprovalOptionKeys.ApproveOnceKey
+                && option.Key != ApprovalOptionKeys.DenyKey)
+            && request.Candidates is { } candidates
+            && candidates.Any(static candidate => candidate.VerbTokens is { Count: > 0 }))
+        {
+            notes.Add("Reusable grants cover the command words shown above within the selected scope.");
+            if (candidates.Any(static candidate => candidate.VerbTokens is [var program]
+                && !ShellVerbPolicyData.HasSingleTokenVerbChain(program)))
+                notes.Add("A one-word program grant covers that program word only. It does not cover subcommands.");
+        }
+
+        foreach (var reason in evaluation.CandidateStates.Where(static state => state.Coverage is null)
+                     .Select(static state => state.GrantEvidence?.NearMiss?.Reason)
+                     .OfType<ShellApprovalNearMissReason>().Distinct().Take(3))
+        {
+            notes.Add(reason switch
+            {
+                ShellApprovalNearMissReason.TokenMismatch => "An existing grant has different command words.",
+                ShellApprovalNearMissReason.AssignmentMismatch => "An existing grant has a different environment assignment qualifier.",
+                ShellApprovalNearMissReason.ShellMismatch => "An existing grant names a different shell.",
+                ShellApprovalNearMissReason.OutsideDirectory => "This call reaches a path outside an existing grant's scope.",
+                ShellApprovalNearMissReason.Symlink => "A link prevents an existing grant from covering this path.",
+                ShellApprovalNearMissReason.MissingDirectory => "Netclaw cannot prove the directory scope of an existing grant.",
+                _ => throw new ArgumentOutOfRangeException(nameof(reason), reason, "Unknown grant mismatch.")
+            });
+        }
+
+        // The full command keeps priority over annotations at the existing channel limit.
+        while (notes.Count > 0)
+        {
+            var display = request.DisplayText + "\n\n" + string.Join("\n", notes);
+            if (display.Length <= ApprovalOptionKeys.MaxCommandTextChars)
+                return request with { DisplayText = display };
+            notes.RemoveAt(notes.Count - 1);
+        }
+
+        return request;
     }
 
     /// <summary>Completes a shell call whose every candidate has coverage.</summary>

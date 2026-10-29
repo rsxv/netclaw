@@ -68,7 +68,7 @@ coordinator. TA-9 states that order.
 | Prompt options | `ToolAccessPolicy.BuildApprovalOptions` | Call-local |
 | Approval note in the tool result | `ConsentAnswerCodec.AppendResultNote` | Call-local |
 | Consent request, answer, and requester check | `SessionToolExecutionPipeline`, `LlmSessionActor`, `ApprovalButtonValueCodec`, `PendingApprovalLookup` | Durable journal; actor-local unanswered state |
-| Subagent consent | `ParentSessionApprovalBridge`, `SubAgentActor` | Actor-local, live-only |
+| Subagent consent | `ParentSessionApprovalBridge`, `SubAgentActor`, `SessionToolWorkflow` | Durable run facts; actor-local live wait |
 | Launch re-verification | `ShellProcessLaunch` | Call-local |
 
 A code PR that moves a decision updates this table and the architecture
@@ -94,6 +94,8 @@ document in the same diff.
 | TA-14 | `DispatchingToolExecutorLaunchTests`, `ShellProcessLaunchTests`, `ShellToolTests`, background evals `queued_grant_revoked` and `queued_grant_valid` |
 | TA-15 | `DispatchingToolExecutorTests` trace cases, `AuthorizationAttemptIdTests`, `ShellPolicyEvidenceFixtureTests`, evals Category 9 |
 | TA-16 | `ApprovalsCommandTests`, `ApprovalsManagerPageTests`, `ToolAudienceProfilesDoctorCheckTests`, `SecurityPolicyDoctorCheckTests` |
+| TA-17 | `DispatchingToolExecutorTests`, `SessionToolWorkflowTests`, `ShellOnceSourceIdentityMutationTests`, `scripts/run-shell-once-identity-mutations.sh` |
+| TA-18 | `ShellNoProgramAuthorizationTests`, `ShellPolicyPathFactsTests`, `ShellProcessLaunchTests`, `NoProgramMutationTests`, `scripts/run-compound-redirect-mutations.sh` |
 
 The outcome direction check (`scripts/check-approval-outcome-direction.py`)
 protects the Result column of the catalog snapshot. The focused mutation gates
@@ -239,17 +241,16 @@ daemon startup with an error that names the invalid entries.
 ### Requirement: TA-4 Consent mode and shell mode resolve per audience and tool
 
 The consent mode of a call SHALL be `Auto`, `Approval`, or `Deny`, resolved in
-this order: a matcher-specific key (for example `file_write:control-plane`),
-`ToolOverrides[tool]` (an MCP `server__tool` alias also matches),
+this order: `ToolOverrides[tool]` (an MCP `server__tool` alias also matches),
 `McpServerDefaults[server]`, the Personal fail-closed rule, then `DefaultMode`.
+Keys SHALL match without regard to case. If two keys differ only by case, the
+more restrictive mode SHALL apply.
 Without an `ApprovalPolicy`, the mode SHALL be `Auto` except where the
 Personal fail-closed rule applies.
 
 - The Personal fail-closed rule SHALL select `Approval` for `shell_execute`
-  unless an exact `shell_execute` override selects a mode. It SHALL apply when
+  unless a `shell_execute` override selects a mode. It SHALL apply when
   `ApprovalPolicy` is absent and when `DefaultMode` is `Auto`.
-- The rule SHALL also select `Approval` for Personal `file_write` and
-  `file_edit` on a Netclaw control-plane path.
 - `Deny` SHALL deny with `tool_denied_by_approval_policy` and SHALL NOT prompt.
 - A shell call that needs an exact tree approval SHALL raise `Auto` to
   `Approval`.
@@ -457,17 +458,19 @@ the link check, then protection.
   parent of the config directory is not denied by this rule. Each other shell program SHALL keep
   `Write` protection for each path, so each write to a config file stays
   denied.
-- Owner decision D5 (option A): a shell glob word that can match a protected
-  shell path, the default credential store (`~/.netclaw/keys`,
+- Owner decision D5: a shell glob word that can match a protected shell
+  path, the default credential store (`~/.netclaw/keys`,
   `~/.netclaw/config/secrets.json`), or a directory that contains one, SHALL
-  get the literal-path denial (`shell_references_protected_path`). The match
-  SHALL be lexical and segment by segment. It SHALL cover dot entries,
-  bracket expressions, and case. Netclaw SHALL NOT list directories or follow
-  links for this check.
-- Accepted D5 gap: a link below the covering directory of a glob that leads
-  to a protected path is not seen by the lexical check. Only a person can make
-  such a link, because an agent call that links to the credential store
-  (`ln -s ~/.netclaw/keys x` or `ln -s ~/.netclaw/k* x`) is denied.
+  get the literal-path denial (`shell_references_protected_path`).
+  The authored pattern SHALL retain its lexical segment check, including dot
+  entries, bracket expressions, and case.
+- Bounded glob alias reach: Netclaw SHALL inspect directory aliases under the
+  TA-7 bounds. The protected-path screen SHALL check each known target and
+  the remaining pattern below that target before reusable approval.
+  A later incomplete branch SHALL NOT remove a known protected target.
+  A protected target SHALL retain its denial when another branch fails,
+  leaves the boundary, or exhausts a bound.
+  This rule SHALL NOT claim protection for arbitrary recursive program behavior.
 - A shell word that reads a proved variable value SHALL get the protected-path
   decision of the literal value.
 - Allow checks SHALL compare paths with ordinal case except on Windows. Deny
@@ -681,6 +684,20 @@ process-local. No state of these checks is durable.
 - **THEN** authorization returns `Denied`, and the shell redirect gets reason `shell_path_protected`
 - **AND** `file_read` on that file is not denied
 
+#### Scenario: A contained alias target remains protected
+
+- **GIVEN** a bounded glob with a matched directory alias inside its covering directory
+- **AND** the target or its remaining pattern reaches a protected path
+- **WHEN** Netclaw evaluates the call with a global grant
+- **THEN** the protected-path screen denies the call before grant coverage
+
+#### Scenario: An incomplete branch cannot erase known protected reach
+
+- **GIVEN** a bounded glob whose first alias reaches a protected path
+- **AND** another branch has a broken link or exceeds the walk bound
+- **WHEN** Netclaw evaluates the call
+- **THEN** the known protected target retains its terminal denial
+
 ### Requirement: TA-7 Shell analysis uses general syntax facts
 
 Netclaw SHALL analyze a shell call with ShellSyntaxTree for the native shell
@@ -715,12 +732,31 @@ have their glossary meaning.
   code, SHALL NOT make the call unresolved. Its scope SHALL be the deepest
   ancestor directory of its text before the first control character. The
   scope SHALL hold no control character, so the prompt can show it.
-- Glob path facts (Bash 5.2 host): the scope of a glob word SHALL be its
-  covering directory. Netclaw SHALL walk the directories that each segment
-  can match, to a bound of 4096 directories, and every match SHALL stay inside
-  the covering directory. A link that leaves the covering directory, or a walk
-  that fails, SHALL keep the candidate exact with `Once` and `Deny` only. A
-  glob with a wildcard in a directory segment (`*/notes.md`) can expand to an
+- Glob path facts (Bash 5.2 host): the scope of a glob word SHALL include
+  its covering directory and every known alias target scope.
+  Netclaw SHALL walk only the directory branches that each segment can match.
+  Reusable reach SHALL require a count of 4096 work units or less.
+  Each intermediate directory visit and each link hop SHALL consume one unit.
+  Ordinary directory-entry scans are outside this count.
+  Every target and residual match SHALL stay inside the original covering boundary.
+  Only a matched intermediate directory alias MAY use that original boundary.
+  The final target of every other link SHALL retain its immediate directory containment rule.
+  A pattern with a trailing slash SHALL retain its directory-only restriction
+  when Netclaw computes known target reach.
+  A contained directory alias SHALL be reusable only after complete target,
+  protected-path, and grant-scope proof.
+  The walk SHALL retain the existing link-hop bound.
+  A cycle, broken link, unknown target, inspection failure, outside target, or
+  exhausted bound SHALL keep reusable scope unresolved.
+  In Personal Approval mode, unresolved reach alone SHALL NOT support reusable approval.
+  Existing hard and protected-path rules SHALL still apply before exact consent.
+  These rules include R13 denial when link resolution fails.
+  If those rules permit consent, the call SHALL retain exact `Once` and `Deny` choices.
+  Explicit Auto consent SHALL retain its existing behavior and SHALL NOT
+  bypass hard or protected-path denials.
+  Incomplete reach SHALL NOT support reusable grants or reviewed-safe coverage.
+  A repeated physical directory SHALL NOT suppress a different remaining pattern.
+  A glob with a wildcard in a directory segment (`*/notes.md`) can expand to an
   option word, so decision D1 SHALL apply to it. A leaf glob (`*.cs`) SHALL
   keep its path rule.
 - Variable values: a word that reads a proved variable value SHALL get the
@@ -1062,6 +1098,46 @@ the command exact, so the call gets the rewrite correction.
 - **AND** the candidates are only the `find` and `grep` commands whose directory is not known
 - **AND** no `echo` command is a candidate
 
+#### Scenario: A contained directory alias supports the existing diagnostic policy
+
+- **GIVEN** the Bash 5.2 host with a proved HOME and existing read authority
+- **AND** `repositories/alias` names `repositories/owner/project` inside the covering directory
+- **AND** every reachable target passes protection and the applicable authority rules
+- **WHEN** Netclaw evaluates `ls -d ~/repositories/*/ ~/repositories/*/*/ 2>/dev/null | head -60`
+- **THEN** the existing reviewed diagnostic policy can permit the complete call
+
+#### Scenario: A leaf alias cannot transfer scope to a sibling directory
+
+- **GIVEN** a Personal Approval-mode folder grant for `touch` covers `<P>`
+- **AND** `<P>/a/alias.txt` links to `<P>/b/item.txt`
+- **WHEN** the user calls `touch '<P>'/*/*.txt`
+- **THEN** the call requires exact consent because the leaf target leaves its immediate directory
+- **AND** the same-directory leaf alias retains its existing grant behavior
+
+#### Scenario: A leaf chain can return within the original covering boundary
+
+- **GIVEN** a Personal Approval-mode folder grant for `touch` covers `<P>`
+- **AND** `<P>/a/alias.txt` links through `<P>/.bridge/hop.txt` to `<P>/a/item.txt`
+- **WHEN** the user calls `touch '<P>'/a*/*.txt`
+- **THEN** the existing grant covers the call because every hop stays inside `<P>`
+- **AND** the final leaf target stays inside its immediate directory `<P>/a`
+
+#### Scenario: A cycle retains the literal failed-resolution denial
+
+- **GIVEN** `<P>/alias` links to itself
+- **WHEN** the user calls `touch '<P>'/a*/*.txt`
+- **THEN** the protected-path screen denies the call with `shell_references_protected_path`
+- **AND** the equivalent literal path also denies under R13
+- **AND** the denial does not assert that the cycle reveals a credential path
+
+#### Scenario: An outside alias stays unresolved under a global grant
+
+- **GIVEN** a bounded glob with a matched directory alias outside the original covering directory
+- **WHEN** Netclaw evaluates the call in Personal Approval mode with a global grant
+- **THEN** the grant does not replace the missing bounded scope proof
+- **AND** an interactive call retains exact consent unless a prior screen denies it
+- **AND** an unattended call denies the unresolved call
+
 ### Requirement: TA-8 Every candidate needs coverage
 
 A call SHALL run without a prompt only when every candidate has
@@ -1096,8 +1172,8 @@ SHALL be:
   `shell_redirect_unproved`, `shell_redirect_file_tool_denied`). Each redirect
   of the command SHALL get these checks before any prompt. With an `Approval`
   mode of the file tool, a stored grant of that tool SHALL cover the redirect.
-  With no such grant, one exact candidate SHALL name each write and read that
-  needs consent, with `Once` and `Deny` only. Otherwise the candidate
+  With no such grant, each file operation that needs consent SHALL have its own exact candidate.
+  The prompt SHALL offer `Once` and `Deny` only. Otherwise the candidate
   SHALL NOT ask for a stored grant, and an answer SHALL NOT save one. Such a
   command SHALL get no managed temporary directory advice. A Bash source that
   parses with no command (an assignment, a comment, an empty `case`, an
@@ -1150,6 +1226,16 @@ call SHALL be denied before grant lookup, also under a grant. The link check
 SHALL NOT change folder, repository, or global grant coverage, so a link to an
 ordinary file SHALL keep the decision of its grant.
 
+For a bounded glob that crosses a directory alias, reusable approval SHALL
+require existing grant coverage for the authored covering scope and every target scope.
+Each grant SHALL retain its ordinary folder or repository membership rules.
+A folder grant SHALL NOT cover an outside target. A repository grant SHALL prove each target's
+repository identity through the existing checkout and registered-worktree rules.
+The same rule SHALL apply to argument and redirect targets.
+Reviewed diagnostic policy SHALL check read authority for every known target scope.
+Only complete bounded reach SHALL support reusable scope or reviewed-safe coverage.
+The resolved path view SHALL retain those target scopes for later path checks.
+
 The store SHALL NOT save a grant that a stored grant already covers, and
 `netclaw doctor --fix` SHALL remove such a grant. A grant covers another grant
 when the tool, the shell, and the assignment digest are equal, its words cover
@@ -1171,6 +1257,39 @@ own the reviewed-safe path rule; their result is call-local.
 `ApprovalPatternMatching` owns the grant match, including the legacy rule; its
 result is call-local. `ToolApprovalActor` holds chat grants (actor-local).
 `ToolApprovalStore` holds persistent grants (durable).
+
+Scratch composition SHALL apply only to a Personal Bash occurrence with resolved command candidates and proved redirects.
+The occurrence SHALL have at least one file target inside the current run's managed temporary directory.
+Every other file target SHALL stay inside that directory or name the null device.
+Every proved scratch target SHALL pass the file-tool authority checks.
+An ineligible occurrence SHALL retain its ordinary command and redirect scopes.
+The command grant SHALL still cover the occurrence directory and every ordinary operand scope.
+The redirect target SHALL remain subject to protected-path checks, file-tool admission, consent modes, and launch verification.
+A redirect through a link, an unresolved target, or a target outside that managed directory SHALL keep its ordinary scope.
+This composition SHALL NOT change any persistent grant or extend a repository's identity.
+
+#### Scenario: Repository command writes managed scratch
+- **GIVEN** a Personal session with a repository grant for `uv export` and file-write permission for its managed temporary directory
+- **WHEN** the command runs in that repository and redirects to a proved file in that managed directory
+- **THEN** the command runs without another prompt
+- **AND** an ordinary operand outside the repository still needs its own coverage
+
+#### Scenario: Scratch composition cannot bypass file consent
+- **GIVEN** the same command and a file-write mode of `Deny`
+- **WHEN** the command redirects to its managed temporary directory
+- **THEN** Netclaw denies the call before a shell grant can cover it
+- **AND** an `Approval` file-write mode needs file-tool consent or a covering file-tool grant
+
+#### Scenario: Exact scratch consent preserves command and file identities
+- **GIVEN** a scratch redirect that needs file consent
+- **WHEN** the operator selects `Once`
+- **THEN** the unchanged retry is allowed
+- **AND** a different command or file-operation set still needs consent
+- **AND** punctuation in one filename cannot authorize two different targets
+
+#### Scenario: Another run's scratch is external
+- **WHEN** a repository command redirects to another run's temporary directory or an arbitrary external file
+- **THEN** the repository grant supplies no scratch exemption
 
 #### Scenario: A command that runs no program needs no prompt
 
@@ -1288,6 +1407,20 @@ result is call-local. `ToolApprovalActor` holds chat grants (actor-local).
 - **WHEN** a Personal session calls `shell_execute` with `git status`
 - **THEN** the Team grant does not cover the candidate
 
+#### Scenario: A folder grant does not transfer through an alias
+
+- **GIVEN** a folder grant for the authored project scope
+- **AND** a glob alias target does not belong to that grant's scope
+- **WHEN** Netclaw checks the bounded glob
+- **THEN** the folder grant does not cover the call
+
+#### Scenario: A repository grant proves the target identity
+
+- **GIVEN** a grant for repository A
+- **AND** a glob alias reaches repository B inside a shared covering directory
+- **WHEN** Netclaw checks the bounded glob
+- **THEN** repository A's grant does not cover repository B
+
 ### Requirement: TA-9 Agent correction precedes a prompt and grants no authority
 
 Agent correction SHALL run only after admission, hard deny, protected-path, and
@@ -1309,6 +1442,23 @@ and pass every check again.
 - A repeated equivalent call after a managed temporary correction SHALL
   suppress the correction once and SHALL offer only `Once` and `Deny`.
 - The parent session and a subagent SHALL use the same corrections.
+
+A resolved Personal Bash command that runs a program in a project SHALL receive temporary-path advice for proved platform-temporary outputs outside the project.
+The advice SHALL preserve the command directory and ordinary operands.
+A command that runs no program and an output inside the project SHALL retain their ordinary file-consent behavior.
+It SHALL name the current run's managed temporary directory and require a new call.
+An input redirect, an unresolved target, or a non-temporary output target SHALL prevent this specific advice.
+Hard deny and protected-path refusal SHALL retain precedence.
+
+#### Scenario: Repository export receives temporary output advice
+- **GIVEN** a Personal session with a project directory
+- **WHEN** `uv export` redirects output to `/tmp/reqs.txt` and otherwise needs approval
+- **THEN** Netclaw suggests the current run's managed temporary directory
+- **AND** Netclaw does not run or rewrite the submitted call
+
+#### Scenario: Temporary advice preserves an external input
+- **WHEN** the command also reads through an input redirect
+- **THEN** Netclaw does not suggest relocation through this rule
 
 #### Scenario: Temporary write gets a correction, not a prompt
 
@@ -1409,6 +1559,21 @@ note line. `SessionToolExecutionPipeline` and `SubAgentActor` add the line to
 the call-local tool result. The journal keeps the consent request and the
 answer (durable).
 
+A reusable shell consent prompt SHALL explain the reach of its command words within the existing display limit.
+The full command SHALL take priority over optional explanations when both cannot fit.
+A one-word program grant SHALL state that it does not cover subcommands, except for existing reviewed policy exceptions.
+A prompt with a proved grant mismatch SHALL give a bounded explanation for the command words, assignment qualifier, shell, or directory mismatch.
+This text SHALL NOT change the grant words, saved scope, one-time identity, or offered option keys.
+
+#### Scenario: Prompt explains a program grant
+- **WHEN** a reusable prompt asks for the one-word program `uv`
+- **THEN** the prompt states that this grant does not cover subcommands
+
+#### Scenario: Prompt explains a near miss
+- **GIVEN** a stored grant whose command words do not cover the submitted call
+- **WHEN** the call needs consent
+- **THEN** the prompt explains the command-word mismatch without changing the saved grant
+
 #### Scenario: A prompt for an unknown program shows the command text
 
 - **GIVEN** an interactive Personal session on the Bash 5.2 host
@@ -1503,9 +1668,13 @@ requester, and the inherited parent working directory. A subagent SHALL use
 chat grants of its parent session, and its own chat grants SHALL NOT reach the
 parent.
 
-- A subagent consent request SHALL be live-only. After a daemon or parent
-  restart, Netclaw SHALL reject the old prompt as expired and SHALL close the
-  interrupted `spawn_agent` call.
+- A durably accepted child SHALL record its consent request and resolution
+  with its original run, concrete call, requester, and authority.
+- The parent SHALL preserve those facts while it serves another user turn.
+- After a daemon or parent restart, Netclaw SHALL reject the old child prompt
+  as expired. Recovery SHALL report uncertain child work without a new child
+  dispatch. The accepted start result SHALL remain distinct from the later
+  terminal result.
 - An answer that arrives after the subagent wait ends SHALL NOT run the tool.
 - A subagent without a parent bridge SHALL NOT ask. Its run SHALL fail with
   `ToolExecutionFailed`.
@@ -1524,6 +1693,20 @@ parent.
 - **WHEN** the requester answers the old prompt
 - **THEN** Netclaw rejects the answer as expired
 - **AND** the tool does not run
+
+#### Scenario: Another parent turn does not replace child approval authority
+
+- **GIVEN** Alice starts a child that requests consent
+- **AND** the parent accepts another user turn
+- **WHEN** Alice answers the original child prompt while its wait remains live
+- **THEN** the child receives consent only for the original concrete call
+- **AND** the prompt retains Alice's original authority and options
+
+#### Scenario: Another requester cannot approve the child call
+
+- **GIVEN** Alice owns a child consent request
+- **WHEN** Bob answers that request
+- **THEN** the system rejects the answer before a grant or tool dispatch
 
 ### Requirement: TA-13 The persistent grant store fails closed
 
@@ -1665,3 +1848,224 @@ SHALL report an error for an unrestricted Public or Team profile.
 - **GIVEN** `Tools.ShellMode` `HostAllowed` and a Personal `shell_execute` override of `Auto`
 - **WHEN** the operator runs `netclaw doctor`
 - **THEN** the audience profile check reports a warning
+
+### Requirement: Legacy grant diagnostics preserve authority
+
+A valid legacy shell grant SHALL participate in bounded phrase near-miss diagnostics.
+The diagnostic SHALL use the same command identity and comparison rules that the grant matcher uses.
+An explanation change SHALL NOT change candidate coverage, consent options, grant scope, or a final authorization outcome.
+Invalid or unrelated entries SHALL NOT become a matching grant or a same-program explanation.
+Existing reviewed single-token program exceptions SHALL keep their current meaning.
+
+#### Scenario: A legacy assignment qualifier differs
+
+- **GIVEN** a valid Bash legacy grant for `dotnet test` without an assignment qualifier
+- **AND** a resolved candidate for those words with a non-null assignment digest
+- **WHEN** the evaluator compares the candidate with that grant
+- **THEN** the grant does not cover the candidate
+- **AND** the bounded explanation names the assignment mismatch
+
+#### Scenario: A legacy command phrase differs
+
+- **GIVEN** a valid legacy Bash grant for `gh pr view`
+- **WHEN** the evaluator compares a candidate for `gh pr merge` with that grant
+- **THEN** the grant does not cover the candidate
+- **AND** the bounded explanation names the command-word mismatch
+
+#### Scenario: An existing reviewed program grant still covers its operands
+
+- **GIVEN** a valid global legacy Bash grant for `grep`
+- **WHEN** an otherwise permitted ordinary `grep` call uses literal operands and no assignment qualifier
+- **THEN** the diagnostic repair preserves the existing grant match
+- **AND** it creates no new authority for another program
+
+#### Scenario: A scope mismatch remains separate
+
+- **GIVEN** a phrase-compatible grant whose folder does not contain the candidate path
+- **WHEN** the evaluator compares the candidate with that grant
+- **THEN** the result retains the scope mismatch
+- **AND** the phrase diagnostic does not authorize the path
+
+### Requirement: A proved launch-value assignment retains its authority qualifier
+
+A launch-derived assignment SHALL become reusable only when its exact source, effective value, and effects have complete proof.
+The proof SHALL use the same supported fresh-host facts and launch snapshot as execution.
+Unknown or incomplete facts SHALL retain exact consent.
+The assignment identity SHALL retain the shell, name, scope, environment-impact flag, and exact effective value.
+An unqualified grant SHALL NOT cover a qualified assignment.
+Changed effective values SHALL need separate authority.
+The proof SHALL NOT bypass hard deny, protected paths, link checks, audience rules, scope checks, or launch checks.
+The implementation SHALL use generic shell facts and SHALL NOT special-case an executable or environment-variable name.
+
+#### Scenario: A launch-derived value matches its literal identity
+
+- **GIVEN** a supported fresh Bash host with a proved launch `HOME` of `/home/test`
+- **AND** complete source and effect proof for `export DOTNET_ROOT=$HOME/.dotnet; dotnet test ./sample.csproj`
+- **WHEN** Netclaw creates the assignment-qualified candidate
+- **THEN** its assignment identity equals the literal-value form with `/home/test/.dotnet` under the same shell and export state
+- **AND** a grant without that assignment identity does not cover it
+- **AND** all normal file and grant-scope checks still apply
+
+#### Scenario: A changed value does not inherit consent
+
+- **GIVEN** a grant qualified by an exact effective assignment value
+- **WHEN** the same command receives a different proved effective assignment value
+- **THEN** that grant does not cover the candidate
+
+#### Scenario: Unknown launch or source facts keep exact consent
+
+- **GIVEN** an unsupported host, absent launch proof, or incomplete source effects
+- **WHEN** a command assigns a value through an expansion
+- **THEN** the launch-value rule adds no reusable authority
+- **AND** the existing exact-consent or denial result remains
+
+#### Scenario: A substitution cannot hide a denied command
+
+- **WHEN** an assignment contains a command substitution that invokes a hard-denied command
+- **THEN** the hard denial wins
+- **AND** an exact effective value or a saved grant cannot bypass it
+
+#### Scenario: A launch-derived protected path remains protected
+
+- **GIVEN** complete launch-value proof for an operand that names a protected path
+- **WHEN** a command uses that operand
+- **THEN** the existing protected-path policy still decides the operation
+- **AND** assignment qualification supplies no additional file authority
+
+#### Scenario: Other environment variables retain their qualifiers
+
+- **WHEN** an assignment to `PATH`, `LD_PRELOAD`, or `GIT_DIR` can reach a program
+- **THEN** the grant identity retains that assignment's environment effect
+- **AND** an unqualified grant does not cover the changed environment
+
+### Requirement: TA-17 Shell Once consent binds exact source
+
+A shell `Once` answer SHALL cover a retry only when the exact structured `Command` value matches the source that received consent. The comparison SHALL be case-sensitive. Prompt display text SHALL NOT define source identity. A persistent grant SHALL NOT use this source identity.
+
+For a recovered prompt, Netclaw SHALL derive source identity from the original assistant tool call in session history. If that call has no valid structured shell command, Netclaw SHALL NOT dispatch the retry with the old `Once` answer.
+Netclaw SHALL stop recovery when a call ID is ambiguous or the original canonical tool name does not match the recovered approval.
+
+#### Scenario: Exact source decides the one-time retry
+- **GIVEN** an operator approved `git status # source-A` with `Once`
+- **WHEN** Netclaw checks a retry with the same approval candidates
+- **THEN** the structured source decides the result:
+
+| Retry source | Result |
+|---|---|
+| `git status # source-A` | Pass the one-time consent check; consume the consent |
+| `git status # source-a` | Request consent again |
+
+#### Scenario: Invalid history prevents recovered consent
+- **GIVEN** a recovered shell approval with invalid source or call identity
+- **AND** history lacks valid command arguments, duplicates a call ID, or names a different canonical tool
+- **WHEN** Netclaw plans the retry
+- **THEN** Netclaw abandons it without using the old consent or prompt display text
+
+### Requirement: TA-18 Bash compound redirects retain independent file authority
+
+Netclaw SHALL check each supported Bash compound redirect as an independent file effect. An input redirect SHALL use file-read path rules. An output redirect SHALL use file-write path rules. The compound command's entry directory SHALL resolve relative targets. A command grant SHALL NOT grant access to a redirect target. A file-tool grant SHALL NOT grant a body command.
+
+Netclaw SHALL check hard-deny rules, protected paths, trusted roots, link targets, and the file-tool mode before it requests consent. A call with no body command SHALL still pass each redirect through these checks. Consent SHALL bind the complete shell source and every file operation that needs consent. An unknown target, incomplete redirect, or unknown relative-path base on a supported compound owner SHALL be denied with `shell_redirect_unproved`. One-time consent SHALL NOT override this denial.
+
+Netclaw SHALL check each redirect again before process start. A changed path or link target SHALL stop the launch.
+
+#### Scenario: An input redirect uses read authority
+
+- **GIVEN** an interactive Personal session with grants for `cat` and `file_read` within the declared roots
+- **WHEN** the model calls `shell_execute` with `for item in one two; do cat "$item"; done < input.txt`
+- **THEN** Netclaw resolves `input.txt` against the loop entry directory
+- **AND** the file-read grant covers the redirect
+- **AND** the command grant covers only the body command
+
+#### Scenario: An output redirect outside roots denies a granted command
+
+- **GIVEN** an interactive Personal session with a grant for `printf` and bounded write roots
+- **WHEN** the model calls `shell_execute` with `while read value; do printf '%s' "$value"; done > ../outside/result.txt`
+- **THEN** authorization returns `Denied` with reason `shell_path_outside_trusted_roots`
+- **AND** Netclaw does not query a shell grant for the command
+
+#### Scenario: A protected redirect denies before grant lookup
+
+- **GIVEN** an interactive Personal session with grants for every body command
+- **WHEN** a compound redirect names a protected path
+- **THEN** authorization returns `Denied` with reason `shell_path_protected` or `shell_references_protected_path`
+- **AND** no grant or consent answer overrides the denial
+
+#### Scenario: A denied file-tool mode denies a compound redirect
+
+- **GIVEN** an interactive Personal session where `file_read` or `file_write` has mode `Deny`
+- **WHEN** a compound command uses the matching input or output redirect
+- **THEN** authorization returns `Denied` with reason `shell_redirect_file_tool_denied`
+
+#### Scenario: Command and file grants retain separate authority
+
+- **GIVEN** an interactive Personal session with a file tool in mode `Approval`
+- **WHEN** a proved compound redirect has only the grant in the table
+- **THEN** Netclaw requests the separate consent shown:
+
+| Stored grant | Consent still required |
+|---|---|
+| File-tool grant for the redirect | Body command |
+| Legacy exact shell grant for the full source | File operation |
+
+#### Scenario: Every redirect gets an independent file check
+
+- **GIVEN** an interactive Personal session with a bounded write root
+- **WHEN** a compound command has two output redirects and the later target is outside that root
+- **THEN** authorization denies the call before consent
+- **AND** the earlier target does not grant authority to the later target
+
+#### Scenario: Nested compound redirects keep their owners
+
+- **GIVEN** an interactive Personal session with bounded read and write roots
+- **WHEN** a nested compound command has one inner redirect and one outer redirect
+- **THEN** Netclaw checks each redirect once against its own compound entry directory
+- **AND** an inner command grant does not widen either path scope
+
+#### Scenario: A compound redirect with no body command still needs file authority
+
+- **GIVEN** an interactive Personal session with a bounded read root
+- **WHEN** the model calls `shell_execute` with `for item in one; do value=1; done < input.txt`
+- **THEN** Netclaw checks `input.txt` with file-read path rules and the file-tool mode
+- **AND** Netclaw does not allow the call only because it found no body command
+
+#### Scenario: Shell Auto retains file consent with or without a body command
+
+- **GIVEN** the shell tool has mode `Auto` and `file_write` has mode `Approval`
+- **AND** no stored `file_write` grant covers the compound output target
+- **WHEN** the model calls `shell_execute` with a supported compound output redirect
+- **THEN** Netclaw requests one-time consent for the full source and the write operation
+- **AND** neither shell `Auto` nor the no-command rule skips the file-operation candidate
+
+| Compound source | Body command |
+|---|---|
+| `while read value; do cat; done > result.txt` | `cat` |
+| `for item in one; do value=1; done > result.txt` | None |
+
+#### Scenario: A command substitution in an outer target stays unresolved
+
+- **GIVEN** an interactive Personal session
+- **WHEN** a compound redirect target contains a command substitution
+- **THEN** the parser keeps the whole source unparseable
+- **AND** Netclaw uses the existing unresolved-source policy
+- **AND** Netclaw does not create reusable candidates from partial command facts
+
+#### Scenario: A changed redirect path stops the launch
+
+- **GIVEN** Netclaw approved a compound redirect target
+- **WHEN** the path or its resolved link target changes before process start
+- **THEN** Netclaw denies launch with reason `shell_launch_paths_changed`
+
+#### Scenario: An unknown target denies before consent
+
+- **GIVEN** an interactive Personal session
+- **WHEN** a supported compound redirect has an unknown target or an unknown relative-path base
+- **THEN** authorization returns `Denied` with reason `shell_redirect_unproved`
+- **AND** no one-time answer or stored grant overrides the denial
+
+#### Scenario: A one-time answer binds the source and file operations
+
+- **GIVEN** an interactive Personal session with no file-tool grant for a compound redirect
+- **WHEN** the operator grants one-time consent for a supported, proved redirect and the full call
+- **THEN** the answer does not cover a call with different body commands
+- **AND** the answer does not cover a call with a different redirect target

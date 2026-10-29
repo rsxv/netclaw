@@ -21,6 +21,48 @@ namespace Netclaw.Actors.Tests.Tools;
 public sealed class RepositoryWorktreeApprovalTests(ShellApprovalMatrixFixture fixture)
 {
     [Fact]
+    public async Task Glob_alias_target_inside_the_cover_requires_its_own_repository_identity()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var root = CreateTestRoot("repository-glob-alias-");
+        try
+        {
+            var main = Path.Combine(root.FullName, "main");
+            var session = Directory.CreateDirectory(Path.Combine(root.FullName, "session")).FullName;
+            RunGit(root.FullName, "init", main);
+            var ordinary = Directory.CreateDirectory(Path.Combine(main, "ordinary")).FullName;
+            var nested = Path.Combine(main, "nested");
+            RunGit(main, "init", nested);
+            var alias = Path.Combine(main, "alias");
+            Directory.CreateSymbolicLink(alias, ordinary);
+            var command = $"touch '{main}'/a*/*.tmp";
+            await using var sameRepository = await CreateHarnessAsync(
+                "glob-alias-same-repository", main, main, session, command,
+                Approvals.PersistentRepository("touch"), ShellApprovalHost.Bash52);
+            var sameDecision = await sameRepository.EvaluateDecisionAsync(TestContext.Current.CancellationToken);
+            Assert.Equal(ToolAuthorizationOutcome.Allowed, sameDecision.Outcome);
+            Assert.Equal(ToolAllowReason.StoredApproval, sameDecision.AllowReason);
+
+            Directory.Delete(alias);
+            Directory.CreateSymbolicLink(alias, nested);
+            await using var nestedRepository = await CreateHarnessAsync(
+                "glob-alias-other-repository", main, main, session, command,
+                Approvals.PersistentRepository("touch"), ShellApprovalHost.Bash52);
+            var nestedDecision = await nestedRepository.EvaluateDecisionAsync(TestContext.Current.CancellationToken);
+
+            Assert.Equal(ToolAuthorizationOutcome.RequiresApproval, nestedDecision.Outcome);
+            Assert.Contains(nestedDecision.ApprovalContext!.Candidates!, candidate => candidate.Directory == nested);
+            Assert.Equal(Path.Combine(nested, ".git"), nestedDecision.ApprovalContext!.RepositoryCommonDirectory);
+        }
+        finally
+        {
+            root.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task Assignment_repository_grant_requires_the_same_assignment_in_a_registered_sibling()
     {
         var root = CreateTestRoot("repository-assignment-fixture-");
@@ -560,6 +602,61 @@ public sealed class RepositoryWorktreeApprovalTests(ShellApprovalMatrixFixture f
         }
     }
 
+    [Fact]
+    public async Task Repository_verb_grant_keeps_an_arbitrary_external_redirect_outside_its_scope()
+    {
+        var root = CreateTestRoot("netclaw-repository-redirect-");
+        try
+        {
+            var main = Path.Combine(root.FullName, "main");
+            var session = Directory.CreateDirectory(Path.Combine(root.FullName, "session"));
+            RunGit(root.FullName, "init", main);
+
+            await using var inside = await CreateHarnessAsync(
+                "repository-redirect-inside",
+                main,
+                main,
+                session.FullName,
+                "uv export --frozen > uv.lock.audit.txt",
+                Approvals.PersistentRepository("uv export"),
+                AssignmentTestHost);
+            var insideDecision = await inside.EvaluateDecisionAsync(TestContext.Current.CancellationToken);
+            Assert.Equal(ToolAuthorizationOutcome.Allowed, insideDecision.Outcome);
+
+            // Only the POSIX null device has the sink exemption.
+            if (!OperatingSystem.IsWindows())
+            {
+                await using var nullDevice = await CreateHarnessAsync(
+                    "repository-redirect-null-device",
+                    main,
+                    main,
+                    session.FullName,
+                    "uv export --frozen 2>/dev/null",
+                    Approvals.PersistentRepository("uv export"),
+                    AssignmentTestHost);
+                var nullDeviceDecision = await nullDevice.EvaluateDecisionAsync(
+                    TestContext.Current.CancellationToken);
+                Assert.Equal(ToolAuthorizationOutcome.Allowed, nullDeviceDecision.Outcome);
+            }
+
+            await using var outside = await CreateHarnessAsync(
+                "repository-redirect-outside-file",
+                main,
+                main,
+                session.FullName,
+                $"uv export --frozen > '{Path.Combine(root.FullName, "audit-reqs.txt")}'",
+                Approvals.PersistentRepository("uv export"),
+                AssignmentTestHost);
+            var outsideDecision = await outside.EvaluateDecisionAsync(TestContext.Current.CancellationToken);
+
+            Assert.NotEqual(ToolAuthorizationOutcome.Allowed, outsideDecision.Outcome);
+        }
+        finally
+        {
+            root.Delete(recursive: true);
+        }
+    }
+
     private Task<ShellApprovalHarness> CreateHarnessAsync(
         string id,
         string project,
@@ -623,7 +720,8 @@ public sealed class RepositoryWorktreeApprovalTests(ShellApprovalMatrixFixture f
             process.StartInfo.ArgumentList.Add(argument);
 
         Assert.True(process.Start());
-        Assert.True(process.WaitForExit(10_000), "git timed out");
+        // No deadline: a deadline left a slow git alive and broke the cleanup on Windows.
+        process.WaitForExit();
         Assert.Equal(0, process.ExitCode);
     }
 

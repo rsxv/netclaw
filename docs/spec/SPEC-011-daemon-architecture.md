@@ -45,7 +45,7 @@ Netclaw.Daemon Process
 │   ├── Slack Socket Mode
 │   └── Internal Timer
 │
-├── ConfigWatcherService + RestartCoordinator (FileSystemWatcher restart coordination)
+├── ConfigWatcherActor + RestartCoordinator (FileSystemWatcher restart coordination)
 └── ISystemPromptProvider (layered soul files)
 ```
 
@@ -255,8 +255,27 @@ unit's `Environment` property decides: no `NETCLAW_HOME` means the default home.
 A unit whose `NETCLAW_HOME` comes only from an `EnvironmentFile`, sampled at an
 instant when it has no main process, is therefore treated as serving the default
 home. For a home the unit does not serve, `start` and `stop` act on that home's
-own daemon process and never on the unit. A stale PID file that names another
-home's live `netclawd` is still trusted by a direct `stop`, as in 0.27.1.
+own daemon process and never on the unit.
+
+A direct `stop` sends a signal only to a PID that is shown to serve the home of
+the command (capability spec `daemon-lifecycle`, change
+`bind-daemon-stop-to-home`). `stop` posts the shutdown notice with the PID and
+the resolved home path to the local control endpoint of the home. The daemon
+answers 200 with its PID and its resolved home, or 409 for another PID or home.
+A 200 with the right PID and the right home is the proof. A daemon that does not
+answer, or answers 200 with no `home` (an older daemon), is proven on Linux only by
+its own environment: `NETCLAW_HOME`, or `<HOME>/.netclaw` with the `HOME` of that
+environment. A relative `NETCLAW_HOME`, or one with `~`, `$`, or `%`, gives no proof.
+Without proof, `stop` sends no signal, keeps the PID file, prints a two-line
+refusal on stderr, and exits with code 1. `start` and `status` use the same
+environment rule, or the held lock file where the environment cannot be read,
+and report a PID with no proof as "not shown to serve" this home. Runbook:
+`docs/runbooks/daemon-upgrade.md`, section "When a command refuses".
+
+An unreadable local config source leaves the local daemon address unknown.
+The stop command reports that state and sends no shutdown notice.
+It still requires the existing process home proof before it sends a signal.
+An absent optional source retains its normal default semantics.
 
 The session journals each accepted input before it acknowledges the source.
 The record retains the text, media, source message ID, and original authority.
@@ -285,6 +304,22 @@ restores the pending input under its recorded authority when the reminder
 arrives. A completed turn, partial text, or possible tool effect produces no
 restart reminder.
 
+A tool batch consumes the turn input. When the drain stops a turn after its
+tool batch, the actor journals one continuation input for that turn before it
+acknowledges (#2632). The input has no text and carries the recorded authority
+of the turn. The normal pending-input path then builds the reminder and, after
+the restart, resumes the turn with the next model call over the stored history.
+The reminder text is not an input. The actor keeps the turn only when no text
+reached the person, no other input waits, no overflow replay waits, no
+background job lives, each tool call has a recorded result, and the turn has a
+channel type. Otherwise the person gets the stop notice. A later input that
+arrives before the reminder closes the continuation input, and the person gets
+the stop notice then. When the journal rejects or fails the continuation write,
+the person gets the stop notice and no reminder exists. A tool that still runs
+at the coordinator deadline has an unknown effect, so that session does not
+acknowledge, gets no reminder and no session notice, and the shutdown alert
+names it.
+
 The daemon gives session drain 20 seconds within a 30-second shutdown phase.
 The CLI allows 45 seconds before forced termination. The generated systemd
 unit allows 60 seconds. A container should set
@@ -295,6 +330,8 @@ then probes `/api/health/ready` on this home's own daemon endpoint (the `Daemon`
 section of `netclaw.json`, not `NETCLAW_DAEMON_ENDPOINT` or a paired remote).
 It exits 1 when the process is not running or readiness does not answer, which
 the container `HEALTHCHECK` relies on. Reports: running/stopped, PID, uptime.
+When a local source cannot be read, status reports an unknown address and exits 1.
+It sends no readiness probe in that state.
 
 `netclaw update` preserves the daemon's lifecycle owner, using the same stop and
 start path as `netclaw daemon stop` and `start`. If the Linux systemd user unit
@@ -361,8 +398,35 @@ wiring and contents. Producer, rehydrator, and validator share
 `install`/`doctor --fix`, so after installing new tools re-run either and then
 `systemctl --user restart netclaw`.
 
+**Operator lines.** `daemon.env` is also the place for operator settings, for example
+`NETCLAW_HOME=/x/home` or `HTTP_PROXY=...`.
+
+Caution: the file holds plain text. If a line holds a credential, run `chmod 600` on `daemon.env`.
+Netclaw never makes the file more open than it was, but it does not make a new file private.
+
+Install and `doctor --fix` replace the first `PATH` line in place, drop a later `PATH` line, and add
+`PATH=` at the end when none exists. A line is a `PATH` line when its key, the text before the first
+`=`, is `PATH` once trimmed. This matches systemd, so `PATH = /x` and `PATH<TAB>=/x` count.
+`export PATH=/x` does not count, because systemd reads it as another key. Both commands keep every
+other line verbatim and in order. A line ending of `\r\n` stays. A rerun with the same input leaves
+the file byte-identical. A rewrite never opens the file more than it was. Install overwrites the file
+in place, which keeps its mode and any symbolic link. `doctor --fix` writes the file atomically and
+gives the new file the mode of the file that it replaces. A new file gets the default mode of a new
+file.
+
 `netclaw daemon uninstall` stops the service and removes the unit file and the
-`daemon.env` file.
+`daemon.env` file. It removes the operator lines in that file too. To change the unit file and keep
+the operator lines, run `netclaw daemon install` again.
+
+The install scripts honor `NETCLAW_HOME` with the `NetclawPaths` rules (`~`, `$HOME`, `${HOME}`,
+and `%USERPROFILE%` expand, a blank value is unset, a relative path resolves against the working
+directory; `install.ps1` uses the PowerShell location). Both scripts use `<home>/config`. A fresh
+`install.sh` also uses `<home>/bin` and `<home>/env`. An upgrade does not move an install. The
+order of the rules: `INSTALL_DIR` always wins. Else an install that sits in `<home>/bin` is
+upgraded there. Else, if `$HOME/.netclaw/bin` holds `netclaw` or `netclawd`, `install.sh` upgrades
+there, keeps the env script at `$HOME/.netclaw/env`, and prints the directory. Else it is a fresh
+install under `<home>`. `install.ps1` keeps its own install directory. `CONFIG_DIR` and
+`NETCLAW_CONFIG_DIR` no longer have an effect.
 
 ### Service Registration (macOS)
 
@@ -429,6 +493,23 @@ not execute tools.
    route activates each target session.
 6. **Invalid config**: log warning with validation errors, preserve previous config
 
+The host records a SHA-256 hash of the exact `netclaw.json` bytes that its JSON provider consumes.
+`ConfigWatcherActor` starts its native watcher, then compares disk with that loaded hash.
+A difference schedules validation after application startup.
+An unchanged startup hash needs no additional restart.
+
+Native file callbacks send actor messages.
+One keyed 500ms actor timer debounces change, create, and rename-into events.
+The actor validates canonical sources, including secrets and environment overlays, before it requests coordinated restart.
+An ordinary config event still triggers validation when the raw bytes match.
+A secret-only event creates no reload signal.
+Invalid candidates retain the current host and report the rejection.
+
+The actor owns its watcher, timer, and one in-flight restart request.
+Actor stop disposes the watcher and cancels the coordinator token.
+The existing restart coordinator retains ingress, session drain, and durable recovery ownership.
+See the [file-event contract](../../openspec/specs/netclaw-config-hot-reload/spec.md).
+
 ### What Changes Take Effect After Restart
 
 - Provider credentials and endpoints
@@ -453,8 +534,8 @@ not execute tools.
 - Not agent file tools: tool authorization write-denies the config directory
   (see `docs/architecture/tool-authorization.md`)
 
-All changes go to disk first. The `FileSystemWatcher` is the single reload
-trigger — there is no in-memory config mutation path.
+All changes go to disk first. Watched file events request reload through the coordinator.
+No in-memory config mutation path exists.
 
 ## Security Context
 

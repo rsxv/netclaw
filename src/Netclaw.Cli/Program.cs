@@ -41,12 +41,17 @@ using Netclaw.Providers.OAuth;
 using Netclaw.Configuration.Secrets;
 using Netclaw.Security;
 using Termina;
-using Termina.Diagnostics;
 using Termina.Hosting;
 
 try
 {
     await RunAsync(args);
+}
+catch (Exception ex) when (CliConfigPreflight.TryDescribeLoadFailure(ex, new NetclawPaths(), out var configFailure))
+{
+    // An operator error (a config file the CLI cannot read), not a crash: one line, no crash log.
+    Console.Error.WriteLine(configFailure);
+    Environment.ExitCode = 1;
 }
 catch (Exception ex)
 {
@@ -105,13 +110,28 @@ static async Task RunAsync(string[] args)
         args = ["chat"];
     }
 
+    // Doctor and status run when netclaw.json or secrets.json cannot be loaded and report it;
+    // any other command that needs the config ends at the handler above with one line.
+    string? configProblem = null;
+    var configFix = string.Empty;
+    if (mode is "doctor" or "status" && !CliConfigPreflight.IsHelpRequest(args)
+        && CliConfigPreflight.TryDescribeUnreadableConfig(new NetclawPaths(), out var unreadableConfig, out configFix))
+    {
+        configProblem = unreadableConfig;
+        if (mode is "status")
+        {
+            Console.Error.WriteLine(configProblem);
+            Console.Error.WriteLine("The daemon address could not be read from the config; checking the default port.");
+        }
+    }
+
     // Kick off the update check only for modes that do not boot Termina or
     // otherwise own the current command's startup flow. Buffering the notice
     // protects active TUIs from stray stderr, but it does not make the
     // background network probe itself safe during interactive startup.
     if (UpdateCommand.ShouldRunStartupUpdateCheck(mode, args))
     {
-        var backgroundUpdateConfig = BuildCliConfig();
+        var backgroundUpdateConfig = BuildCliConfig(CliConfigPreflight.RunsWithUnreadableConfig(args));
         var backgroundDaemonConfig = DaemonConfig.BindFromConfiguration(backgroundUpdateConfig.GetSection("Daemon"));
         _ = UpdateCommand.BackgroundUpdateCheckAsync(backgroundDaemonConfig.DisableSelfUpdate, backgroundDaemonConfig.UpdateChannel);
     }
@@ -155,11 +175,6 @@ static async Task RunAsync(string[] args)
 
         if (mode is "init")
         {
-            // Enable Termina trace logging for debugging TUI input/rendering issues
-            var traceFile = Path.Combine(Path.GetTempPath(), "netclaw-init-trace.log");
-            builder.Services.AddTerminaFileTracing(traceFile, TerminaTraceCategory.All, TerminaTraceLevel.Trace);
-            Console.Error.WriteLine($"Trace log: {traceFile}");
-
             // Provider descriptors (includes IProviderProbe via registry)
             builder.Services.AddProviderDescriptors();
             builder.Services.AddProviderOAuthServices();
@@ -243,7 +258,11 @@ static async Task RunAsync(string[] args)
         try
         {
             DoctorFixPlan? fixPlan = null;
-            if (doctorOptions!.Fix)
+            var fixBlocked = configProblem
+                ?? (doctorOptions!.Fix && CliConfigPreflight.TryDescribeUneditableConfig(new NetclawPaths(), out var uneditable) ? uneditable : null);
+            if (doctorOptions!.Fix && fixBlocked is not null)
+                Console.Error.WriteLine($"Nothing was fixed. {fixBlocked}");
+            if (doctorOptions.Fix && fixBlocked is null)
             {
                 fixPlan = await fixService.BuildPlanAsync();
                 if (doctorOptions.Format is DoctorOutputFormat.Text)
@@ -256,8 +275,9 @@ static async Task RunAsync(string[] args)
                     {
                         try
                         {
+                            var backupOutput = doctorOptions.Format is DoctorOutputFormat.Json ? Console.Error : Console.Out;
                             foreach (var backup in await fixService.ApplyAsync(fixPlan))
-                                Console.WriteLine($"Backed up the original to {backup}");
+                                backupOutput.WriteLine($"Backed up the original to {backup}");
                         }
                         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                         {
@@ -269,7 +289,7 @@ static async Task RunAsync(string[] args)
                 }
             }
 
-            var result = await runner.RunAsync();
+            var result = await runner.RunAsync(configProblem is null ? null : DoctorCheckResult.Error("Config Load", configProblem, configFix));
 
             if (doctorOptions.Format is DoctorOutputFormat.Json)
                 WriteDoctorJsonResult(result, fixPlan, doctorOptions);
@@ -278,6 +298,7 @@ static async Task RunAsync(string[] args)
 
             // Hint about --fix when there are issues and fix wasn't requested
             if (!doctorOptions.Fix
+                && configProblem is null
                 && result.ExitCode != 0
                 && doctorOptions.Format is DoctorOutputFormat.Text)
             {
@@ -378,8 +399,8 @@ static async Task RunAsync(string[] args)
 
         using var host = builder.Build();
         using var scope = host.Services.CreateScope();
-        var exitCode = await RunStatusAsync(scope.ServiceProvider, statusAsJson);
-        Environment.ExitCode = exitCode;
+        var exitCode = await RunStatusAsync(scope.ServiceProvider, statusAsJson, configProblem is not null);
+        Environment.ExitCode = configProblem is null ? exitCode : Math.Max(exitCode, 1);
         return;
     }
 
@@ -508,7 +529,10 @@ static async Task RunAsync(string[] args)
     {
         var subcommand = args.Length > 1 ? args[1] : "help";
         if (IsHelpToken(subcommand))
-            subcommand = "help";
+        {
+            WriteDaemonHelp();
+            return;
+        }
 
         // See DaemonCommandDispatch remarks: `pair`/`devices` guard their own trailing --help
         // below; the remaining lifecycle verbs previously executed for real on a trailing help
@@ -528,14 +552,14 @@ static async Task RunAsync(string[] args)
             case "start":
                 var startResult = await UpdateCommand.StartDaemonAsync(
                     new UpdateCommand.DaemonProcessLifecycle(manager),
-                    new SystemdUserService());
+                    new SystemdUserService(paths.BasePath));
                 WriteDaemonResult(startResult);
                 return;
 
             case "stop":
                 var stopResult = (await UpdateCommand.StopDaemonAsync(
                     new UpdateCommand.DaemonProcessLifecycle(manager),
-                    new SystemdUserService(),
+                    new SystemdUserService(paths.BasePath),
                     "cli-stop")).ToDaemonResult();
                 WriteDaemonResult(stopResult);
                 if (stopResult.Success && new ContainerSupervisor().IsExternallySupervised)
@@ -546,7 +570,7 @@ static async Task RunAsync(string[] args)
             {
                 var status = manager.GetStatus();
                 Console.WriteLine(status.Message);
-                if (!status.IsRunning)
+                if (!status.IsRunning || !status.ServesThisHome)
                 {
                     Environment.ExitCode = 1;
                     return;
@@ -559,7 +583,9 @@ static async Task RunAsync(string[] args)
 
                 if (!ready)
                 {
-                    Console.WriteLine($"Daemon process is running but {readyEndpoint}/api/health/ready did not answer.");
+                    Console.WriteLine(readyEndpoint is null
+                        ? "The local daemon address is unknown. No readiness probe was sent. Repair the local configuration and retry."
+                        : $"Daemon process is running but {readyEndpoint}/api/health/ready did not answer.");
                     Environment.ExitCode = 1;
                     return;
                 }
@@ -590,13 +616,10 @@ static async Task RunAsync(string[] args)
 
                 using var pairHost = pairBuilder.Build();
                 var pairApi = pairHost.Services.GetRequiredService<DaemonApi>();
-                var proofProtector = pairHost.Services.GetRequiredService<LocalControlPairingProofProtector>();
-                var timeProvider = pairHost.Services.GetRequiredService<TimeProvider>();
 
                 try
                 {
-                    var proof = proofProtector.CreateProof(timeProvider.GetUtcNow());
-                    var response = await pairApi.RequestPairingCodeAsync(proof);
+                    var response = await pairApi.RequestPairingCodeAsync();
                     if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
                     {
                         Console.Error.WriteLine("error: The daemon does not support local-control pairing.");
@@ -730,9 +753,6 @@ static async Task RunAsync(string[] args)
             builder.Services.AddSingleton<McpToolPermissionsNavigationState>();
             builder.Services.AddSingleton<TuiNavigation>();
 
-            var traceFile = Path.Combine(Path.GetTempPath(), "netclaw-mcp-tools-trace.log");
-            builder.Services.AddTerminaFileTracing(traceFile, TerminaTraceCategory.All, TerminaTraceLevel.Trace);
-
             builder.Services.AddTermina("/mcp-tools", t =>
             {
                 ConfigureNativeSelection(t);
@@ -777,9 +797,6 @@ static async Task RunAsync(string[] args)
             builder.Services.AddProviderDescriptors();
             builder.Services.AddProviderOAuthServices();
 
-            var traceFile = Path.Combine(Path.GetTempPath(), "netclaw-provider-trace.log");
-            builder.Services.AddTerminaFileTracing(traceFile, TerminaTraceCategory.All, TerminaTraceLevel.Trace);
-
             builder.Services.AddTermina("/provider", t =>
             {
                 ConfigureNativeSelection(t);
@@ -806,9 +823,6 @@ static async Task RunAsync(string[] args)
         {
             var builder = CreateQuietHostBuilder(args);
             builder.Services.AddProviderDescriptors();
-
-            var traceFile = Path.Combine(Path.GetTempPath(), "netclaw-model-trace.log");
-            builder.Services.AddTerminaFileTracing(traceFile, TerminaTraceCategory.All, TerminaTraceLevel.Trace);
 
             builder.Services.AddTermina("/model", t =>
             {
@@ -837,9 +851,6 @@ static async Task RunAsync(string[] args)
             var builder = CreateQuietHostBuilder(args);
             builder.Services.AddSingleton(paths);
 
-            var traceFile = Path.Combine(Path.GetTempPath(), "netclaw-approvals-trace.log");
-            builder.Services.AddTerminaFileTracing(traceFile, TerminaTraceCategory.All, TerminaTraceLevel.Trace);
-
             builder.Services.AddTermina("/approvals", t =>
             {
                 ConfigureNativeSelection(t);
@@ -861,9 +872,6 @@ static async Task RunAsync(string[] args)
         if (args.Length > 1 && args[1] is "ui" or "tui")
         {
             var builder = CreateQuietHostBuilder(args);
-
-            var traceFile = Path.Combine(Path.GetTempPath(), "netclaw-reminder-trace.log");
-            builder.Services.AddTerminaFileTracing(traceFile, TerminaTraceCategory.All, TerminaTraceLevel.Trace);
 
             builder.Services.AddTermina("/reminder", t =>
             {
@@ -899,15 +907,11 @@ static async Task RunAsync(string[] args)
     if (mode is "skill")
     {
         var skillSubcommand = args.Length > 1 ? args[1] : "list";
-        if (skillSubcommand is "list" or "sync")
+        if (skillSubcommand is "list" or "sync" or "show" or "remove")
         {
-            // `skill list` is served by the daemon's live registry — the only view
-            // that includes dynamic MCP prompt skills. It requires the daemon; when
-            // the daemon is unavailable, SkillCommand reports that and exits non-zero
-            // (no disk fallback). Building the DI host parses local config
-            // (netclaw.json, secrets.json); a corrupt file must produce a readable
-            // error, not a stack trace — the old disk-scan list never read those
-            // files, so this path must not make them a new way to crash.
+            // These commands need the complete daemon registry.
+            // The host reads local configuration before it creates DaemonApi.
+            // Report malformed configuration without a stack trace.
             try
             {
                 var builder = CreateQuietHostBuilder(args);
@@ -940,7 +944,7 @@ static async Task RunAsync(string[] args)
         var paths = new NetclawPaths();
         paths.EnsureDirectoriesExist();
         // All memory subcommands are offline — direct SQLite/model-file access, no daemon needed
-        Environment.ExitCode = await MemoryCommand.RunAsync(args, paths, BuildCliConfig(), Console.Out, Console.Error);
+        Environment.ExitCode = await MemoryCommand.RunAsync(args, paths, BuildCliConfig(lenient: false), Console.Out, Console.Error);
         return;
     }
 
@@ -1283,9 +1287,6 @@ static async Task RunConfigEditorAsync(string[] args)
         .AddSectionEditor<FeatureSelectionStepViewModel>()
         .AddSectionEditor<ExposureModeStepViewModel>();
 
-    var traceFile = Path.Combine(Path.GetTempPath(), "netclaw-config-trace.log");
-    builder.Services.AddTerminaFileTracing(traceFile, TerminaTraceCategory.All, TerminaTraceLevel.Trace);
-
     builder.Services.AddTermina("/config", t =>
     {
         // Every Termina host uses raw input so native terminal text-selection
@@ -1365,7 +1366,11 @@ static async Task RunTerminaHostAsync(IHost host)
 
 static void WriteDaemonResult(DaemonResult result)
 {
-    Console.WriteLine(result.Message);
+    // A refusal has one writer and goes to stderr only.
+    if (result.IsRefusal)
+        Console.Error.WriteLine(result.Message);
+    else
+        Console.WriteLine(result.Message);
     if (!string.IsNullOrWhiteSpace(result.CrashLogPath))
         Console.WriteLine($"Crash log: {result.CrashLogPath}");
     if (!result.Success)
@@ -1421,6 +1426,10 @@ static void WriteDaemonHelp()
     Console.WriteLine("  pair                         Generate a pairing code for remote device access");
     Console.WriteLine("  devices                      List paired devices");
     Console.WriteLine("  devices revoke <name>        Revoke a paired device by name");
+    Console.WriteLine();
+    Console.WriteLine("start, stop, and status refuse when the PID in netclaw.pid is not shown to serve this home.");
+    Console.WriteLine("If no Netclaw daemon of this home runs, delete <home>/netclaw.pid.");
+    Console.WriteLine("If the process is a wedged daemon of this home, check it, then stop it with 'kill <pid>'.");
 }
 
 static void WriteDaemonPairHelp()
@@ -1646,7 +1655,7 @@ static void WriteSimpleDiff(string original, string updated)
     }
 }
 
-static async Task<int> RunStatusAsync(IServiceProvider services, bool jsonOutput)
+static async Task<int> RunStatusAsync(IServiceProvider services, bool jsonOutput, bool configUnreadable)
 {
     var api = services.GetRequiredService<DaemonApi>();
     var httpClientFactory = services.GetRequiredService<IHttpClientFactory>();
@@ -1700,14 +1709,16 @@ static async Task<int> RunStatusAsync(IServiceProvider services, bool jsonOutput
     {
         await updateCts.CancelAsync();
         Console.WriteLine($"[FAIL] status: daemon returned {(int)ex.StatusCode} from {api.Endpoint}");
-        Console.WriteLine("       fix: run `netclaw daemon status` and `netclaw daemon start`.");
+        if (!configUnreadable)
+            Console.WriteLine("       fix: run `netclaw daemon status` and `netclaw daemon start`.");
         return 1;
     }
     catch (Exception ex)
     {
         await updateCts.CancelAsync();
         Console.WriteLine($"[FAIL] status: unable to reach daemon at {api.Endpoint}: {ex.Message}");
-        Console.WriteLine("       fix: run `netclaw daemon start` and retry.");
+        if (!configUnreadable)
+            Console.WriteLine("       fix: run `netclaw daemon start` and retry.");
         return 1;
     }
 }
@@ -2096,13 +2107,13 @@ static void WriteDailyTable(List<DaemonStats.DailyRow> rows)
 static HostApplicationBuilder CreateQuietHostBuilder(string[] args)
 {
     var builder = Host.CreateApplicationBuilder(args);
-    ConfigureConfigServices(builder.Services, builder.Configuration);
+    ConfigureConfigServices(builder.Services, builder.Configuration, CliConfigPreflight.RunsWithUnreadableConfig(args));
     builder.Logging.ClearProviders();
     builder.Logging.SetMinimumLevel(LogLevel.Warning);
     return builder;
 }
 
-static NetclawPaths ConfigureConfigServices(IServiceCollection services, IConfigurationManager configuration)
+static NetclawPaths ConfigureConfigServices(IServiceCollection services, IConfigurationManager configuration, bool lenient = false)
 {
     // Netclaw paths (creates ~/.netclaw/ structure)
     var paths = new NetclawPaths();
@@ -2123,10 +2134,7 @@ static NetclawPaths ConfigureConfigServices(IServiceCollection services, IConfig
     // 1. netclaw.json (daemon-owned config, optional)
     // 2. secrets.json (credentials overlay, optional)
     // 3. NETCLAW_* environment variables (highest priority)
-    configuration
-        .AddJsonFile(paths.NetclawConfigPath, optional: true, reloadOnChange: false)
-        .AddJsonFile(paths.SecretsPath, optional: true, reloadOnChange: false)
-        .AddEnvironmentVariables("NETCLAW_");
+    CliConfigPreflight.AddConfigSources(configuration, paths, lenient);
 
     services.AddSingleton(DaemonConfig.BindFromConfiguration(configuration.GetSection("Daemon")));
 
@@ -2149,16 +2157,12 @@ static NetclawPaths ConfigureConfigServices(IServiceCollection services, IConfig
     return paths;
 }
 
-static IConfigurationRoot BuildCliConfig()
+static IConfigurationRoot BuildCliConfig(bool lenient)
 {
     var paths = new NetclawPaths();
     paths.EnsureDirectoriesExist();
 
-    return new ConfigurationBuilder()
-        .AddJsonFile(paths.NetclawConfigPath, optional: true, reloadOnChange: false)
-        .AddJsonFile(paths.SecretsPath, optional: true, reloadOnChange: false)
-        .AddEnvironmentVariables("NETCLAW_")
-        .Build();
+    return CliConfigPreflight.AddConfigSources(new ConfigurationBuilder(), paths, lenient).Build();
 }
 
 // ═══════════════════════════════════════════════════════════════════════

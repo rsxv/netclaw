@@ -24,6 +24,7 @@ using Netclaw.Actors.Tests.Sessions;
 using FakeChatClient = Netclaw.Tests.Utilities.FakeChatClient;
 using Netclaw.Channels.Slack;
 using Netclaw.Configuration;
+using Netclaw.Media;
 using Netclaw.Tests.Utilities;
 using Netclaw.Security;
 using Xunit;
@@ -71,6 +72,7 @@ public sealed class SlackThreadBackfillIntegrationTests : TestKit, IAsyncDisposa
     {
         services.AddSingleton<IChatClientProvider>(new SingleClientProvider(_chatClient));
         services.AddSingleton(_paths);
+        services.AddSingleton<IOperationalNotificationSink>(NullNotificationSink.Instance);
         services.AddSingleton<Netclaw.Actors.Jobs.BackgroundJobDefinitionStore>();
         services.AddSingleton(new ModelCapabilities
         {
@@ -912,7 +914,7 @@ public sealed class SlackThreadBackfillIntegrationTests : TestKit, IAsyncDisposa
                                 {
                                     Id = "F_DOCX",
                                     Name = "notes.docx",
-                                    Mimetype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                    Mimetype = MimeTypeCatalog.ApplicationDocx,
                                     Size = FakePngBytes.Length,
                                     UrlPrivateDownload = "https://files.slack.com/fake/notes.docx"
                                 }

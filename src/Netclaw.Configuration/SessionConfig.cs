@@ -18,11 +18,8 @@ namespace Netclaw.Configuration;
 public sealed record SessionConfig
 {
     /// <summary>
-    /// Maximum number of LLM-to-tools-to-LLM iterations allowed per turn. One
-    /// LLM response that requests any number of parallel tool calls counts as
-    /// exactly one iteration. At ~75% of this limit a budget-awareness nudge
-    /// is injected; at 100% tools are stripped and the model is asked to
-    /// summarize its work (force-no-tools completion).
+    /// Legacy configuration field. The runtime preserves the value but does not enforce a fixed iteration ceiling.
+    /// Exact recurrence rules govern repeated work. Deadlines, cancellation, and authorization still apply.
     /// </summary>
     public int MaxToolIterationsPerTurn { get; init; } = 60;
 
@@ -37,9 +34,9 @@ public sealed record SessionConfig
     /// How long a session can be idle before passivating.
     /// The actor saves a snapshot and stops itself; re-creation by
     /// <c>GenericChildPerEntityParent</c> on next message recovers state from journal.
-    /// Default 30 minutes. Set to <see cref="TimeSpan.Zero"/> to disable.
+    /// Default one hour. Set to <see cref="TimeSpan.Zero"/> to disable.
     /// </summary>
-    public TimeSpan IdleTimeout { get; init; } = TimeSpan.FromMinutes(30);
+    public TimeSpan IdleTimeout { get; init; } = TimeSpan.FromHours(1);
 
     /// <summary>
     /// Timeout for the primary per-turn LLM streaming call.
@@ -174,7 +171,7 @@ public sealed record SessionConfig
     {
         public int MaxToolIterationsPerTurn { get; init; } = 60;
         public int MemoryObserverIdleSeconds { get; init; } = 90;
-        public TimeSpan IdleTimeout { get; init; } = TimeSpan.FromMinutes(30);
+        public TimeSpan IdleTimeout { get; init; } = TimeSpan.FromHours(1);
         public int TurnLlmTimeoutSeconds { get; init; } = 180;
         public int ToolExecutionTimeoutSeconds { get; init; } = 90;
         public int SidecarLlmTimeoutSeconds { get; init; } = 90;

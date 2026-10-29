@@ -53,6 +53,7 @@ public sealed class ToolCycleUserInputTests(ITestOutputHelper output) : LlmSessi
     [InlineData(true)]
     public async Task Tool_completion_resets_cycle_state_only_for_new_user_input(bool newUserInput)
     {
+        // Arrange
         var ct = TestContext.Current.CancellationToken;
         ConfigureRepeatedCalls();
         foreach (var decision in new[] { true, true, true, false })
@@ -61,71 +62,89 @@ public sealed class ToolCycleUserInputTests(ITestOutputHelper output) : LlmSessi
         var sessionId = new SessionId("cycle-user-input/tool-completion");
         var subscriber = await StartRequestAsync(sessionId);
 
-        await _executor.CallPaused.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
-        if (newUserInput)
-            await SendNewRequestAsync(sessionId);
-        _executor.ResumeCall.TrySetResult();
-        await ExpectTurnCompletedAsync(subscriber);
-
-        Assert.Equal(newUserInput ? 3 : 2, _executor.Count);
-        Assert.Equal(4, _client.Inner.CallCount);
-    }
-
-    [Fact]
-    public async Task New_user_input_discards_the_exhausted_budget_from_the_completed_batch()
-    {
-        var ct = TestContext.Current.CancellationToken;
-        static List<FunctionCallContent> DistinctCalls(int number)
+        // Act
+        try
         {
-            var calls = Calls(number);
-            calls[0].Arguments!["query"] = number;
-            return calls;
+            await _executor.CallPaused.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
+            if (newUserInput)
+            {
+                await SendRequestAsync(sessionId, "Queued first request");
+                await SendRequestAsync(sessionId, "Queued second request");
+            }
+            _executor.ResumeCall.TrySetResult();
+            await ExpectTurnCompletedAsync(subscriber);
+
+            // Assert
+            Assert.Equal(newUserInput ? 3 : 2, _executor.Count);
+            Assert.Equal(4, _client.Inner.CallCount);
+            if (newUserInput)
+            {
+                var firstQueuedCall = _client.Inner.ReceivedMessages.First(messages =>
+                    messages.Any(message => message.Text == "Queued first request"));
+                var queuedInputs = firstQueuedCall
+                    .Where(message => message.Role == Microsoft.Extensions.AI.ChatRole.User
+                        && message.Text is ("Queued first request" or "Queued second request"))
+                    .Select(message => message.Text)
+                    .ToArray();
+                Assert.Equal(["Queued first request", "Queued second request"], queuedInputs);
+            }
         }
-
-        _client.Inner.ToolCallsOnFirstCall = DistinctCalls(1);
-        _client.Inner.AfterToolCallResponse = count =>
-            _client.Inner.ToolCallsOnFirstCall = DistinctCalls(count + 1);
-        _client.Inner.AlwaysReturnToolCalls = true;
-        _executor.PauseAtCall = MaximumToolIterations;
-        var sessionId = new SessionId("cycle-user-input/exhausted-budget");
-        var subscriber = await StartRequestAsync(sessionId);
-
-        await _executor.CallPaused.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
-        Assert.Equal(MaximumToolIterations, _executor.Count);
-        await SendNewRequestAsync(sessionId);
-        _client.Inner.PlannedToolCallDecisions.Enqueue(true);
-        _client.Inner.PlannedToolCallDecisions.Enqueue(false);
-        _executor.ResumeCall.TrySetResult();
-        await ExpectTurnCompletedAsync(subscriber);
-
-        Assert.Equal(MaximumToolIterations + 1, _executor.Count);
-        Assert.Equal(MaximumToolIterations + 2, _client.Inner.CallCount);
-        Assert.Contains("search_tools", _client.Inner.ReceivedToolNames[MaximumToolIterations]);
+        finally
+        {
+            _executor.ResumeCall.TrySetResult();
+        }
     }
 
     [Fact]
-    public async Task User_input_queued_during_terminal_reply_restores_tools_for_the_new_request()
+    public async Task User_input_queued_before_a_repeated_refusal_joins_the_continuing_turn()
     {
+        // Arrange
         var ct = TestContext.Current.CancellationToken;
         ConfigureRepeatedCalls();
         _client.Inner.AlwaysReturnToolCalls = true;
-        _client.Pause = PausePoint.ToolFreeReply;
-        var sessionId = new SessionId("cycle-user-input/terminal-reply");
+        _client.Pause = PausePoint.PostCorrectionResponse;
+        var sessionId = new SessionId("cycle-user-input/repeat-nudge");
         var subscriber = await StartRequestAsync(sessionId);
 
-        await _client.CallPaused.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
-        Assert.Equal(2, _executor.Count);
-        await SendNewRequestAsync(sessionId);
-        foreach (var decision in new[] { false, true, false })
-            _client.Inner.PlannedToolCallDecisions.Enqueue(decision);
-        _client.ResumeCall.TrySetResult();
-        await ExpectTurnCompletedAsync(subscriber);
-        await ExpectTurnCompletedAsync(subscriber);
+        try
+        {
+            // Act
+            await _client.CallPaused.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
+            Assert.Equal(2, _executor.Count);
+            await SendRequestAsync(sessionId, "A fresh request after the correction.");
+            // The paused response repeats the refused call. The fresh request then gets one call and a text answer.
+            foreach (var decision in new[] { true, true, false })
+                _client.Inner.PlannedToolCallDecisions.Enqueue(decision);
+            _client.ResumeCall.TrySetResult();
+            var outputs = new List<object>();
+            await subscriber.FishForMessageAsync<object>(message =>
+            {
+                outputs.Add(message);
+                return message is TurnCompleted;
+            }, TimeSpan.FromSeconds(10), cancellationToken: ct);
 
-        Assert.Equal(3, _executor.Count);
-        Assert.Equal(7, _client.Inner.CallCount);
-        Assert.Empty(_client.Inner.ReceivedToolNames[4]);
-        Assert.Contains("search_tools", _client.Inner.ReceivedToolNames[5]);
+            // Assert
+            Assert.DoesNotContain(outputs, static output => output is ErrorOutput);
+            Assert.Equal(TurnOutcome.Completed, Assert.IsType<TurnCompleted>(outputs[^1]).Outcome);
+            // The repeat did not run. The fresh request starts a new guard window, so its call runs.
+            Assert.Equal(3, _executor.Count);
+            Assert.Equal(6, _client.Inner.CallCount);
+            var afterRepeat = _client.Inner.ReceivedMessages[4];
+            Assert.Contains("search_tools", _client.Inner.ReceivedToolNames[4]);
+            var nudge = afterRepeat.ToList().FindIndex(static message =>
+                message.Role == Microsoft.Extensions.AI.ChatRole.User
+                && message.Text.StartsWith("[system: Netclaw refused your repeated call to `search_tools` again.",
+                    StringComparison.Ordinal));
+            var fresh = afterRepeat.ToList().FindIndex(static message =>
+                message.Role == Microsoft.Extensions.AI.ChatRole.User
+                && message.Text == "A fresh request after the correction.");
+            Assert.True(nudge >= 0, "The request after the repeat has no nudge.");
+            Assert.True(fresh > nudge, "The fresh request must follow the nudge.");
+        }
+        finally
+        {
+            _client.ResumeCall.TrySetResult();
+        }
     }
 
     [Theory]
@@ -158,8 +177,9 @@ public sealed class ToolCycleUserInputTests(ITestOutputHelper output) : LlmSessi
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task Overflow_replay_preserves_text_only_state_unless_a_new_user_request_arrives(bool newUserInput)
+    public async Task Overflow_replay_preserves_unresolved_correction_unless_new_user_input_arrives(bool newUserInput)
     {
+        // Arrange
         var ct = TestContext.Current.CancellationToken;
         var sessionId = new SessionId("cycle-user-input/overflow-replay");
         var subscriber = await StartRequestAsync(sessionId);
@@ -172,7 +192,7 @@ public sealed class ToolCycleUserInputTests(ITestOutputHelper output) : LlmSessi
         _client.Inner.AfterToolCallResponse = count =>
         {
             _client.Inner.ToolCallsOnFirstCall = Calls(count + 1);
-            if (++toolResponses == 4)
+            if (++toolResponses == 3)
             {
                 _client.Inner.PlannedExceptions.Enqueue(new ProviderException(
                     "maximum context length exceeded", "HTTP 400: maximum context length exceeded", statusCode: 400));
@@ -181,22 +201,42 @@ public sealed class ToolCycleUserInputTests(ITestOutputHelper output) : LlmSessi
         await SendNewRequestAsync(sessionId);
         await _client.CallPaused.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
         Assert.Equal(2, _executor.Count);
-        if (newUserInput)
+        try
         {
-            await SendNewRequestAsync(sessionId);
+            // Act
+            if (newUserInput)
+                await SendNewRequestAsync(sessionId);
+            // The replayed request repeats the call. Then the model answers with text.
             _client.Inner.PlannedToolCallDecisions.Enqueue(true);
-        }
-        _client.Inner.PlannedToolCallDecisions.Enqueue(false);
-        _client.ResumeCall.TrySetResult();
-        await subscriber.FishForMessageAsync<object>(message => message is CompactionOutput,
-            TimeSpan.FromSeconds(10), cancellationToken: ct);
-        await ExpectTurnCompletedAsync(subscriber);
+            _client.Inner.PlannedToolCallDecisions.Enqueue(false);
+            _client.ResumeCall.TrySetResult();
+            await subscriber.FishForMessageAsync<object>(message => message is CompactionOutput,
+                TimeSpan.FromSeconds(10), cancellationToken: ct);
+            var errors = new List<ErrorOutput>();
+            await subscriber.FishForMessageAsync<object>(message =>
+            {
+                if (message is ErrorOutput error)
+                    errors.Add(error);
+                return message is TurnCompleted;
+            }, TimeSpan.FromSeconds(10), cancellationToken: ct);
 
-        Assert.Equal(newUserInput ? 3 : 2, _executor.Count);
-        if (newUserInput)
+            // Assert
+            Assert.Equal(newUserInput ? 3 : 2, _executor.Count);
             Assert.Contains("search_tools", _client.Inner.ReceivedToolNames[^1]);
-        else
-            Assert.Empty(_client.Inner.ReceivedToolNames[^1]);
+            // A repeat of the unresolved correction is refused again with a nudge. It is never a model failure.
+            Assert.DoesNotContain(errors, static error => error.Category == ErrorCategory.ModelBehavior);
+            if (!newUserInput)
+            {
+                var last = _client.Inner.ReceivedMessages[^1][^1];
+                Assert.Equal(Microsoft.Extensions.AI.ChatRole.User, last.Role);
+                Assert.StartsWith("[system: Netclaw refused your repeated call to `search_tools` again.",
+                    last.Text, StringComparison.Ordinal);
+            }
+        }
+        finally
+        {
+            _client.ResumeCall.TrySetResult();
+        }
     }
 
     private void ConfigureRepeatedCalls()
@@ -227,16 +267,19 @@ public sealed class ToolCycleUserInputTests(ITestOutputHelper output) : LlmSessi
     }
 
     private Task<CommandAck> SendNewRequestAsync(SessionId sessionId)
+        => SendRequestAsync(sessionId, "Run the same tool once more. This is an explicit user request.");
+
+    private Task<CommandAck> SendRequestAsync(SessionId sessionId, string content)
         => ActorRegistry.Get<SessionManagerActorKey>().Ask<CommandAck>(new SendUserMessage
         {
-            SessionId = sessionId, Content = "Run the same tool once more. This is an explicit user request."
+            SessionId = sessionId, Content = content
         }, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
     private static ValueTask<object> ExpectTurnCompletedAsync(TestProbe subscriber)
         => subscriber.FishForMessageAsync<object>(message => message is TurnCompleted,
             TimeSpan.FromSeconds(10), cancellationToken: TestContext.Current.CancellationToken);
 
-    private enum PausePoint { None, ToolFreeReply, Compaction }
+    private enum PausePoint { None, PostCorrectionResponse, Compaction }
 
     private sealed class PausedChatClient : IChatClient
     {
@@ -255,7 +298,7 @@ public sealed class ToolCycleUserInputTests(ITestOutputHelper output) : LlmSessi
             var shouldPause = Pause switch
             {
                 PausePoint.Compaction => compaction,
-                PausePoint.ToolFreeReply => !compaction && options?.Tools is not { Count: > 0 },
+                PausePoint.PostCorrectionResponse => !compaction && Inner.CallCount == 3,
                 _ => false
             };
             if (shouldPause && Interlocked.Exchange(ref _didPause, 1) == 0)

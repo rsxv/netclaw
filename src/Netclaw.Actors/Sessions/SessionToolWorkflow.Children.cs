@@ -1,0 +1,259 @@
+// -----------------------------------------------------------------------
+// <copyright file="SessionToolWorkflow.Children.cs" company="Petabridge, LLC">
+//      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
+// </copyright>
+// -----------------------------------------------------------------------
+using Akka.Actor;
+using Netclaw.Actors.Authorization.Consent;
+using Netclaw.Actors.Channels;
+using Netclaw.Actors.Protocol;
+using Netclaw.Actors.Sessions.Pipelines;
+using Netclaw.Actors.SubAgents;
+using Netclaw.Tools;
+using FunctionCallContent = Microsoft.Extensions.AI.FunctionCallContent;
+using static Netclaw.Actors.Sessions.SessionProtocol;
+
+namespace Netclaw.Actors.Sessions;
+
+internal sealed partial class SessionToolWorkflow
+{
+    public bool IsPendingChildStart(ToolCallId callId) => _activeBatch.IsPending(callId);
+
+    public void ValidateRecoveredAuthority(TurnContext context)
+    {
+        foreach (var entry in _calls.Values.Where(call => call.Pending.Request.SourceChildRunId is null))
+        {
+            if (entry.Pending.TurnContext is not { } authority || !authority.HasSameAuthority(context))
+                throw new InvalidDataException("A legacy task context differs from its recovered approval authority.");
+        }
+    }
+
+    public int ChildApprovalCount(SubAgentRunId runId)
+        => _calls.Values.Count(call => call is PendingToolApproval && call.Pending.Request.SourceChildRunId == runId);
+    public bool IsChildApproval(ToolCallId callId)
+        => _calls.TryGetValue(callId.Value, out var call) && call.Pending.Request.SourceChildRunId is not null;
+    // <child-approval-close>
+    // A child owner never survives a restart, so recovery closes every child entry that replay left open.
+    public IReadOnlyList<KeyValuePair<string, ToolApprovalCallState>> ExpireRecoveredChildApprovals()
+    {
+        var closed = _calls.Where(pair => pair.Value.Pending.Request.SourceChildRunId is not null).ToArray();
+        foreach (var pair in closed)
+            _calls.Remove(pair.Key);
+        return closed;
+    }
+
+    // The live close rule: a cancel record or a terminal record (also the Lost record that recovery writes) closes every
+    // entry of its run. A checkpoint or a prepared result leaves the prompt open. Replay does not call this method.
+    public IReadOnlyList<KeyValuePair<string, ToolApprovalCallState>> CloseChildApprovals(ChildRunEvent evt)
+    {
+        if (evt is not (ChildRunEvent.CancellationRequested or ChildRunEvent.TerminalRecorded))
+            return [];
+        var closed = _calls.Where(pair => pair.Value.Pending.Request.SourceChildRunId == evt.RunId).ToArray();
+        foreach (var pair in closed)
+            _calls.Remove(pair.Key);
+        return closed;
+    }
+    // </child-approval-close>
+
+    // A cancel or the end of a run closes its entries (CloseChildApprovals). Each entry that was still open becomes a
+    // withdrawal with the reason of the record. An entry with an answer closed already, so it gives no event.
+    public IReadOnlyList<AgentEvent.ChildApprovalResolved> WithdrawChildApprovals(
+        ChildRunEvent evt, BackgroundChildRun run, SessionId owner, DateTimeOffset at)
+    {
+        WithdrawReason reason;
+        switch (evt)
+        {
+            case ChildRunEvent.CancellationRequested:
+                reason = WithdrawReason.CancelledByParent;
+                break;
+            case ChildRunEvent.TerminalRecorded terminal:
+                // A parent cancel of a parked run writes only the terminal record (design D7).
+                reason = terminal.Terminal.Lost ? WithdrawReason.ChildLost
+                    : terminal.Terminal.Result.OutcomeReason == SubAgentOutcomeReason.CancelledByParent
+                        ? WithdrawReason.CancelledByParent
+                        : WithdrawReason.ChildEnded;
+                break;
+            default:
+                throw new InvalidOperationException($"A {evt.GetType().Name} record closes no child approval.");
+        }
+
+        var closedEntries = CloseChildApprovals(evt);
+        var withdrawn = RememberClosedChildCalls(closedEntries, _ => reason);
+        // A resume closes the answers of its park only after its Resumed record commits (UseParkedAnswers), so an
+        // answer that is still here was never used. A late click gets the reason of the run end, not "already answered".
+        foreach (var (callId, _) in closedEntries.Where(static pair => pair.Value is ResolvedToolApproval))
+            _closedChildCalls[callId] = new ChildApprovalResolution.Withdrawn(reason);
+        return withdrawn
+            .Select(closed => AgentEventFactory.ApprovalResolved(owner, run, closed.CallId,
+                new ChildApprovalResolution.Withdrawn(closed.Reason), at))
+            .ToArray();
+    }
+
+    // Recovery closes the child entries that replay left open (ExpireRecoveredChildApprovals). The run lifecycle in the
+    // state gives the reason of each open entry: a run that was live at the restart, a cancelled run, or an ended run.
+    // Recovery records a live run as lost only later (RecoverChildRuns), so "live" here means "lost by this restart".
+    public IReadOnlyList<(ToolCallId CallId, WithdrawReason Reason)> WithdrawRecoveredChildApprovals(SessionState state)
+        => RememberClosedChildCalls(ExpireRecoveredChildApprovals(),
+            request => RecoveredWithdrawReason(state, request.SourceChildRunId!.Value));
+
+    private static WithdrawReason RecoveredWithdrawReason(SessionState state, SubAgentRunId runId)
+    {
+        // A legacy journal can hold a child prompt with no run record. No child survives a restart, so the restart
+        // withdrew that prompt.
+        if (!state.ChildRuns.TryGetValue(runId, out var run))
+            return WithdrawReason.DaemonRestarted;
+        return run.Lifecycle switch
+        {
+            ChildRunLifecycle.Accepted => WithdrawReason.DaemonRestarted,
+            ChildRunLifecycle.Cancelling => WithdrawReason.CancelledByParent,
+            ChildRunLifecycle.Terminal terminal
+                when terminal.Result.Result.OutcomeReason == SubAgentOutcomeReason.CancelledByParent
+                => WithdrawReason.CancelledByParent,
+            ChildRunLifecycle.Reported { Reason: var reported } when reported == SubAgentOutcomeReason.CancelledByParent
+                => WithdrawReason.CancelledByParent,
+            // A run that ended before the restart, also a run that the earlier process lost (coordinator ruling).
+            ChildRunLifecycle.Terminal or ChildRunLifecycle.Reported => WithdrawReason.ChildEnded,
+            _ => throw new InvalidOperationException($"Unknown child run lifecycle {run.Lifecycle.GetType().Name}.")
+        };
+    }
+
+    // Keeps how each closed child prompt ended, so a late click gets the true reply (RejectClosedCall). Returns the
+    // entries that were open, with their reasons, in request order. Actor-local: recovery rebuilds it from the replayed
+    // approval events and the run lifecycle.
+    private IReadOnlyList<(ToolCallId CallId, WithdrawReason Reason)> RememberClosedChildCalls(
+        IReadOnlyList<KeyValuePair<string, ToolApprovalCallState>> closed,
+        Func<ToolApprovalRequested, WithdrawReason> openReason)
+    {
+        var withdrawn = new List<(ToolCallId, WithdrawReason)>();
+        foreach (var (callId, call) in closed.OrderBy(static pair => pair.Value.Pending.Request.RequestedAtMs))
+        {
+            switch (call)
+            {
+                case PendingToolApproval pending:
+                    var reason = openReason(pending.Pending.Request);
+                    _closedChildCalls[callId] = new ChildApprovalResolution.Withdrawn(reason);
+                    withdrawn.Add((new ToolCallId(callId), reason));
+                    break;
+                case ResolvedToolApproval resolved:
+                    _closedChildCalls[callId] = ChildResolution(resolved.Answer);
+                    break;
+            }
+        }
+        return withdrawn;
+    }
+
+    // A snapshot deletes the approval events of the closed child prompts, so replay cannot rebuild their closes.
+    public void ForgetClosedChildCalls() => _closedChildCalls.Clear();
+
+    // A channel answers prompt_unavailable when it cannot show a child prompt. The prompt has buttons only (design D3,
+    // S7), so no person saw it: the session withdraws the request, and the call is refused.
+    private static ChildApprovalResolution ChildResolution(ConsentAnswer answer)
+        => answer is ConsentAnswer.Refused { Kind: RefusalKind.PromptUnavailable }
+            ? new ChildApprovalResolution.Withdrawn(WithdrawReason.PromptUnavailable)
+            : ChildApprovalResolution.From(answer);
+
+    // The answer of a child request is durable. Only the workflow turns it into the typed event, after it applied it.
+    public AgentEvent.ChildApprovalResolved CreateChildResolution(
+        ToolApprovalResolved resolution, BackgroundChildRun run, SessionId owner, DateTimeOffset at)
+        => AgentEventFactory.ApprovalResolved(owner, run, new ToolCallId(resolution.CallId),
+            ChildResolution(ConsentAnswerCodec.FromJournalText(resolution.Decision)), at);
+
+    // <child-consent-pause>
+    // The child consent pause (design D5): the session is paused while any child consent request of the session is
+    // open. A request with an answer is closed, also when its run did not resume yet. Actor-local and derived.
+    public bool IsChildConsentPaused
+        => _calls.Values.Any(static call => call is PendingToolApproval && call.Pending.Request.SourceChildRunId is not null);
+
+    // While paused, the model cannot start more children. A slash start is accepted, because a person typed it.
+    public bool RefusesChildStart(ChildRunStartKey startKey)
+        => startKey is ChildRunStartKey.Tool && IsChildConsentPaused;
+    // </child-consent-pause>
+
+    /// <summary>The open child consent requests of the session, in request order.</summary>
+    public IReadOnlyList<ToolApprovalRequested> OpenChildRequests()
+        => _calls.Values.OfType<PendingToolApproval>()
+            .Select(static call => call.Pending.Request)
+            .Where(static request => request.SourceChildRunId is not null)
+            .OrderBy(static request => request.RequestedAtMs)
+            .ToArray();
+
+    public IReadOnlyList<PendingToolInteraction> OpenApprovals()
+        => _calls.Values.OfType<PendingToolApproval>().Select(static call => call.Pending).ToArray();
+
+    // A child gets only the fact that consent is available: it parks at a consent need (design D1), and the owner
+    // builds each prompt for the run requester when the park arrives.
+    public InteractiveApprovalCapability ChildApprovalCapability(BackgroundChildRun run)
+    {
+        if (!TurnContext.TryFromRecord(run.OriginalContext, out var context, out var reason) || context is null)
+            throw new InvalidOperationException($"Child authority is invalid: {reason}");
+        return context.SupportsInteractiveApproval
+            ? new InteractiveApprovalCapability.Available(ChildConsentAvailable.Instance)
+            : new InteractiveApprovalCapability.Unavailable();
+    }
+
+    private sealed class ChildConsentAvailable : IParentApprovalBridge
+    {
+        public static readonly ChildConsentAvailable Instance = new();
+    }
+
+    /// <summary>
+    /// Takes the recorded answers of a parked run, keyed by the child call ID, for its resume (design D3 and D4). The
+    /// entries stay open until <see cref="UseParkedAnswers"/>, so a resume that the session refuses after this read
+    /// leaves them for the run end to withdraw, and no answer counts as used (#2659 gap A).
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// The park cannot bind a recorded answer to its call. The entries stay, so the run end withdraws them and no
+    /// answer counts as used.
+    /// </exception>
+    public IReadOnlyDictionary<string, ApprovalRedriveEntry> TakeParkedAnswers(SubAgentRunId runId, ChildRunPark park)
+    {
+        var answered = _calls.Where(pair => pair.Value is ResolvedToolApproval && pair.Value.Pending.Request.SourceChildRunId == runId)
+            .ToArray();
+        var answers = new Dictionary<string, ApprovalRedriveEntry>(StringComparer.Ordinal);
+        var parkedCalls = ReadParkedCalls(park);
+        foreach (var pair in answered)
+        {
+            var resolved = (ResolvedToolApproval)pair.Value;
+            var childCallId = resolved.Pending.Request.OriginalChildCallId?.Value
+                              ?? throw new InvalidOperationException("A parked request has no child call ID.");
+            // The resumed child runs the call of the park transcript, so its shell source key binds the consent.
+            var shellSourceKey = GetShellSourceKey(childCallId, resolved, parkedCalls, out var failure);
+            if (failure is not null)
+                throw new InvalidOperationException($"The parked call {childCallId} cannot resume: {failure}.");
+            if (!answers.TryAdd(childCallId, ApprovalRedriveEntry.From(resolved, shellSourceKey)))
+                throw new InvalidOperationException($"The parked call ID {childCallId} is not unique.");
+        }
+
+        return answers;
+    }
+
+    /// <summary>
+    /// The resume of a parked run started: its Resumed record committed. The answered entries close, so a later click on
+    /// a prompt of the park gets "already answered".
+    /// </summary>
+    public void UseParkedAnswers(SubAgentRunId runId)
+    {
+        var answered = _calls.Where(pair => pair.Value is ResolvedToolApproval && pair.Value.Pending.Request.SourceChildRunId == runId)
+            .ToArray();
+        foreach (var pair in answered)
+            _calls.Remove(pair.Key);
+        RememberClosedChildCalls(answered, static _ => throw new InvalidOperationException("A parked run has an open request."));
+    }
+
+    // The resumed child runs the calls of the last assistant message of the transcript (SubAgentActor.ResumeFromPark).
+    private static Dictionary<string, FunctionCallContent> ReadParkedCalls(ChildRunPark park)
+    {
+        var calls = new Dictionary<string, FunctionCallContent>(StringComparer.Ordinal);
+        var assistant = park.Transcript.LastOrDefault(static message => message.Role == ChatRole.Assistant);
+        if (assistant is null)
+            return calls;
+
+        foreach (var call in ChatMessageConverter.ToAiMessage(assistant, reinjectMeta: true).Contents.OfType<FunctionCallContent>())
+        {
+            if (!calls.TryAdd(call.CallId, call))
+                throw new InvalidOperationException("The parked tool call IDs are ambiguous.");
+        }
+
+        return calls;
+    }
+}

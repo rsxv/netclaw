@@ -112,7 +112,9 @@ public sealed class McpOAuthEndToEndTests : IDisposable
         var daemonApi = new DaemonApi(
             new TestServerHttpClientFactory(app.GetTestClient),
             new ConfigurationBuilder().Build(),
-            paths);
+            paths,
+            DaemonApiTestDependencies.CreateProofProtector(),
+            TimeProvider.System);
         var output = new StringWriter();
 
         var exitCode = await McpCommand.RunAsync(
@@ -124,6 +126,7 @@ public sealed class McpOAuthEndToEndTests : IDisposable
         Assert.Equal(1, exitCode);
         Assert.Contains("dynamic client registration", output.ToString(), StringComparison.Ordinal);
         Assert.Contains("HTTP 403 Forbidden", output.ToString(), StringComparison.Ordinal);
+        Assert.Contains("--client-id", output.ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain("Error: \n", output.ToString(), StringComparison.Ordinal);
         Assert.Contains(logger.Messages, message => message.Contains("403", StringComparison.Ordinal));
         Assert.Contains(logger.Exceptions, exception =>

@@ -4,6 +4,7 @@
 // </copyright>
 // -----------------------------------------------------------------------
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Collections.Frozen;
 using Akka.Actor;
 using Akka.Event;
@@ -14,7 +15,9 @@ using Netclaw.Actors.Channels;
 using Netclaw.Actors.Jobs;
 using Netclaw.Actors.Protocol;
 using Netclaw.Actors.Sessions;
+using Netclaw.Actors.Sessions.Handlers;
 using Netclaw.Actors.Tools;
+using Netclaw.Actors.SubAgents;
 using Netclaw.Configuration;
 using Netclaw.Media;
 using Netclaw.Security;
@@ -34,7 +37,6 @@ namespace Netclaw.Actors.Sessions.Pipelines;
 /// </summary>
 internal sealed record ToolCallResult(
     SerializableChatMessage Message,
-    IReadOnlyList<SerializableMediaReference> ModelInputMediaReferences,
     IReadOnlyList<FileAttachmentInfo> FileAttachments,
     IReadOnlyList<CompletedSubAgentRun> CompletedSubAgentRuns,
     IReadOnlyList<AcceptedSubAgentFinding> AcceptedSubAgentFindings,
@@ -43,7 +45,11 @@ internal sealed record ToolCallResult(
     ManagedTemporaryCorrectionChange? ManagedTemporaryCorrectionUpdate = null,
     string? FailureCode = null,
     ToolInvocationReceipt? Receipt = null,
-    ToolExposureRequest? ExposureRequest = null);
+    ToolExposureRequest? ExposureRequest = null)
+{
+    public SerializableChatMessage MessageWithProgress
+        => ToolCycleResult.FromInvocation(Message, Receipt, FailureCode).WithMessageFacts(Message);
+}
 
 internal sealed record ModelInputMaterializationResult(
     IReadOnlyList<SerializableMediaReference> MediaReferences,
@@ -119,6 +125,11 @@ internal sealed class SessionToolRunEnvironment
     private IReadOnlyList<string> _recentFiles = [];
 
     public required SessionStoragePaths Storage { get; init; }
+    /// <summary>
+    /// The posture-narrowed audience of the turn. The run scope, the tool gate, and each child use this value.
+    /// The recorded turn context keeps the source audience.
+    /// </summary>
+    public required TrustAudience EffectiveAudience { get; init; }
     public required InlineOutputBudget InlineOutputBudget { get; init; }
     public required Func<object, string, CancellationToken, Task<object>> SpawnChildActor { get; init; }
     public ModelModality ModelInputModalities { get; init; } = ModelModality.Text;
@@ -164,7 +175,7 @@ internal sealed class SessionToolBatch
         RunScope = new ToolRunScope
         {
             Session = new ToolSessionScope.Bound(turnContext.SessionId.Value, environment.Storage),
-            Audience = turnContext.Audience,
+            Audience = environment.EffectiveAudience,
             Boundary = turnContext.Boundary,
             ChannelType = turnContext.ChannelType?.ToWireValue(),
             DefaultDeliveryTarget = turnContext.DefaultDeliveryTarget,
@@ -187,6 +198,7 @@ internal sealed class SessionToolBatch
             _toolCalls = Array.AsReadOnly(value.ToArray());
         }
     }
+    public IReadOnlySet<string> RefusedCallIds { get; init; } = new HashSet<string>();
     public TurnContext TurnContext { get; }
     public ToolRunScope RunScope { get; }
     public required ToolExecutionTimeout DefaultTimeout { get; init; }
@@ -196,7 +208,6 @@ internal sealed class SessionToolBatch
     public required BackgroundJobDispatch BackgroundJobs { get; init; }
     public bool SetWorkingDirectoryAvailable { get; init; }
     public Func<string, ToolInvocationContext, bool>? CanDeclareWorkingDirectory { get; init; }
-    public bool StreamResults { get; init; }
     public ManagedTemporaryCorrectionDispatch ManagedTemporaryCorrections { get; init; }
         = ManagedTemporaryCorrectionDispatch.Empty;
     public IReadOnlyDictionary<string, IReadOnlyList<string>> OneTimeApprovalPreSeed
@@ -264,6 +275,89 @@ internal sealed class SessionToolBatch
 }
 
 /// <summary>
+/// One entry of an approval re-drive plan (<see cref="ApprovalRedrivePlan"/>): the recorded answer for one call. The
+/// session pipeline applies it to the call context of a re-driven call. A resumed child applies its own recorded
+/// answers with the same helper (durable-child-consent-wait, design D4 and M11).
+/// </summary>
+/// <param name="AuthorizationAttemptId">
+/// The recorded authorization attempt ID, or a new ID when the plan has none for the call.
+/// </param>
+/// <param name="ApprovedConsentKeys">The keys of the one-time consent for an approved call, or null.</param>
+/// <param name="Refusal">The refusal of a refused call, or null.</param>
+/// <param name="ManagedTemporaryDenialDirectory">The managed temporary directory for a denial hint, or null.</param>
+internal sealed record ApprovalRedriveEntry(
+    AuthorizationAttemptId AuthorizationAttemptId,
+    IReadOnlyList<string>? ApprovedConsentKeys,
+    RefusalKind? Refusal,
+    string? ManagedTemporaryDenialDirectory)
+{
+    /// <summary>Reads the entry of one call from the four plan maps of the batch.</summary>
+    public static ApprovalRedriveEntry For(SessionToolBatch batch, string callId)
+        => new(
+            batch.AuthorizationAttemptIds.TryGetValue(callId, out var restoredAttemptId)
+                ? restoredAttemptId
+                : AuthorizationAttemptId.New(),
+            batch.OneTimeApprovalPreSeed.TryGetValue(callId, out var preSeedKeys) ? preSeedKeys : null,
+            batch.DecisionOverrides.TryGetValue(callId, out var refusal) ? refusal : null,
+            batch.ManagedTemporaryDenialDirectories.TryGetValue(callId, out var denialDirectory)
+                ? denialDirectory
+                : null);
+
+    /// <summary>Makes the entry of one recorded answer. A parent re-drive and a child resume use the same rule.</summary>
+    /// <param name="resolved">The recorded answer.</param>
+    /// <param name="shellSourceKey">
+    /// The key of the exact shell source for an approved shell call (SessionToolWorkflow.GetShellSourceKey), else null.
+    /// </param>
+    public static ApprovalRedriveEntry From(ResolvedToolApproval resolved, string? shellSourceKey)
+    {
+        var request = resolved.Pending.Request;
+        return resolved.Answer is ConsentAnswer.Refused refusal
+            ? new(resolved.Pending.AuthorizationAttemptId, null, refusal.Kind,
+                refusal.Kind == RefusalKind.Denied && request.ManagedTemporaryDirectory is { Length: > 0 } directory
+                    ? directory
+                    : null)
+            // The resume seeds these keys as a one-time consent for the tool name of the call.
+            : new(resolved.Pending.AuthorizationAttemptId,
+                OneTimeApprovalKeys.Create(request.Patterns, request.Candidates, request.Cwd, shellSourceKey), null, null);
+    }
+
+    /// <summary>
+    /// Restores the recorded authorization attempt ID and, for an approved call, seeds the one-time consent.
+    /// </summary>
+    /// <remarks>
+    /// The re-drive of an approved call: the person approved the call before the session passivated, but no
+    /// persisted grant satisfies the gate on the cold re-drive. The one-time consent lets exactly this call pass the
+    /// gate once with no second prompt. The gate still matches the consent against the tool name, the patterns, and
+    /// the exact candidate snapshot (DispatchingToolExecutor.IsOneTimeApprovalSatisfied), and the pipeline clears it
+    /// after the attempt, so it cannot reach another call.
+    /// </remarks>
+    public void ApplyTo(ToolApprovalAttempt approval, string callName)
+    {
+        approval.RestoreAuthorizationAttemptId(AuthorizationAttemptId);
+        if (ApprovedConsentKeys is not null)
+            approval.SeedOneTimeConsent(new OneTimeConsent(callName, ApprovedConsentKeys));
+    }
+
+    /// <summary>
+    /// Gets the result text of a refused call. A refused call never dispatches. Only a denial adds the managed
+    /// temporary hint.
+    /// </summary>
+    public bool TryGetRefusalText(string callName, [NotNullWhen(true)] out string? text)
+    {
+        if (Refusal is not { } refusal)
+        {
+            text = null;
+            return false;
+        }
+
+        text = ConsentRefusalText.For(refusal, callName);
+        if (refusal == RefusalKind.Denied && ManagedTemporaryDenialDirectory is { Length: > 0 } denialDirectory)
+            text = $"{text}\n{ManagedTemporaryCorrection.BuildDenialHint(denialDirectory)}";
+        return true;
+    }
+}
+
+/// <summary>
 /// Async pipeline for parallel tool execution. Runs on the thread pool and
 /// sends results back to the session actor via <c>self.Tell()</c>.
 /// </summary>
@@ -305,15 +399,7 @@ internal sealed class SessionToolExecutionPipeline
                 var result = await ExecuteSingleToolAsync(
                     tc,
                     batch,
-                    batch.OneTimeApprovalPreSeed.TryGetValue(tc.CallId, out var preSeedKeys)
-                        ? preSeedKeys
-                        : null,
-                    batch.DecisionOverrides.TryGetValue(tc.CallId, out var overrideDecision)
-                        ? overrideDecision
-                        : null,
-                    batch.ManagedTemporaryDenialDirectories.TryGetValue(tc.CallId, out var managedTemporaryDirectory)
-                        ? managedTemporaryDirectory
-                        : null,
+                    ApprovalRedriveEntry.For(batch, tc.CallId),
                     modelInputBudget);
                 result = result with
                 {
@@ -322,8 +408,7 @@ internal sealed class SessionToolExecutionPipeline
                         result.Receipt,
                         batch.SetWorkingDirectoryAvailable)
                 };
-                if (batch.StreamResults)
-                    batch.ReplyTo.Tell(new ToolExecutionSingleCompleted(result));
+                batch.ReplyTo.Tell(new ToolExecutionSingleCompleted(result, batch.CancellationToken), ActorRefs.NoSender);
                 return result;
             });
             var results = await Task.WhenAll(tasks);
@@ -342,61 +427,11 @@ internal sealed class SessionToolExecutionPipeline
                         (receipt as ToolInvocationReceipt.Correction)?.RemediationCode.ToString());
             }
 
-            if (batch.StreamResults)
-            {
-                batch.ReplyTo.Tell(new ToolExecutionBatchCompleted());
-                return;
-            }
-
-            var fileAttachments = results.SelectMany(r => r.FileAttachments).ToList();
-            var modelInputMediaReferences = results.SelectMany(r => r.ModelInputMediaReferences).ToList();
-            batch.ReplyTo.Tell(new ToolExecutionCompleted
-            {
-                ToolResults = [.. results.Select(r => r.Message)],
-                ModelInputMediaReferences = modelInputMediaReferences,
-                FileAttachments = fileAttachments,
-                CompletedSubAgentRuns = [.. results.SelectMany(r => r.CompletedSubAgentRuns)],
-                AcceptedSubAgentFindings = [.. results.SelectMany(r => r.AcceptedSubAgentFindings)],
-                StartedBackgroundJobs = [.. results.Where(r => r.StartedBackgroundJob is not null).Select(r => r.StartedBackgroundJob!)],
-                ManagedTemporaryCorrectionChanges = [.. results.Where(r => r.ManagedTemporaryCorrectionUpdate is not null).Select(r => r.ManagedTemporaryCorrectionUpdate!)],
-                ToolFailureCodes = results
-                    .Where(result => result.FailureCode is not null)
-                    .ToDictionary<ToolCallResult, string, string>(
-                        result => result.Message.ToolCallId is { } callId
-                            ? callId.Value
-                            : throw new InvalidOperationException("A failed tool result requires a call identity."),
-                        result => result.FailureCode
-                            ?? throw new InvalidOperationException("A failed tool result requires a failure code."),
-                        StringComparer.Ordinal),
-                ToolReceipts = results
-                    .Where(result => result.Receipt is not null)
-                    .ToDictionary<ToolCallResult, string, ToolInvocationReceipt>(
-                        result => result.Message.ToolCallId is { } callId
-                            ? callId.Value
-                            : throw new InvalidOperationException("A tool receipt requires a call identity."),
-                        result => result.Receipt
-                            ?? throw new InvalidOperationException("A selected tool result requires a receipt."),
-                        StringComparer.Ordinal),
-                ToolExposureRequests = results
-                    .Where(result => result.ExposureRequest is not null)
-                    .ToDictionary<ToolCallResult, string, ToolExposureRequest>(
-                        result => result.Message.ToolCallId is { } callId
-                            ? callId.Value
-                            : throw new InvalidOperationException("A tool exposure request requires a call identity."),
-                        result => result.ExposureRequest
-                            ?? throw new InvalidOperationException("A selected tool result requires an exposure request."),
-                        StringComparer.Ordinal),
-                AuthorizationAttemptIds = results.ToDictionary<ToolCallResult, string, AuthorizationAttemptId>(
-                    result => result.Message.ToolCallId is { } callId
-                        ? callId.Value
-                        : throw new InvalidOperationException("An authorization attempt requires a call identity."),
-                    result => result.AuthorizationAttemptId,
-                    StringComparer.Ordinal)
-            });
+            batch.ReplyTo.Tell(new ToolExecutionBatchCompleted(batch.CancellationToken), ActorRefs.NoSender);
         }
         catch (TimeoutException ex)
         {
-            batch.ReplyTo.Tell(new ToolExecutionFailed { Cause = ex });
+            batch.ReplyTo.Tell(new ToolExecutionFailed { Cause = ex, DispatchToken = batch.CancellationToken }, ActorRefs.NoSender);
         }
         catch (OperationCanceledException) when (batch.CancellationToken.IsCancellationRequested)
         {
@@ -405,22 +440,18 @@ internal sealed class SessionToolExecutionPipeline
         }
         catch (Exception ex)
         {
-            batch.ReplyTo.Tell(new ToolExecutionFailed { Cause = ex });
+            batch.ReplyTo.Tell(new ToolExecutionFailed { Cause = ex, DispatchToken = batch.CancellationToken }, ActorRefs.NoSender);
         }
     }
 
     private async Task<ToolCallResult> ExecuteSingleToolAsync(
         FunctionCallContent tc,
         SessionToolBatch batch,
-        IReadOnlyList<string>? oneTimeApprovalPreSeed,
-        RefusalKind? decisionOverride,
-        string? managedTemporaryDenialDirectory,
+        ApprovalRedriveEntry redrive,
         ModelInputBatchBudget modelInputBudget)
     {
         var originalToolCall = tc;
-        var authorizationAttemptId = batch.AuthorizationAttemptIds.TryGetValue(tc.CallId, out var restoredAttemptId)
-            ? restoredAttemptId
-            : AuthorizationAttemptId.New();
+        var authorizationAttemptId = redrive.AuthorizationAttemptId;
 
         _logger.Info(
             "Tool authorization attempt started authorizationAttemptId={AuthorizationAttemptId} " +
@@ -435,18 +466,49 @@ internal sealed class SessionToolExecutionPipeline
         // sentinel, invalid/ambiguous meta values, unrecognized keys) and, on
         // success, extract meta + strip meta keys.
         var interpretation = _executor.InterpretToolCall(tc);
+
+        // The OTLP exporter sends this line off the host. ToolCallLogFormatter
+        // redacts and bounds the original arguments (meta keys included) and the
+        // rationale. The line comes before the rejection branch, so a rejected
+        // call also has its arguments in the log. The level check skips the walk
+        // of the arguments when Info is off.
+        if (_logger.IsInfoEnabled)
+        {
+            _logger.Info(
+                "Invoking tool [{ToolName}] (call={CallId}) args={Args} rationale={Rationale} " +
+                "authorizationAttemptId={AuthorizationAttemptId} sessionId={SessionId}",
+                tc.Name,
+                tc.CallId,
+                ToolCallLogFormatter.FormatArguments(tc.Arguments),
+                ToolCallLogFormatter.FormatRationale(interpretation.Meta?.Rationale),
+                authorizationAttemptId.Value,
+                batch.SessionId.Value);
+        }
+
         if (interpretation.Rejection is { } rejection)
         {
             return new ToolCallResult(new SerializableChatMessage
             {
                 Role = Protocol.ChatRole.Tool,
-                Content = rejection.Message,
+                Content = batch.RefusedCallIds.Contains(tc.CallId)
+                    ? $"{rejection.Message}\n{ToolCycleMessages.Correction}" : rejection.Message,
                 ToolCallId = new ToolCallId(tc.CallId),
                 Name = tc.Name
-            }, [], [], [], [], authorizationAttemptId, FailureCode: rejection.DenyReason,
-                Receipt: new ToolInvocationReceipt.OtherOutcome(ToolInvocationOutcomeCategory.InvalidInput));
+            }, [], [], [], authorizationAttemptId, FailureCode: rejection.DenyReason,
+                Receipt: batch.RefusedCallIds.Contains(tc.CallId)
+                    ? new ToolInvocationReceipt.Correction(ToolRemediationCode.BreakToolCycle)
+                    : new ToolInvocationReceipt.OtherOutcome(ToolInvocationOutcomeCategory.InvalidInput));
         }
 
+        if (batch.RefusedCallIds.Contains(tc.CallId))
+        {
+            var correction = new ToolInvocationReceipt.Correction(ToolRemediationCode.BreakToolCycle);
+            return new ToolCallResult(new SerializableChatMessage
+            {
+                Role = Protocol.ChatRole.Tool, ToolCallId = new ToolCallId(tc.CallId),
+                Name = tc.Name, Content = ToolCycleMessages.Correction
+            }, [], [], [], authorizationAttemptId, Receipt: correction);
+        }
         var meta = interpretation.Meta;
         tc = interpretation.Cleaned;
 
@@ -506,30 +568,8 @@ internal sealed class SessionToolExecutionPipeline
 
             if (!info.IsStarted && info.Success)
             {
-                foreach (var finding in info.Findings)
-                {
-                    var findingDecision = ReviewSubAgentFinding(finding, batch.SessionId);
-                    acceptedFindings.Add(new AcceptedSubAgentFinding
-                    {
-                        RunId = info.RunId,
-                        AgentName = new SubAgents.AgentName(info.AgentName),
-                        Duration = info.Duration,
-                        Shape = finding.Shape,
-                        Title = finding.Title,
-                        Content = finding.Content,
-                        Kind = finding.Kind,
-                        Sensitivity = finding.Sensitivity,
-                        RecallMode = finding.RecallMode,
-                        UpdateSemantics = finding.UpdateSemantics,
-                        Confidence = finding.Confidence,
-                        Durability = finding.Durability,
-                        Reusability = finding.Reusability,
-                        Evidence = finding.Evidence,
-                        FreshnessAtMs = finding.FreshnessAtMs,
-                        Decision = findingDecision.Decision,
-                        DecisionReason = findingDecision.Reason
-                    });
-                }
+                acceptedFindings.AddRange(ReviewChildFindings(info.RunId,
+                    new SubAgents.AgentName(info.AgentName), info.Duration, info.Findings, batch.SessionId));
             }
         });
         var approvalBridge = CanRequestInteractiveApproval(batch.TurnContext)
@@ -538,15 +578,32 @@ internal sealed class SessionToolExecutionPipeline
                 batch.ApprovalRequests.EmitRequest,
                 batch.ApprovalRequests.Timeout,
                 batch.SessionId,
-                tc.CallId,
                 batch.TurnContext.RequesterSenderId,
                 batch.TurnContext.RequesterPrincipal,
                 batch.TurnContext.HasAdoptedContext,
                 batch.TurnContext.HasThirdPartyAdoptedContext,
                 batch.TurnContext.AdoptedSpeakerIds)
             : null;
+        var spawnChildActor = batch.RunScope.SpawnChildActor
+            ?? throw new InvalidOperationException("A session tool batch requires its owner callback.");
         var callScope = batch.RunScope with
         {
+            SpawnChildActor = async (request, name, token) =>
+            {
+                if (request is not PreparedChildStart prepared)
+                {
+                    return await spawnChildActor(request is ChildRunControlRequest control
+                        ? new ChildRunControl(control.RunId, control.Cancel, batch.TurnContext.ToRecord())
+                        : request, name, token);
+                }
+
+                // The task file records the requester of this turn. It exists before the owner accepts the start.
+                var requester = batch.TurnContext.ToRecord();
+                await prepared.WriteTaskFileAsync(requester, token);
+                return await spawnChildActor(new AcceptChildStart(prepared,
+                    new ChildRunStartKey.Tool(batch.TurnContext.SessionId, batch.TurnContext.TurnId.Value,
+                        new ToolCallId(tc.CallId)), requester, tc.Name, token), name, token);
+            },
             InteractiveApproval = approvalBridge is null
                 ? new InteractiveApprovalCapability.Unavailable()
                 : new InteractiveApprovalCapability.Available(approvalBridge)
@@ -555,7 +612,7 @@ internal sealed class SessionToolExecutionPipeline
             callScope,
             new ToolExecutionTimeout(timeout),
             outputs);
-        context.Approval.RestoreAuthorizationAttemptId(authorizationAttemptId);
+        redrive.ApplyTo(context.Approval, tc.Name);
         var approvalShell = _executor is IApprovalShellProvider shellProvider
             ? shellProvider.Shell
             : ApprovalShell.Bash;
@@ -568,31 +625,12 @@ internal sealed class SessionToolExecutionPipeline
             context.Approval.MarkManagedTemporaryRetry(correctionKey.Target);
         }
 
-        // Re-drive of an ApprovedOnce approval: the user already clicked
-        // "approve once" before the session passivated, but there is no
-        // persisted grant to satisfy the gate on the cold-recovered re-drive.
-        // Pre-seed the one-time approval bypass for exactly this call id so the
-        // gate passes once without emitting a duplicate approval prompt. The
-        // bypass is still matched against the tool name, patterns, and exact
-        // approval-candidate snapshot inside the gate
-        // (DispatchingToolExecutor.IsOneTimeApprovalSatisfied) and the pipeline
-        // clears it after the attempt — it cannot leak to any other call.
-        if (oneTimeApprovalPreSeed is not null)
-            context.Approval.SeedOneTimeConsent(new OneTimeConsent(tc.Name, oneTimeApprovalPreSeed));
         try
         {
-            if (decisionOverride is { } refusedOnReplay)
+            if (redrive.TryGetRefusalText(tc.Name, out var refusalText))
             {
                 sw.Stop();
-                resultText = ConsentRefusalText.For(
-                    refusedOnReplay,
-                    $"Tool access denied: approval_denied_by_user ({tc.Name} requires interactive approval and the user declined it)");
-                if (refusedOnReplay == RefusalKind.Denied
-                    && managedTemporaryDenialDirectory is { Length: > 0 })
-                {
-                    resultText = $"{resultText}\n{ManagedTemporaryCorrection.BuildDenialHint(managedTemporaryDenialDirectory)}";
-                }
-
+                resultText = refusalText;
                 var deniedMessage = new SerializableChatMessage
                 {
                     Role = Protocol.ChatRole.Tool,
@@ -603,7 +641,6 @@ internal sealed class SessionToolExecutionPipeline
 
                 return new ToolCallResult(
                     deniedMessage,
-                    [],
                     [],
                     [],
                     [],
@@ -669,7 +706,7 @@ internal sealed class SessionToolExecutionPipeline
                 Content = delivery.Content,
                 ToolCallId = new ToolCallId(tc.CallId),
                 Name = tc.Name
-            }, [], context.Outputs.FileAttachments, completedRuns, acceptedFindings,
+            }, context.Outputs.FileAttachments, completedRuns, acceptedFindings,
                 authorizationAttemptId,
                 Receipt: delivery.Receipt,
                 ExposureRequest: delivery.NativeTool is { } nativeTool
@@ -693,7 +730,7 @@ internal sealed class SessionToolExecutionPipeline
                 Content = ToolAuthorizer.ConsentWithoutBridgeResult(tc.Name),
                 ToolCallId = new ToolCallId(tc.CallId),
                 Name = tc.Name
-            }, [], context.Outputs.FileAttachments, completedRuns, acceptedFindings,
+            }, context.Outputs.FileAttachments, completedRuns, acceptedFindings,
                 authorizationAttemptId,
                 FailureCode: SessionProtocol.ToolResultOutput.AccessDeniedFailureCode,
                 Receipt: new ToolInvocationReceipt.AuthorizationDenied());
@@ -760,9 +797,7 @@ internal sealed class SessionToolExecutionPipeline
             else
             {
                 var refusal = (ConsentAnswer.Refused)step.Answer;
-                var reason = ConsentRefusalText.For(
-                    refusal.Kind,
-                    $"Tool access denied: approval_denied_by_user ({tc.Name} requires interactive approval and the user declined it)");
+                var reason = ConsentRefusalText.For(refusal.Kind, tc.Name);
 
                 // When a shell call is denied because its cwd is outside both
                 // session_dir and project_dir, surface a one-line hint pointing
@@ -837,7 +872,6 @@ internal sealed class SessionToolExecutionPipeline
 
         return new ToolCallResult(
             message,
-            modelInputMaterialization.MediaReferences,
             context.Outputs.FileAttachments,
             completedRuns,
             acceptedFindings,
@@ -865,16 +899,8 @@ internal sealed class SessionToolExecutionPipeline
         {
             var stream = executor.ExecuteStreamAsync(toolCall, context, cancellationToken);
 
-            // Self-monitoring tools (spawn_agent) own their liveness end to end and
-            // always drive their stream to a terminal item, so the parent does not
-            // supervise them at all — it drains to that terminal item under caller
-            // (turn/user) cancellation only. For spawn_agent the terminal item is
-            // produced by SpawnAgentTool's stream, which completes when SpawnAsync
-            // returns; SpawnAsync's finally unconditionally completes the activity
-            // channel, and SubAgentActor.PostStop guarantees the reply that lets
-            // SpawnAsync return even on a crash. (Note: PostStop alone only unblocks
-            // the spawner Ask — the terminal stream item depends on that finally
-            // running.)
+            // Self-monitoring tools own their terminal stream contract.
+            // Caller cancellation still bounds their lifetime.
             if (executor.GetLivenessMode(toolCall) == ToolLivenessMode.SelfMonitoring)
                 return await DrainToCompletionAsync(stream, toolCall.Name, cancellationToken);
 
@@ -932,6 +958,24 @@ internal sealed class SessionToolExecutionPipeline
     /// Reviews a sub-agent finding to decide whether it should be accepted,
     /// deferred, or rejected for memory persistence.
     /// </summary>
+    internal static IReadOnlyList<AcceptedSubAgentFinding> ReviewChildFindings(
+        SubAgentRunId runId, SubAgents.AgentName agentName, TimeSpan duration,
+        IEnumerable<SubAgentFinding> findings, SessionId sessionId)
+        => findings.Select(finding =>
+        {
+            var decision = ReviewSubAgentFinding(finding, sessionId);
+            return new AcceptedSubAgentFinding
+            {
+                RunId = runId, AgentName = agentName, Duration = duration,
+                Shape = finding.Shape, Title = finding.Title, Content = finding.Content,
+                Kind = finding.Kind, Sensitivity = finding.Sensitivity, RecallMode = finding.RecallMode,
+                UpdateSemantics = finding.UpdateSemantics, Confidence = finding.Confidence,
+                Durability = finding.Durability, Reusability = finding.Reusability,
+                Evidence = finding.Evidence, FreshnessAtMs = finding.FreshnessAtMs,
+                Decision = decision.Decision, DecisionReason = decision.Reason
+            };
+        }).ToArray();
+
     internal static SubAgentFindingReviewResult ReviewSubAgentFinding(
         SubAgentFinding finding,
         SessionId sessionId)
@@ -1033,7 +1077,7 @@ internal sealed class SessionToolExecutionPipeline
                 OutputLogPath = started.OutputLogPath
             };
             return new ToolCallResult(
-                resultMessage, [], [], [], [], context.Approval.AuthorizationAttemptId, jobInfo);
+                resultMessage, [], [], [], context.Approval.AuthorizationAttemptId, jobInfo);
         }
         catch (Exception ex)
         {
@@ -1047,7 +1091,7 @@ internal sealed class SessionToolExecutionPipeline
                 Name = tc.Name
             };
             return new ToolCallResult(
-                errorMessage, [], [], [], [], context.Approval.AuthorizationAttemptId);
+                errorMessage, [], [], [], context.Approval.AuthorizationAttemptId);
         }
     }
 
