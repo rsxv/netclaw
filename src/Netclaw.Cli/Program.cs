@@ -569,9 +569,9 @@ static async Task RunAsync(string[] args)
             case "status":
             {
                 var status = manager.GetStatus();
-                Console.WriteLine(status.Message);
                 if (!status.IsRunning || !status.ServesThisHome)
                 {
+                    Console.WriteLine(status.Message);
                     Environment.ExitCode = 1;
                     return;
                 }
@@ -581,11 +581,19 @@ static async Task RunAsync(string[] args)
                 // port baked into the image.
                 var (ready, readyEndpoint) = await DaemonApi.ProbeLocalReadinessAsync(paths);
 
+                if (readyEndpoint is null)
+                {
+                    // One message: "Daemon running" followed by "address unknown" read as a contradiction.
+                    CliConfigPreflight.TryDescribeUnreadableConfig(paths, out var unreadable, out var unreadableFix);
+                    Console.WriteLine(DaemonCommandDispatch.FormatAddressUnknown(status, unreadable, unreadableFix));
+                    Environment.ExitCode = 1;
+                    return;
+                }
+
+                Console.WriteLine(status.Message);
                 if (!ready)
                 {
-                    Console.WriteLine(readyEndpoint is null
-                        ? "The local daemon address is unknown. No readiness probe was sent. Repair the local configuration and retry."
-                        : $"Daemon process is running but {readyEndpoint}/api/health/ready did not answer.");
+                    Console.WriteLine($"Daemon process is running but {readyEndpoint}/api/health/ready did not answer.");
                     Environment.ExitCode = 1;
                     return;
                 }
@@ -1251,7 +1259,7 @@ static void ConfigureNativeSelection(TerminaBuilder termina)
 
 static void WriteCrashLog(Exception ex)
 {
-    CrashLogWriter.Write(ex, "CLI");
+    CrashLogWriter.Write(ex, "CLI", SecretOutputRedactor.RedactForLogging);
 }
 
 // Canonical launch path for CLI hosts. A host that registered a Termina UI (via
@@ -1421,11 +1429,14 @@ static void WriteDaemonHelp()
     Console.WriteLine("  start                        Start daemon as a background process");
     Console.WriteLine("  stop                         Stop daemon gracefully");
     Console.WriteLine("  status                       Show daemon process status (exit 1 if not running or not ready)");
-    Console.WriteLine("  install                      Install systemd user service (Linux)");
-    Console.WriteLine("  uninstall                    Remove systemd user service (Linux)");
+    Console.WriteLine("  install                      Install systemd user service for this home (Linux)");
+    Console.WriteLine("  uninstall                    Remove the systemd user service (Linux)");
     Console.WriteLine("  pair                         Generate a pairing code for remote device access");
     Console.WriteLine("  devices                      List paired devices");
     Console.WriteLine("  devices revoke <name>        Revoke a paired device by name");
+    Console.WriteLine();
+    Console.WriteLine("The user service serves the home it was installed from (NETCLAW_HOME=/srv/x netclaw daemon install).");
+    Console.WriteLine("There is one service per user: install and uninstall refuse while it serves another home.");
     Console.WriteLine();
     Console.WriteLine("start, stop, and status refuse when the PID in netclaw.pid is not shown to serve this home.");
     Console.WriteLine("If no Netclaw daemon of this home runs, delete <home>/netclaw.pid.");

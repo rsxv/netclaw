@@ -1,5 +1,15 @@
 # NetClaw Release Notes
 
+## Unreleased
+
+### Security
+
+- **Notification webhook URLs and auth header values live in `secrets.json`, encrypted.** A webhook URL can be a credential, and the TUI wrote it to `netclaw.json` in plain text. `Notifications:Webhooks` is now an object keyed by webhook name. The TUI writes only the `Format` to `netclaw.json` and writes the URL and header values to `secrets.json`. The old list shape and a plain `Url` in `netclaw.json` still load. `netclaw doctor` warns about them, and `netclaw doctor --fix` backs up `netclaw.json` and `secrets.json`, converts the list, and moves the values. A webhook with no URL from any source now stops daemon startup and names the key ([#2777](https://github.com/netclaw-dev/netclaw/issues/2777)).
+
+### Models
+
+- **The output limit no longer shrinks with an estimate of the prompt.** 0.28.2 clamped the default output limit per call to the context window minus a character-based prompt estimate, with a floor of 1024. The estimate counted an inline image at its base64 size, so one generated image (about 1 MB) added about 330,000 phantom tokens, and every later call in that session was sent `max_tokens: 1024` and failed with "The model reply was truncated". Now the default is still 32000, capped to the known model maximum (hosted APIs) and to a quarter of the known context window, which is static and fits below the 75% compaction threshold. A self-hosted server with an unknown window still gets no limit field, and a configured or call-site value is sent as is. The 1024 floor and its warning are gone. A prompt that still overflows is rejected by the provider, and the session compacts and retries.
+
 ## 0.28.2 (2026-10-28)
 
 This is a stable patch release for 0.28.0. A model definition now carries a provider-neutral output limit and thinking level, so an Anthropic reply is no longer cut at 1024 tokens. The daemon rotates its log into bounded numbered segments. The CLI refuses to send local control traffic to a guessed address when the configuration cannot be read.
@@ -77,7 +87,7 @@ The beta sections below give each change in full detail.
 ### Sub-agents
 
 - **A child runs in the background.** `spawn_agent` returns a run ID at once. When the child ends, the parent gets one notice in a later turn and reads `result.md` with `file_read` ([#2464](https://github.com/netclaw-dev/netclaw/pull/2464), [#2467](https://github.com/netclaw-dev/netclaw/pull/2467), [#2515](https://github.com/netclaw-dev/netclaw/pull/2515)).
-  - **Upgrade impact:** `netclaw chat -p` exits at the end of the first turn, so a headless caller does not see a child result that arrives later.
+  - **Upgrade impact:** upgrade the CLI with the daemon. While a child run is open, `netclaw chat -p` waits and prints `[subagent:waiting]` (no line with `--json`). It exits 0 after the first turn that leaves no child open. A failed turn, a stopped session, or a lost connection ends it with exit 1 and names the open runs. A 0.27.1 CLI exits at turn 1 against this daemon and never prints the child result. The notice turn still runs in the daemon, and `result.md` stays in the run folder.
 - **A child that waits for consent parks.** The parent gets a notice and pauses. After the last answer, the child runs only the parked calls, each one time, and the gate checks each call again. The park is in the run record, so it survives a restart, a config reload, a compaction, and passivation ([#2583](https://github.com/netclaw-dev/netclaw/pull/2583), [#2618](https://github.com/netclaw-dev/netclaw/pull/2618), [#2670](https://github.com/netclaw-dev/netclaw/pull/2670)).
 - **A child that runs during a graceful restart parks and resumes after the restart.** A child that does not park in time ends as `owner_restarted`, and its tools do not run again ([#2604](https://github.com/netclaw-dev/netclaw/pull/2604), [#2672](https://github.com/netclaw-dev/netclaw/pull/2672)).
   - **Upgrade impact:** a graceful restart with an active child can take up to about 18 seconds longer.
@@ -340,7 +350,7 @@ This is the first beta of 0.28.0. A sub-agent now runs in the background: `spawn
 ### Sub-agents
 
 - **A child runs in the background.** `spawn_agent` records the run and returns its run ID at once, so the parent stays available. When the child ends, the runtime writes `result.md` in the run folder. The parent then gets one notice in a later turn and reads the result with `file_read`. A notice runs under the authority of the person who started the child ([#2464](https://github.com/netclaw-dev/netclaw/pull/2464), [#2467](https://github.com/netclaw-dev/netclaw/pull/2467), [#2515](https://github.com/netclaw-dev/netclaw/pull/2515)).
-  - **Upgrade impact:** `netclaw chat -p` exits at the end of the first turn. A headless caller does not see a child result that arrives in a later turn. The follow-up turn still runs in the daemon.
+  - **Upgrade impact:** upgrade the CLI with the daemon. While a child run is open, `netclaw chat -p` waits and prints `[subagent:waiting]` (no line with `--json`). The daemon's notice turn reads the child result. It exits 0 after the first turn that leaves no child open. A failed turn, a stopped session, or a lost connection ends it with exit 1 and names the open runs. A 0.27.1 CLI exits at turn 1 against this daemon and never prints the child result. The notice turn still runs in the daemon, and `result.md` stays in the run folder.
 - **The parent gets a notice and pauses while a child waits for consent.** When a child asks for operator consent, the parent gets one notice turn. The notice lists the open child requests and the answers since the last notice. While a child request is open, the session holds reminder fires and refuses `spawn_agent`. The parent can finish its turn, and prompts from other children still post ([#2583](https://github.com/netclaw-dev/netclaw/pull/2583)).
   - **Upgrade impact:** an open child approval now holds reminder fires for that session until the prompt closes.
 - **Netclaw withdraws a child prompt that nothing can answer.** Slack, Discord, Mattermost, the TUI, and headless redraw the prompt with no buttons and show the reason. A prompt closes when the parent cancels the child, the child ends or is lost, the prompt post fails, or the daemon restarts. An answered prompt shows "This approval request has an answer." While a child prompt is open, a text answer resolves nothing, and the channel asks for a button ([#2584](https://github.com/netclaw-dev/netclaw/pull/2584)).

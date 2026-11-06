@@ -134,6 +134,12 @@ catch (ModelConfigurationException ex)
     StartupConfigurationFailure.Report(bootstrapPaths, ex.Message, Console.Error);
     Environment.ExitCode = 1;
 }
+catch (OptionsValidationException ex)
+{
+    // A validated option section that the operator wrote wrongly, such as a notification webhook with no Url.
+    StartupConfigurationFailure.Report(bootstrapPaths, string.Join(' ', ex.Failures), Console.Error);
+    Environment.ExitCode = 1;
+}
 catch (InvalidDataException ex)
 {
     // netclaw.json or secrets.json that the configuration source cannot read (invalid JSON, a
@@ -186,7 +192,7 @@ static async Task RunDaemonAsync(
     builder.WebHost.UseUrls($"http://{daemonConfig.Host}:{daemonConfig.Port}");
     var daemonLogLevel = builder.ConfigureNetclawLogging(paths);
     builder.AddNetclawTelemetry();
-    var (configurationWarnings, configurationNotices) = ConfigureDaemonServices(
+    var (configurationWarnings, configurationNotices, initialSkillScan) = ConfigureDaemonServices(
         builder.Services,
         builder.Configuration,
         paths,
@@ -245,7 +251,9 @@ static async Task RunDaemonAsync(
     builder.Services.AddSingleton<SessionIngressGate>();
     // The layout is a required dependency of the resolver. On POSIX it is the short per-user base
     // /tmp/netclaw-<uid> (issue #2554). A host that cannot read its user ID fails at startup.
-    builder.Services.AddSingleton<ManagedTemporaryLayout>(_ => ManagedTemporaryLayout.ForHost());
+    var managedTemporaryLayout = ManagedTemporaryLayout.ForHost();
+    builder.Services.AddSingleton(managedTemporaryLayout);
+
     builder.Services.AddSingleton<ISessionStorageResolver, SqliteSessionStorageResolver>();
     builder.Services.AddSingleton<RestartManifestStore>();
     builder.Services.AddSingleton<RejectedConfigState>();
@@ -262,6 +270,13 @@ static async Task RunDaemonAsync(
     var startupLogger = app.Services
         .GetRequiredService<ILoggerFactory>()
         .CreateLogger("Netclaw.Startup");
+
+    // A read-only root filesystem with no tmpfs on /tmp leaves the daemon healthy while every shell
+    // call fails. Log it once here and report it from the status endpoint, which probes again per
+    // request; readiness stays green so a supervisor does not restart-loop a working daemon.
+    if (ShellTemporaryDirectoryState.Probe(managedTemporaryLayout).Problem is { } shellTemporaryProblem)
+        startupLogger.LogError("{Problem}", shellTemporaryProblem);
+
     startupLogger.LogInformation(
         "Selected native shell {Executable} at {ExecutablePath} with {Grammar} grammar and {Dialect} dialect.",
         shellResolution.Environment.ExecutableName,
@@ -272,6 +287,7 @@ static async Task RunDaemonAsync(
         startupLogger.LogWarning("Configuration warning: {ConfigurationWarning}", warning);
     foreach (var notice in configurationNotices)
         startupLogger.LogInformation("Configuration notice: {ConfigurationNotice}", notice);
+    SkillScanStartupLogging.Log(startupLogger, initialSkillScan);
 
     if (shellResolution.FallbackReason is { } fallbackReason)
     {
@@ -394,7 +410,7 @@ static async Task RunDaemonAsync(
         }
         catch (Exception ex)
         {
-            CrashLogWriter.Write(ex, "daemon-started-hook");
+            CrashLogWriter.Write(ex, "daemon-started-hook", SecretOutputRedactor.RedactForLogging);
         }
     });
 
@@ -466,7 +482,7 @@ static (NetclawPaths Paths, ModelSelection Models) ConfigureConfigServices(
 // ═══════════════════════════════════════════════════════════════════════
 
 // Returns configuration warnings. The caller logs them after the host builds its loggers.
-static (IReadOnlyList<string> Warnings, IReadOnlyList<string> Notices) ConfigureDaemonServices(
+static (IReadOnlyList<string> Warnings, IReadOnlyList<string> Notices, MergedSkillScanResult InitialSkillScan) ConfigureDaemonServices(
     IServiceCollection services,
     IConfigurationManager configuration,
     NetclawPaths paths,
@@ -787,6 +803,9 @@ static (IReadOnlyList<string> Warnings, IReadOnlyList<string> Notices) Configure
     // Operational notification webhooks
     var notificationsConfig = configuration.GetSection("Notifications")
         .Get<NotificationsConfig>() ?? new NotificationsConfig();
+    // A webhook with no Url from any source stops startup. Skipping it would drop every alert without a sign.
+    if (new NotificationsConfigValidator().Validate(name: null, notificationsConfig) is { Failed: true } notificationsInvalid)
+        throw new OptionsValidationException(Options.DefaultName, typeof(NotificationsConfig), notificationsInvalid.Failures);
     services.AddSingleton(notificationsConfig);
 
     if (notificationsConfig.Webhooks.Count > 0)
@@ -864,27 +883,6 @@ static (IReadOnlyList<string> Warnings, IReadOnlyList<string> Notices) Configure
         paths, skillFeedsConfig, resolvedExternalSources, skillRegistry, skillIndexPublisher);
     var initialSkillScan = skillInventoryRefresher.Refresh();
     services.AddSingleton(skillInventoryRefresher);
-
-    // Skill tools are registered post-build so ISkillContentScanner resolves from DI.
-    // See SkillToolRegistration call after app.Build().
-    if (initialSkillScan.Issues.Count > 0)
-    {
-        using var loggerFactory = LoggerFactory.Create(b => b.SetMinimumLevel(daemonLogLevel));
-        var startupLogger = loggerFactory.CreateLogger("Netclaw.Startup");
-        startupLogger.LogWarning(
-            "Skill inventory is degraded at startup: accepted={AcceptedSkillCount} rejected={RejectedIssueCount}",
-            initialSkillScan.AcceptedSkills.Count,
-            initialSkillScan.Issues.Count);
-
-        foreach (var issue in initialSkillScan.Issues)
-        {
-            startupLogger.LogWarning(
-                "Rejected skill item during startup scan: kind={IssueKind} path={Path} message={Message}",
-                issue.Kind,
-                issue.Path,
-                issue.Message);
-        }
-    }
 
     // Skill tools are registered post-build so ISkillContentScanner resolves from DI.
     // See SkillToolRegistration call after app.Build().
@@ -1168,7 +1166,7 @@ static (IReadOnlyList<string> Warnings, IReadOnlyList<string> Notices) Configure
 
     // Expired data is cleared by DataRetentionActor, which runs every RetentionJob registered here.
     var retentionWarnings = services.AddRetentionJobs(configuration, paths);
-    return ([.. toolConfigWarnings, .. retentionWarnings, .. OAuthTokenExpiryStorage.RetiredKeyWarnings(paths)], toolConfigNotices);
+    return ([.. toolConfigWarnings, .. retentionWarnings, .. OAuthTokenExpiryStorage.RetiredKeyWarnings(paths)], toolConfigNotices, initialSkillScan);
 }
 
 static ISearchBackend? CreateSearchBackend(SearchConfig config)

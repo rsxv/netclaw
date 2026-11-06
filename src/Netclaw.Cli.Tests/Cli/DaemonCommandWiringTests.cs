@@ -84,11 +84,12 @@ public sealed class DaemonCommandWiringTests : IDisposable
             ? File.ReadAllText(Path.Combine(_systemctlState, "calls.log"))
             : string.Empty;
 
-    private void InstallUnit()
+    private void InstallUnit(string? serves = null)
     {
         var unitDir = Path.Combine(_home, ".config", "systemd", "user");
         Directory.CreateDirectory(unitDir);
-        File.WriteAllText(Path.Combine(unitDir, "netclaw.service"), "[Service]\nExecStart=/opt/netclaw/netclawd\n");
+        File.WriteAllText(Path.Combine(unitDir, "netclaw.service"), "[Service]\nExecStart=/opt/netclaw/netclawd\n"
+            + (serves is null ? string.Empty : $"Environment=NETCLAW_HOME={serves}\n"));
     }
 
     private void FakeSystemctl(string file, string content)
@@ -336,11 +337,10 @@ public sealed class DaemonCommandWiringTests : IDisposable
     public async Task Stop_NeverTouchesTheUnit_WhenNoDaemonRunsForThisHomeButTheUnitServesAnotherOne()
     {
         // The default home runs nothing; the unit's daemon belongs to some other home.
-        InstallUnit();
+        InstallUnit("/home/op/data");
         FakeSystemctl("active.code", "0");
         FakeSystemctl("active.out", "active\n");
         FakeSystemctl("mainpid.out", int.MaxValue + "\n"); // no such process: its environment is unreadable
-        FakeSystemctl("environment.out", "NETCLAW_HOME=/home/op/data");
 
         var (exitCode, output) = await RunAsync(DefaultNetclawHome, ["daemon", "stop"]);
 
@@ -916,6 +916,38 @@ public sealed class DaemonCommandWiringTests : IDisposable
 
         Assert.Equal(1, exitCode);
         Assert.Contains($"http://127.0.0.1:{port}/api/health/ready did not answer", output);
+    }
+
+    [Fact]
+    public async Task Status_PrintsOneMessage_AndExitsNonZero_WhenTheLocalConfigCannotBeRead()
+    {
+        Directory.CreateDirectory(Path.Combine(ScratchHome, "config"));
+        File.WriteAllText(Path.Combine(ScratchHome, "config", "netclaw.json"), "{\"configVersion\":1,\"configVersion\":1}");
+        using var lockHolder = HoldDaemonLock(ScratchHome);
+
+        var (exitCode, stdout, stderr) = await RunWithStreamsAsync(ScratchHome, ["daemon", "status"]);
+
+        Assert.Equal(1, exitCode);
+        var line = Assert.Single(stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        Assert.Contains("address cannot be determined", line);
+        Assert.DoesNotContain("Daemon is running", stdout);
+        Assert.Equal(string.Empty, stderr);
+    }
+
+    [Fact]
+    public async Task Status_NamesSecretsJson_WhenThatFileCannotBeRead()
+    {
+        Directory.CreateDirectory(Path.Combine(ScratchHome, "config"));
+        File.WriteAllText(Path.Combine(ScratchHome, "config", "netclaw.json"), "{}");
+        File.WriteAllText(Path.Combine(ScratchHome, "config", "secrets.json"), "{not json");
+        using var lockHolder = HoldDaemonLock(ScratchHome);
+
+        var (exitCode, stdout, _) = await RunWithStreamsAsync(ScratchHome, ["daemon", "status"]);
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("address cannot be determined", stdout);
+        Assert.Contains("secrets.json", stdout);
+        Assert.DoesNotContain("netclaw.json", stdout);
     }
 
     [Fact]

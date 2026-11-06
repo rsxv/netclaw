@@ -83,6 +83,9 @@ internal sealed record ApprovalPromptObservation(
     /// <summary>The command text that a channel shows to the operator.</summary>
     public string DisplayText { get; init; } = string.Empty;
 
+    /// <summary>The grant-scope notes that a channel shows beside the command, outside its code span.</summary>
+    public string? Notes { get; init; }
+
     /// <summary>The patterns that a channel lists when the prompt has no candidate verb.</summary>
     public IReadOnlyList<string> Patterns { get; init; } = [];
 
@@ -407,6 +410,13 @@ internal sealed class ShellApprovalHarness : IAsyncDisposable
                                 approvalExternalDirectory)))))
                     .ToList());
         }
+
+        // Each read through the actor takes the store's lock file. The first read
+        // creates the directory and the lock file, which on a loaded Windows runner
+        // can take longer than the 5s Ask deadline, so the policy denies the call
+        // with internal_policy_failure. Read once here, on the test thread, so the
+        // actor's first read finds both already in place.
+        store.Load();
 
         var approvalService = provider.GetRequiredService<CountingApprovalService>();
         foreach (var seed in approvals.Seeds.Where(seed => seed.Source == ApprovalSeedSource.Session))
@@ -797,6 +807,7 @@ internal sealed class ShellApprovalHarness : IAsyncDisposable
             approvalContext.Options.Select(option => option.Key.Value).ToList())
         {
             DisplayText = approvalContext.DisplayText,
+            Notes = approvalContext.Notes,
             Patterns = approvalContext.Patterns,
             OptionLabels = approvalContext.Options.Select(option => option.Label).ToList(),
             CandidateDirectories = approvalContext.Candidates?
